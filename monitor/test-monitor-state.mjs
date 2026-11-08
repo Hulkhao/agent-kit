@@ -602,6 +602,13 @@ test("chunkPayload: 600-grapheme target, 1200-byte hard cap, exact reconstructio
   const afterBreak = "a".repeat(19) + "\n" + "b".repeat(30);
   assert.equal(chunkPayload(afterBreak, 100, 20)[0], "a".repeat(19) + "\nb");
 
+  // Long blank-line runs must not make a boundary adjustment exceed the chunk target.
+  const blankLineRun = "a".repeat(19) + "\n" + "\n".repeat(1000) + "b".repeat(30);
+  const blankLineChunks = chunkPayload(blankLineRun, 100, 20);
+  assert.equal(blankLineChunks.join(""), blankLineRun);
+  assert.ok(blankLineChunks.every((chunk) => countGraphemes(chunk) <= 22));
+  assert.ok(blankLineChunks.every((chunk) => Buffer.byteLength(chunk, "utf8") <= 100));
+
   // CJK reaches the byte cap before the grapheme target.
   const cjk = "庭".repeat(900);
   const cjkChunks = chunkPayload(cjk);

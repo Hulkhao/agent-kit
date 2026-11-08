@@ -320,8 +320,8 @@ export function chunkPayload(text, byteLimit = 1200, targetChars = 600) {
       (isLineBreak(graphemes[end - 1]) || isLineBreak(graphemes[end]))) {
       let forwardEnd = end;
       let forwardBytes = chunkBytes;
-      while (forwardEnd < graphemes.length && isLineBreak(graphemes[forwardEnd])) {
-        if (forwardBytes + byteLengths[forwardEnd] > byteLimit) break;
+      if (forwardEnd < graphemes.length && isLineBreak(graphemes[forwardEnd]) &&
+        forwardBytes + byteLengths[forwardEnd] <= byteLimit) {
         forwardBytes += byteLengths[forwardEnd];
         forwardEnd++;
       }
