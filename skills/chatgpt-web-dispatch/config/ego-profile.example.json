@@ -1,0 +1,8 @@
+{
+  "_comment": "Copy this file to C:\\Users\\<你>\\.agents\\ego-profile.json (macOS/Linux: ~/.agents/ego-profile.json) and fill in YOUR machine's values. This file is machine-local: never commit it, never put real emails into the repo. defaultProfileId comes from running `profiles()` in ego-browser nodejs (ego-profile-check.mjs MODE=list prints it). defaultAccount is the email that must be logged in on that profile — dispatch templates verify it before sending (1 call to /api/auth/session).",
+  "defaultProfileId": "Profile 3",
+  "defaultAccount": "your-plus-account@example.com",
+  "spaceExpect": {
+    "example-special-space-name": "other-account@example.com"
+  }
+}

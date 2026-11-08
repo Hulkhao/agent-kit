@@ -16,6 +16,7 @@
 
 1. 安装 ego lite（本机实测 0.6.2.8，CLI 命令 `ego-browser`，skill 版本 2.2.0）。安装后运行 `ego-browser skill`，它会打印与所装版本匹配的使用指南（**任何浏览器任务前必跑；升级后重跑**）。指南结尾必须是 `[ego-browser:skill] end of guide`，缺了=输出被截断，按指南存文件分段读。
 2. **登录态（口径裁定 2026-11-08）**：**首次使用先检查是否已登录**；未登录则在 ego 浏览器窗口登一次，登录一次后长期有效。实测记载两种情形并存——一项目实测与主 Chrome 共享登录态（免登）、另一项目实测为独立 profile（需登一次）——**以实机为准，不预设**。
+   **多 profile 机器必须账号钉扎（PO 令 2026-11-08，issue #7 根因）**：`taskSpace(名字)` 按名复用旧空间，`profileId` 只在创建空间时生效（`taskSpace(名字, { profileId })`，`profiles()` 列本机 profile）——复用错号建的旧空间会永远用错号跑（实测：无会员账号整会话静默 mini 档）。因此：①本机先配 `~/.agents/ego-profile.json`（模板见 skill `config/ego-profile.example.json`，含 defaultProfileId/defaultAccount/spaceExpect，**永不进仓库**）；②新建空间一律带 profileId；③派单发送前核对页面实际账号（`/api/auth/session` 的 user.email）与钉扎是否一致，不符/无配置/字段缺失一律 STOP 报人，不猜账号；④旧空间不能换账号，不符只能重建空间或人工登录正确账号。校验工具：ego-tools `monitor/ego-profile-check.mjs`。
 3. 编程模型：`ego-browser nodejs < 脚本.mjs`（Git Bash 支持重定向）跑脚本；**每次运行都是新进程**，但 TaskSpace/页面标签（p1/p2…）持久，用 `taskSpace("唯一名")` 恢复。Windows PowerShell 不支持 heredoc；**脚本一律走 UTF-8 `.mjs` 文件**：
    - 每轮新写完整文件（round-01.mjs、round-02.mjs…），不要改旧文件重放（每轮是新进程，旧步骤会重跑）。
    - 一个目标一个目录，如 `C:/Users/<name>/ego/<目标>-<日期时间>/`。

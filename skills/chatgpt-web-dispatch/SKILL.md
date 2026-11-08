@@ -2,18 +2,33 @@
 name: chatgpt-web-dispatch
 description: ChatGPT 网页 Agent 派单工作流（ego-browser）——向 ChatGPT 网页会话派发任务、双循环监控回复、API 提取、会话迁移、429/死页/巨型会话处置。凡涉及 chatgpt.com 会话的派单、监控、提取、迁移任务（含关键词：派单/值守/看门狗/快轮询/提取/迁移会话）必读本 skill。Use for any ChatGPT web conversation dispatch, reply monitoring, extraction, or migration task driven by ego-browser.
 metadata:
-  version: "1.4.0"
+  version: "1.5.0"
   date: "2026-11-08"
 ---
 
 # ChatGPT 网页派单（ego-browser 工作流）
 
-任何 ChatGPT 网页派单/监控/提取/迁移任务，动手前必做两件事：
+任何 ChatGPT 网页派单/监控/提取/迁移任务，动手前必做三件事：
 
-1. **通读本 skill 目录下的唯一真源手册 `references/EGO-LITE-HANDBOOK.md`**——派单全链路（§3）、回复提取（§4）、故障模式与巨型会话迁移（§5）、双循环监控部署（§6）、统一参数表（§7）、新机上手顺序（§10）、上游可靠性补充（§11）。细则与参数一律以手册为准。
-2. **跑 `ego-browser skill`** 获取与所装版本匹配的 API 指南（ego 升级后重跑；输出缺 `[ego-browser:skill] end of guide` 尾行 = 被截断，存文件分段读）。
+1. **开工前自检更新（每次任务前）**：`cd` 本机 agent-kit 仓库 → `git pull` → 若有新提交则跑 `deploy.ps1` 并重读部署副本（新会话自动生效）。**只在任务边界更新**——值守循环运行中禁止热更新（监控脚本换文件会让运行中循环行为不一致）。远程/同事机器同样适用：仓库地址 `github.com/Hulkhao/agent-kit`，pull + deploy 即完成更新，无需等通知。
+2. **通读本 skill 目录下的唯一真源手册 `references/EGO-LITE-HANDBOOK.md`**——派单全链路（§3）、回复提取（§4）、故障模式与巨型会话迁移（§5）、双循环监控部署（§6）、统一参数表（§7）、新机上手顺序（§10）、上游可靠性补充（§11）。细则与参数一律以手册为准。
+3. **跑 `ego-browser skill`** 获取与所装版本匹配的 API 指南（ego 升级后重跑；输出缺 `[ego-browser:skill] end of guide` 尾行 = 被截断，存文件分段读）。
 
 维护口径：本 skill 随 agent-kit git 仓库多机同步；**改手册/skill 只改仓库内这一份**（各机全局公用 `~/.agents/skills/` 下是 `deploy.ps1` 生成的部署副本，勿直接改），改完 commit → push → 各机 pull + 重新 deploy。
+
+## 本机账号钉扎（ego-profile.json，PO 令 2026-11-08，首次使用本 skill 前必配）
+
+**为什么**：`taskSpace(名字)` 按名字复用已存在的空间，ego 的 profileId 只在「创建空间」那一刻生效——复用一个早期用错账号建的空间，就会一直用那个账号跑（实测事故：复用了无会员账号的空间，整个会话静默跑在 mini 档，见 agent-kit#7）。所以账号必须本机钉死+使用前验证。
+
+**配置（机器本地，绝不进仓库、绝不写真实邮箱进 Git）**：复制 `config/ego-profile.example.json` 到本机 `~/.agents/ego-profile.json`（Windows 即 `C:\Users\<你>\.agents\ego-profile.json`），填本机值：
+
+- `defaultProfileId`：本机 ego 的 profile id（跑 `ego-profile-check.mjs` MODE=list 可列出，或 nodejs 里 `await profiles()`）；选登录了 ChatGPT Plus 的那个。
+- `defaultAccount`：该 profile 应登录的账号邮箱——派单模板发送前会用它核对（`/api/auth/session`，每轮 1 次调用）。
+- `spaceExpect`：个别空间要用其他账号时的覆盖项。
+
+**行为口径**：本机没有该配置文件或字段缺失 → `ACCOUNT_CONFIG_MISSING_STOP` / `ACCOUNT_CONFIG_INCOMPLETE_STOP`，**立即停止报人，不猜测账号**；页面实测账号与钉扎不符 → `ACCOUNT_MISMATCH_STOP`。**新建空间**一律 `taskSpace(名字, { profileId })` 带上钉扎的 profile；**旧空间无法换账号**——核对不符只能换空间名重建或人工登录正确账号。
+
+校验工具：ego-tools 仓库 `monitor/ego-profile-check.mjs`（`ego-browser nodejs < ego-profile-check.mjs`，MODE=list/init/verify，详见文件头注释）。
 
 ## 七条铁律（细则见手册）
 

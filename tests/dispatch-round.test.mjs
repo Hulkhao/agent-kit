@@ -91,3 +91,23 @@ test("agent-kit#7: level-gate entry is fail-closed (no silent skip) and bilingua
   // Gate 8 snapshot accepts both locales
   assert.match(src, /textfield "\(询问 ChatGPT\|Ask ChatGPT\)"/);
 });
+
+test("agent-kit#7 root cause: account pin gate (Gate 1.5) precedes ownership; missing/incomplete config stops, never guesses", async () => {
+  const src = await template();
+  const order = [
+    'abort("ACCOUNT_CONFIG_MISSING_STOP")',
+    'abort("ACCOUNT_CONFIG_INCOMPLETE_STOP")',
+    'abort("ACCOUNT_UNPROVEN_STOP")',
+    'abort("ACCOUNT_MISMATCH_STOP:" + SPACE)',
+    "verifyDraftOwnership({ draft, payload, record: existing })",
+  ];
+  let pos = -1;
+  for (const marker of order) {
+    const at = src.indexOf(marker);
+    assert.ok(at >= 0, `missing account-pin marker: ${marker}`);
+    assert.ok(at > pos, `account-pin order violated at: ${marker}`);
+    pos = at;
+  }
+  // config is machine-local, read from ~/.agents, never embedded in the repo
+  assert.match(src, /homedir\(\) \+ "\/.agents\/ego-profile\.json"/);
+});

@@ -17,6 +17,7 @@ if ([MON, SPACE, CONV].some((v) => v.startsWith("REPLACE_")) || MSG_FILE.startsW
 import * as fs from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 import { createHash } from "node:crypto";
+import { homedir } from "node:os";
 
 const {
   appendEvent, prepareDispatch, markSendStarted, markAccepted, markUncertain,
@@ -56,6 +57,20 @@ if (!surface0.hostOk || !surface0.composerPresent) abort("COMPOSER_SURFACE_UNAVA
 if (surface0.generating) abort("PREVIOUS_GENERATION_STILL_ACTIVE");
 
 const existing = await readDispatchState(MON).catch(() => null);
+
+// ---- Gate 1.5: account pin (PO 令 2026-11-08, issue #7 root cause) — profileId only applies at
+// space CREATION, so a resumed space keeps whatever account it was born with. Verify the account
+// actually logged in on this page against the machine-local pin BEFORE anything is filled or sent.
+let profileCfg = null;
+try { profileCfg = JSON.parse(await fs.readFile(homedir() + "/.agents/ego-profile.json", "utf-8")); }
+catch { abort("ACCOUNT_CONFIG_MISSING_STOP"); } // no pin on this machine: stop, never guess the account
+const expectedAccount = (profileCfg.spaceExpect && profileCfg.spaceExpect[SPACE]) || profileCfg.defaultAccount;
+if (!expectedAccount || !profileCfg.defaultProfileId) abort("ACCOUNT_CONFIG_INCOMPLETE_STOP");
+let session = null;
+try { session = await page.fetch("/api/auth/session"); } catch {} // 1 call, inside the ≤2-per-wake budget
+const accountEmail = session?.user?.email || null;
+if (!accountEmail) abort("ACCOUNT_UNPROVEN_STOP");
+if (accountEmail !== expectedAccount) abort("ACCOUNT_MISMATCH_STOP:" + SPACE);
 
 // Resume only a PREPARED record of THIS exact payload (interrupted fill of the same message).
 const resume = existing?.status === "PREPARED" && existing.payload_sha256 === payloadHash;
