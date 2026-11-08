@@ -76,3 +76,18 @@ test("FRESHEN: fires before the fill, resets the counter, distinct goto_reason",
   assert.ok(freshenAt < fillAt, "FRESHEN must precede the fill");
   assert.match(src, /resetFillCount\(MON, SPACE\)/);
 });
+
+test("agent-kit#7: level-gate entry is fail-closed (no silent skip) and bilingual; composer is targeted not first-contenteditable", async () => {
+  const src = await template();
+  // bilingual entry selector
+  assert.match(src, /aria-label="选择 ChatGPT 模型"\], button\[aria-label="Model selector"\]/);
+  // menu unavailable = STOP, never skip to Gate 8
+  assert.match(src, /abort\("LEVEL_GATE_MENU_UNAVAILABLE_STOP"\)/);
+  const gate7 = src.slice(src.indexOf("Gate 7"), src.indexOf("Gate 8"));
+  assert.match(gate7, /!menuInfo \|\| !modelOk \|\| !levelOk/, "missing menu must abort, not pass");
+  // targeted composer: aria-label selectors precede the generic contenteditable fallback
+  const sel = src.match(/const COMPOSER_SEL = ([^;]+);/)[1];
+  assert.ok(sel.indexOf('aria-label="询问 ChatGPT"') < sel.indexOf('#prompt-textarea'), "targeted composer selector must precede generic fallback");
+  // Gate 8 snapshot accepts both locales
+  assert.match(src, /textfield "\(询问 ChatGPT\|Ask ChatGPT\)"/);
+});

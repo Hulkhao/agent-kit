@@ -52,7 +52,7 @@
 | 响应检测 | 结构化尾部（`data-content-search-unit-key` 末段 role + assistant DIL UUID，见 §6.2 DOM 契约）+ 可见停止按钮 | `data-message-author-role` 属性已彻底消失（§11.10），文本标记（「你说」等）禁作状态依据 |
 | 页内 API | `page.fetch("/api/auth/session")` 拿 accessToken，再带 `Authorization: Bearer` 打 `/backend-api/conversation/<uuid>` | 同源带 cookie；**仅作辅助证据通道：单次验证/提取，每次唤醒最多 2 个调用，禁止轮询**；2026-11-08 实测该通道 404 `conversation_inaccessible`（见 §4），不得据此判会话死亡 |
 
-**模型/思考强度 UI 预检（2026-11-08 实测）**：模型选择读取 `menuitemradio` 的 `aria-checked`，目标 GPT-6 必须 `aria-checked=true`；思考强度读取 `slider` 的 `aria-valuemin`/`aria-valuemax`/`aria-valuenow`（Plus 实测 min=0、max=2、now=2 对应 High）。**不再匹配旧文案「高，第 3 项，共 3 项」**；五档会员的 High 数值需独立校准。
+**模型/思考强度 UI 预检（2026-11-08 实测）**：模型选择读取 `menuitemradio` 的 `aria-checked`，目标 GPT-6 必须 `aria-checked=true`；思考强度读取 `slider` 的 `aria-valuemin`/`aria-valuemax`/`aria-valuenow`（Plus 实测 min=0、max=2、now=2 对应 High）。**不再匹配旧文案「高，第 3 项，共 3 项」**；五档会员的 High 数值需独立校准。**locale 边界（R2.5 裁定）：读取属性 locale 无关，但入口按钮不是**——中文按钮 `aria-label="选择 ChatGPT 模型"` 在英文界面不存在（部分英文界面变体甚至没有模型菜单入口，agent-kit#7 实测）；菜单打不开或读不到 = `LEVEL_GATE_MENU_UNAVAILABLE_STOP` fail-closed，**禁止静默跳过预检继续发送**（实测事故：跳过后会话从建号起静默跑在 mini 档）。英文界面 Agent 的兜底：把 chatgpt.com 界面语言切回中文，或事后用 conversation API 的 `metadata.model_slug` 审计已产出的回复档位。**composer 定位必须按 aria-label 定向**（`询问 ChatGPT`/`Ask ChatGPT`），禁止「第一个 contenteditable」——半渲染代码块的 Edit code 编辑器与其同类，会误吸填充（#7 实测）。
 
 **静默生成死亡**（实测两次）：user 气泡入库、页面转空闲、但服务端没有任何 assistant 节点——用 API 核实后发短消息催办即可激活。
 

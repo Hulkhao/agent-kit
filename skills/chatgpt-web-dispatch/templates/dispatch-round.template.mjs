@@ -37,7 +37,9 @@ for (const p of (await task.pages())) {
 if (!page) { console.log("RESULT=CONVERSATION_PAGE_MISSING"); process.exit(1); }
 
 const abort = (code) => { console.log("RESULT=" + code); process.exit(1); };
-const COMPOSER_SEL = '#prompt-textarea, [data-testid="prompt-textarea"], [contenteditable="true"][role="textbox"]';
+// Targeted composer selection: the first contenteditable on the page may be a rendered
+// code block's "Edit code" editor (EN-UI field test, agent-kit#7) — aria-label wins, generic fallbacks last.
+const COMPOSER_SEL = '[contenteditable="true"][role="textbox"][aria-label="询问 ChatGPT"], [contenteditable="true"][role="textbox"][aria-label="Ask ChatGPT"], #prompt-textarea, [data-testid="prompt-textarea"], [contenteditable="true"][role="textbox"]';
 
 const readRaw = () => page.evaluate((sel) => {
   const el = document.querySelector(sel);
@@ -151,29 +153,36 @@ if (!readbackMatches(payload, composerText)) {
 const dispatch = resume ? existing :
   await prepareDispatch({ monitorDir: MON, conversationUuid: CONV, taskSpace: SPACE, pageLabel: page.label, page, payload });
 
-// ---- Gate 7: thinking-level precheck (aria contract, locale-independent) ----
-await page.click('button[aria-label="选择 ChatGPT 模型"]', { label: "open model menu" });
-await page.waitForTimeout(1500);
-const menuInfo = await page.evaluate(() => {
-  const m = document.querySelector("[role='menu']");
-  if (!m) return null;
-  return {
-    radios: [...m.querySelectorAll("[role='menuitemradio']")].map((el) => ({ label: (el.textContent || "").trim().slice(0, 30), checked: el.getAttribute("aria-checked") })),
-    sliders: [...m.querySelectorAll("[role='slider']")].map((el) => ({ now: el.getAttribute("aria-valuenow"), max: el.getAttribute("aria-valuemax") })),
-  };
-});
+// ---- Gate 7: thinking-level precheck — READ is locale-independent (aria attrs); ENTRY is bilingual.
+// The EN-UI variant may have NO model menu at all (agent-kit#7): a click failure or missing menu is
+// a fail-closed STOP, never a silent skip — a skipped gate is how a session ran unnoticed on mini.
+let menuInfo = null;
+try {
+  await page.click('button[aria-label="选择 ChatGPT 模型"], button[aria-label="Model selector"]', { label: "open model menu" });
+  await page.waitForTimeout(1500);
+  menuInfo = await page.evaluate(() => {
+    const m = document.querySelector("[role='menu']");
+    if (!m) return null;
+    return {
+      radios: [...m.querySelectorAll("[role='menuitemradio']")].map((el) => ({ label: (el.textContent || "").trim().slice(0, 30), checked: el.getAttribute("aria-checked") })),
+      sliders: [...m.querySelectorAll("[role='slider']")].map((el) => ({ now: el.getAttribute("aria-valuenow"), max: el.getAttribute("aria-valuemax") })),
+    };
+  });
+} catch (error) {
+  abort("LEVEL_GATE_MENU_UNAVAILABLE_STOP"); // dispatch surface unprovable here; do NOT send
+}
 await page.keyboard.press("Escape");
 await page.waitForTimeout(600);
 const modelOk = menuInfo && menuInfo.radios.some((r) => r.label === "GPT-6" && r.checked === "true");
 const levelOk = menuInfo && menuInfo.sliders.some((s) => String(s.now) === "2" && String(s.max) === "2");
-if (!modelOk || !levelOk) abort("LEVEL_GATE_FAIL_ABORT");
+if (!menuInfo || !modelOk || !levelOk) abort("LEVEL_GATE_FAIL_ABORT");
 
 // ---- Gate 8: fresh ref lifecycle (R2.5-S) — every attempt re-snapshots; ≤3 focus tries;
 // send-button disabled check; SEND_STARTED persisted BEFORE Enter; old refs never reused ----
 let sent = false;
 for (let focusAttempt = 1; focusAttempt <= 3 && !sent; focusAttempt++) {
   const snap = await page.snapshot({ scope: "full_page" });
-  const tfLine = snap.split("\n").reverse().find((l) => /textfield "询问 ChatGPT"/.test(l));
+  const tfLine = snap.split("\n").reverse().find((l) => /textfield "(询问 ChatGPT|Ask ChatGPT)"/.test(l));
   const ref = tfLine && (tfLine.match(/\[ref=(\d+)/) || [])[1];
   if (!ref) continue;
   try {
