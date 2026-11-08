@@ -42,7 +42,7 @@ metadata:
 
 ## 相关事实源
 
-- 监控脚本唯一存放点：ego-tools 仓库（R2.2 验收基线 `fd6da71`，父基线 `32c3658`；路径与本机部署状态见手册 §6；要改脚本只改那一份）。状态机文件：`dispatch-state.mjs`（派单账本 + 结构化 Composer/尾部读取）、`state-schema.mjs`（v3 Schema + 绝对 deadline）、`page-recovery.mjs`（多 Page URL-UUID 消歧）。
+- 监控脚本唯一存放点：**官方仓库 `github.com/Hulkhao/ego-tools`**（R2.5 复审基线见分支 feat/stay-on-page-probe-20261108；要改脚本只改仓库内这一份，禁止本地另立孤本副本）。**开工前 `git pull` 同步官方最新**（与 agent-kit 同一口径，任务边界更新）。状态机文件：`dispatch-state.mjs`（派单账本 + 结构化 Composer/尾部读取）、`state-schema.mjs`（v3 Schema + 绝对 deadline）、`page-recovery.mjs`（多 Page URL-UUID 消歧）、`ego-profile-check.mjs`（本机账号钉扎校验）。
 - **派单规范模板**：`templates/dispatch-round.template.mjs`（R2.5 九闸门冻结事务链，见手册 §3.1）。新派单任务以它为底本，只改顶部适配器常量（MON/SPACE/MSG_FILE/CONV），遇到 `ADAPTATION_REQUIRED` 说明环境与模板假设不符，STOP 上报，不要徒手重写链路。
 - 跨机器交付的 SHA256 必须注明哈希对象与字节基准（Git blob / 下载文件 / 部署磁盘，注明 LF/CRLF），见手册 §11.10。
 - 通用浏览器操作（非 ChatGPT 派单流）见 `ego-browser` skill。
