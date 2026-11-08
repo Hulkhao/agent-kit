@@ -22,7 +22,7 @@ import { homedir } from "node:os";
 const {
   appendEvent, prepareDispatch, markSendStarted, markAccepted, markUncertain,
   readComposerSurface, readDispatchState,
-  chunkPayload, readbackMatches, readbackMode, verifyDraftOwnership,
+  chunkPayload, readbackMatches, readbackMode, classifyChunkReadback, verifyDraftOwnership,
   getFillCount, recordFillAttempt, resetFillCount,
   markComposerFreeze, findUnconsumedComposerFreeze,
 } = await import(pathToFileURL(MON + "/dispatch-state.mjs").href);
@@ -170,15 +170,21 @@ if (await getFillCount(MON, SPACE) >= 3) { // Gate 3 (FRESHEN)
 const dispatch = resume ? existing :
   await prepareDispatch({ monitorDir: MON, conversationUuid: CONV, taskSpace: SPACE, pageLabel: page.label, page, payload });
 
-// ---- Gate 5: fill (R2.5-F chunk rule); one whole round = one fill attempt ----
+// ---- Gate 5: adaptive fill with cumulative-prefix readback (R2.6-F) ----
 await recordFillAttempt(MON, SPACE);
-const chunks = chunkPayload(payload, 1200);
+const chunks = chunkPayload(payload, 1200, 600);
+const fillReadbackMode = readbackMode(payload);
+let expectedPrefix = "";
+let composerText = "";
 for (const chunk of chunks) {
-  let ok = false;
-  for (let attempt = 0; attempt < 2 && !ok; attempt++) {
-    const r = await composerOp(() => page.evaluate(({ sel, text }) => {
+  const nextPrefix = expectedPrefix + chunk;
+  let verified = false;
+  for (let attempt = 0; attempt < 2 && !verified; attempt++) {
+    // execCommand's boolean is not proof of insertion. The Composer's actual cumulative text
+    // is authoritative: accept a completed insert even if execCommand returned false.
+    await composerOp(() => page.evaluate(({ sel, text }) => {
       const el = document.querySelector(sel);
-      if (!el) return { ok: false };
+      if (!el) return false;
       el.focus();
       const range = document.createRange();
       range.selectNodeContents(el);
@@ -186,25 +192,42 @@ for (const chunk of chunks) {
       const selObj = window.getSelection();
       selObj.removeAllRanges();
       selObj.addRange(range);
-      return { ok: !!document.execCommand("insertText", false, text) };
+      document.execCommand("insertText", false, text);
+      return true;
     }, { sel: COMPOSER_SEL, text: chunk }));
-    ok = r?.ok === true;
-    if (!ok && attempt === 0) await page.waitForTimeout(2500);
+    await page.waitForTimeout(450);
+    composerText = await readRaw();
+
+    const readbackState = classifyChunkReadback(expectedPrefix, nextPrefix, composerText, fillReadbackMode);
+    if (readbackState === "INSERTED") {
+      expectedPrefix = nextPrefix;
+      verified = true;
+      break;
+    }
+    // Retry only when the Composer is provably unchanged. Partial, reordered, or foreign
+    // content is not repaired automatically; stop before it can reach the send gate.
+    if (readbackState === "MISMATCH") abort("CHUNK_READBACK_MISMATCH");
+    if (attempt === 0) {
+      await page.waitForTimeout(1000);
+      // Re-read immediately before retry: a delayed insertion may have completed during the wait.
+      composerText = await readRaw();
+      const retryReadbackState = classifyChunkReadback(expectedPrefix, nextPrefix, composerText, fillReadbackMode);
+      if (retryReadbackState === "INSERTED") {
+        expectedPrefix = nextPrefix;
+        verified = true;
+        break;
+      }
+      if (retryReadbackState === "MISMATCH") abort("CHUNK_READBACK_MISMATCH");
+    }
   }
-  if (!ok) abort("CHUNK_INSERT_FAILED");
-  await page.waitForTimeout(450);
+  if (!verified) abort("CHUNK_INSERT_NO_EFFECT");
 }
 
-// ---- Gate 6: full readback, two-level per payload class (R2.5-F) ----
-let composerText = "";
-for (let a = 0; a < 8 && !composerText; a++) {
-  composerText = await readRaw();
-  if (!composerText) await page.waitForTimeout(3000);
-}
-// strict mode (URL/code/commands): raw compare only — rendered innerText cannot prove fidelity,
-// so a mismatch means STOP; normalized mode (plain text): collapse DOM block artifacts first.
-if (!readbackMatches(payload, composerText)) {
-  abort(readbackMode(payload) === "strict" ? "SENSITIVE_FIDELITY_UNPROVEN" : "READBACK_NOT_VERIFIED_ABORT");
+// ---- Gate 6: final full-payload verdict, using the last cumulative readback (no duplicate DOM read).
+// Empty payloads have no chunks, so read the Composer once to establish their empty-slate state.
+if (chunks.length === 0) composerText = await readRaw();
+if (!readbackMatches(payload, composerText, fillReadbackMode)) {
+  abort(fillReadbackMode === "strict" ? "SENSITIVE_FIDELITY_UNPROVEN" : "READBACK_NOT_VERIFIED_ABORT");
 }
 
 // ---- Gate 7: thinking-level precheck — READ is locale-independent (aria attrs); ENTRY is bilingual.

@@ -45,8 +45,8 @@
 | 导航 | `page.goto(url)` + `waitForLoadState("load")` | 刚 load 完立刻 snapshot 可能缺 composer（水合瞬态），重取一次快照即可；URL 比对用 `includes(uuid)`（见 §2） |
 | 观察页面 | `page.snapshot()` 语义快照带 ref；**输入框不在默认视口快照里，必须 `snapshot({scope:"full_page"})`** | 会话页 composer 是 `textfield "询问 ChatGPT"`，项目页新聊天是 `textfield "在"XX"中新建聊天"`；输入框是 contenteditable 不是 textbox；**坑 2：snapshot 偶尔不出 textbox 行——在发送按钮附近按行号上下文找** |
 | ref 提取 | 快照行内格式是 `[ref=368]`，提取正则用 `ref=(\d+)` | 不是 `@368` 格式 |
-| 填充 | **~1.2KB 线边界分块 + 每块 `document.execCommand("insertText", false, chunk)`**（2026-11-08 实测口径） | `fill()` 会产生 CDP 幽灵补全且带损伤、原生 `paste()` 需前台且后台窗口静默失败、单次长文本 `execCommand` 会冻结页面数十秒——三者均不作为可靠投递通道；单行超限再按 Unicode 码点拆分 |
-| 回读核对 | 全文回读 innerText，规范化 CRLF、去除每行尾随空格后做**完整 diff** | 未完全一致不得发送；`goto` 后旧草稿复活 = STOP 标 `DRAFT_PERSISTED`，不覆盖、不追加、不发送；Composer 空态 innerText 是 `"\n"`（长度 1），勿用 `length===0` 判空 |
+| 填充 | **600 grapheme 目标 + 1200 UTF-8 字节硬上限；每块 `insertText` 后回读整个 Composer 的累计前缀**（R2.6-F） | 以 Composer 实际内容为准，不以 `execCommand` 返回值判成功；只有仍等于上一累计前缀才允许当前块重试一次；部分、乱序或无法判定立即 STOP。原生 `paste()`、`fill()` 和单次长文本插入不作为可靠投递通道 |
+| 回读核对 | 每块回读整个 Composer 并核对累计前缀；最终块结果复用为 Gate 6 全文 verdict | 未完全一致不得发送；`goto` 后旧草稿复活 = STOP 标 `DRAFT_PERSISTED`，不覆盖、不追加、不发送；Composer 空态 innerText 是 `"\n"`（长度 1），勿用 `length===0` 判空 |
 | **发送** | **默认 `page.focus("@ref")` + `page.keyboard.press("Enter")`** | **口径裁定 2026-11-08：统一默认 Enter + 双验；Enter 失败再回退 click「发送」按钮**。发送前必须确认按钮可用：`button[aria-label=发送]` `disabled/aria-disabled=true` = 陈旧页（实测：文字满框但 Enter 与 click 全静默无效），先 `goto` 刷新重读再发。页面状态用 `el.focus()`（evaluate 内）不足以路由键盘事件，必须 ego 级 `page.focus("@ref")` |
 | URL 确认 | 发送后等 5~10 秒再取 URL | 过渡地址 `local-chatgpt%` 开头=草稿 id，必须重取真 `/c/<uuid>` |
 | 发送双验 | 结构化证据：**尾部 unit key 前进为 `:user`** + 停止按钮出现（生成态）——缺一不可 | 命令「✓ Done」回执不可信（假成功事故多起）；「你说：/You said:」计数在虚拟化 DOM 下不可靠，禁作基线 |
@@ -60,15 +60,15 @@
 **附件上传 DOM 契约（2026-11-08 实测 19 文件一次挂载成功，issue #4）**：源码/任意类型附件走 composer 的 `input[aria-label="附加文件"]`（accept 为空的通用 input）；「拍照/添加照片/附加照片或视频」类按钮均限 `accept=image|video`，**不能用于源码附件**。顺序固定：**先 `setInputFiles` 一次性挂全部文件 → 再 fill 文本 → Enter 一次发送**（不要挂一个发一个）。附件落在代码解释器 `/mnt/data`，可绕过「沙箱无法承接多文件」类阻断。监控侧 composer 定位同口径：`dispatch-state.mjs` 的 `readComposerSurface` 与模板 `COMPOSER_SEL` 一致（aria-label 优先 → id/testid → 非代码编辑器的 contenteditable 回退），含代码块页面不再误读出假 FOREIGN_DRAFT_STOP（#9 实测）。
 
 
-### 3.1 R2.5 派单冻结事务链（LIMITED GO · AUTHORIZED，规划师裁决 reply-r43）
+### 3.1 R2.5 派单冻结事务链（R2.6-F 自适应填充扩展，LIMITED GO · AUTHORIZED，规划师裁决 reply-r43）
 
-**核心验收哲学**：不会误发、不会重复发、不会覆盖用户草稿、不会因页面冻结丢失派单。完整链路：**PREPARED → 填充 → 完整回读 → 刷新 Composer ref → 所有权确认 → SEND_STARTED → Enter → AUTO_ACCEPTED**；任何一步无法证明，都不得进入下一步。规范模板：`templates/dispatch-round.template.mjs`（九闸门实现，新派单任务照抄改适配器，不要徒手重写）。
+**核心验收哲学**：不会误发、不会重复发、不会覆盖用户草稿、不会因页面冻结丢失派单。完整链路：**PREPARED → 分块插入 + 每块累计前缀回读 → Gate 6 全文 verdict → 刷新 Composer ref → 所有权确认 → SEND_STARTED → Enter → AUTO_ACCEPTED**；任何一步无法证明，都不得进入下一步。规范模板：`templates/dispatch-round.template.mjs`（九闸门实现，新派单任务照抄改适配器，不要徒手重写）。
 
 **R2.5 复审补强（reply-r44 REWORK REQUIRED 定点修正，全部已落地模板）**：①账本读取 fail-closed——冻结事件/派单账本**文件缺失=可证明为空**，**读取损坏/IO 错误必须 STOP**（`FREEZE_LEDGER_READ_FAILED`/`DISPATCH_LEDGER_READ_FAILED`），绝不把读失败当「没有记录」；②PREPARED 持久化**前移到首次填充之前**（中断后凭持久化身份恢复，不靠运行时现场）；③导航只有**一个 `navigate(reason)` 入口**（单一 gotoAt 时间戳 + GOTO_ATTEMPT 事件），模板禁止直接 `page.goto`；**任何 goto 后必须重跑草稿复活检查**（重读 Composer → 所有权 → 必要时清空 → 验空）；④发送路径**只允许 snapshot/ref/focus 重试**：focus 成功后发送最多执行一次——发送按钮**不存在也是 STOP**（`SEND_BUTTON_MISSING_STOP`），SEND_STARTED 后先对当前 Composer 做最终内容复核，Enter 单独 try、抛错即标 UNCERTAIN 且**绝不重进发送循环**；⑤**所有 Composer evaluate/读取统一包进冻结通道**（composerOp 包装），初始表面读、草稿读、清空、复核无一例外。
 
 - **账本指纹化（R2.5 起）**：PREPARED 记录只存 `payload_sha256` / `payload_bytes` / `composer_baseline`，**禁止保存完整提示词正文、前缀后缀片段、事件日志正文、诊断用 Composer 全文副本**。哈希是指纹不是匿名化——泄漏原文的风险不因哈希消除，绝不能把哈希当脱敏后仍可外发的原文用。
-- **填充分块规则**：以行为单位切分；每个非末块携带自己的行尾换行；每块 ≤1.2KB（UTF-8 字节）；`chunks.join()` 必须精确还原原文；单行超限报 `CHUNK_LINE_EXCEEDS_LIMIT` 停止，不静默拆行。
-- **两级回读核对**：普通文本走**归一化**（折叠空白伪影 `\s+→" "` 后比对）；含 URL / 代码块 / 命令行（`/https?:\/\/|www\.|```|^\s*[$>]/m` 命中）走**严格保真**原文比对——innerText 无法证明字节级保真即 STOP（`SENSITIVE_FIDELITY_UNPROVEN`），宁可不发，不发错。
+- **R2.6-F 填充分块规则**：以 grapheme cluster 为单位（`Intl.Segmenter`），600 grapheme 为目标、1200 UTF-8 byte 为硬上限；非末块边界尽量移入下一行内部，字节上限不允许时回退到上一行内部；`chunks.join()` 必须精确还原原文；单个 grapheme 超过字节上限报 `CHUNK_GRAPHEME_EXCEEDS_LIMIT`。每块 `insertText` 后回读整个 Composer：累计前缀等于预期新前缀=成功（不依赖 `execCommand` 返回值）；仍等于上一前缀=等待后复读，确认仍未变化才重试当前块一次；部分、乱序或无法证明= `CHUNK_READBACK_MISMATCH` STOP；最后一块回读复用 Gate 6，不重复读取。
+- **两级回读核对**：普通文本走**归一化**（折叠空白伪影 `\s+→" "` 后比对）；含 URL / 代码块 / 命令行（`/https?:\/\/|www\.|```|^\s*[$>]/m` 命中）走**严格保真**原文比对；每块累计前缀使用**完整 payload 的 readbackMode**，不能因敏感标记尚在后续块而提前降级为普通文本；innerText 无法证明严格保真即 STOP（`SENSITIVE_FIDELITY_UNPROVEN`）。
 - **草稿所有权（R2.5-O）**：Composer 现文必须等于本次 payload 全文、或为其按顺序的有效前缀（同样空白折叠后比对），才算「我们的草稿」；历史草稿只凭持久化哈希精确匹配认领；**禁止把任意子串当所有权证据**；空草稿是独立分支。不归属 → `FOREIGN_DRAFT_STOP` 停止；确认为自己的残留才清空（`selectNodeContents` + `deleteFromDocument`，清空后必须回验空态）。
 - **SEND_STARTED 后锁定**：状态一旦进入 SEND_STARTED 及之后，禁止清空、重填、重发；进程重启后先对账，UNCERTAIN 由主管人工裁定，不自动重发（at-most-once）。
 - **发送 ref 生命周期**：每次 focus 尝试前重新 `page.snapshot()` 取新 ref（旧 ref 跨尝试不复用）；最多 3 次 focus 尝试；发送按钮 `disabled` = 陈旧页，先 goto 刷新重读再发；`markSendStarted` 必须持久化在 Enter **之前**。

@@ -281,28 +281,75 @@ export async function reconcileDispatch(monitorDir, conversationUuid, surface) {
 
 // ---- R2.5 Composer delivery reliability (planner ruling reply-r43.txt) ----
 
-// R2.5-F chunk rule (frozen): split by lines; every non-last chunk carries its own trailing
-// newline; each chunk stays within the UTF-8 byte limit. join() reconstructs the payload exactly.
-export function chunkPayload(text, limit = 1200) {
+// R2.6-F adaptive chunking: target 600 user-perceived graphemes, with a hard 1200-byte UTF-8 cap.
+// Keep the existing second argument as the UTF-8 byte limit for caller compatibility.
+// Chunks preserve exact source text. When a boundary touches a line break, move it into the
+// following line where the byte cap allows; otherwise retreat into the preceding line.
+export function chunkPayload(text, byteLimit = 1200, targetChars = 600) {
   if (typeof text !== "string") throw new TypeError("PAYLOAD_NOT_STRING");
-  if (!Number.isInteger(limit) || limit < 1) throw new TypeError("LIMIT_NOT_POSITIVE_INT");
-  const byteLen = (s) => Buffer.byteLength(s, "utf8");
-  const lines = text.split("\n");
-  const chunks = [];
-  let current = "";
-  for (let i = 0; i < lines.length; i++) {
-    // every non-last line carries its own newline, so chunk boundaries never eat separators
-    const piece = i < lines.length - 1 ? lines[i] + "\n" : lines[i];
-    if (piece && byteLen(piece) > limit) throw new Error("CHUNK_LINE_EXCEEDS_LIMIT");
-    if (current && byteLen(current + piece) > limit) {
-      chunks.push(current);
-      current = "";
-    }
-    current += piece;
+  if (!Number.isInteger(byteLimit) || byteLimit < 1) throw new TypeError("BYTE_LIMIT_NOT_POSITIVE_INT");
+  if (!Number.isInteger(targetChars) || targetChars < 1) throw new TypeError("TARGET_CHARS_NOT_POSITIVE_INT");
+  if (typeof Intl.Segmenter !== "function") throw new Error("GRAPHEME_SEGMENTER_UNAVAILABLE");
+
+  const graphemes = Array.from(
+    new Intl.Segmenter("und", { granularity: "grapheme" }).segment(text),
+    (item) => item.segment,
+  );
+  const byteLengths = graphemes.map((part) => Buffer.byteLength(part, "utf8"));
+  const isLineBreak = (part) => part === "\n" || part === "\r" || part === "\r\n";
+
+  for (const byteLength of byteLengths) {
+    if (byteLength > byteLimit) throw new Error("CHUNK_GRAPHEME_EXCEEDS_LIMIT");
   }
-  if (current) chunks.push(current);
+
+  const chunks = [];
+  let start = 0;
+  while (start < graphemes.length) {
+    let end = start;
+    let chunkBytes = 0;
+    while (end < graphemes.length && end - start < targetChars &&
+      chunkBytes + byteLengths[end] <= byteLimit) {
+      chunkBytes += byteLengths[end];
+      end++;
+    }
+    if (end === start) throw new Error("CHUNK_GRAPHEME_EXCEEDS_LIMIT");
+
+    // Do not leave a non-final chunk exactly at a line edge. Prefer crossing the line break
+    // and taking one grapheme from the next line; if that cannot fit, retreat into this line.
+    if (end < graphemes.length &&
+      (isLineBreak(graphemes[end - 1]) || isLineBreak(graphemes[end]))) {
+      let forwardEnd = end;
+      let forwardBytes = chunkBytes;
+      while (forwardEnd < graphemes.length && isLineBreak(graphemes[forwardEnd])) {
+        if (forwardBytes + byteLengths[forwardEnd] > byteLimit) break;
+        forwardBytes += byteLengths[forwardEnd];
+        forwardEnd++;
+      }
+      if (forwardEnd === graphemes.length) {
+        // Trailing line breaks can be absorbed into the final chunk without a next-line character.
+        end = forwardEnd;
+      } else if (!isLineBreak(graphemes[forwardEnd]) &&
+        forwardBytes + byteLengths[forwardEnd] <= byteLimit) {
+        end = forwardEnd + 1;
+      } else {
+        let adjustedEnd = end;
+        while (adjustedEnd > start &&
+          (isLineBreak(graphemes[adjustedEnd - 1]) || isLineBreak(graphemes[adjustedEnd]))) {
+          adjustedEnd--;
+        }
+        if (adjustedEnd > start) end = adjustedEnd;
+      }
+    }
+
+    const chunk = graphemes.slice(start, end).join("");
+    if (Buffer.byteLength(chunk, "utf8") > byteLimit) throw new Error("CHUNK_BYTE_LIMIT_EXCEEDED");
+    chunks.push(chunk);
+    start = end;
+  }
   return chunks;
 }
+
+// chunkPayload output is source-preserving; Composer normalization is readback-only.
 
 // R2.5-F composer artifact normalization (readback only): collapse whitespace runs to one space.
 // Never applied to the delivered payload itself or to sensitive-content fidelity checks.
@@ -325,13 +372,35 @@ export function readbackMode(payload) {
   return isSensitivePayload(payload) ? "strict" : "normalized";
 }
 
-export function readbackMatches(payload, composerText) {
+export function readbackMatches(payload, composerText, mode = readbackMode(payload)) {
   if (typeof payload !== "string" || typeof composerText !== "string") return false;
-  if (readbackMode(payload) === "strict") {
+  if (mode === "strict") {
     return composerText === payload ||
       composerText.replace(/\r\n/g, "\n") === payload.replace(/\r\n/g, "\n");
   }
+  if (mode !== "normalized") return false;
   return collapseComposerArtifacts(composerText).trim() === collapseComposerArtifacts(payload).trim();
+}
+
+export function classifyChunkReadback(previousPrefix, nextPrefix, composerText, mode = "normalized") {
+  if (typeof previousPrefix !== "string" || typeof nextPrefix !== "string" ||
+    typeof composerText !== "string") return "MISMATCH";
+  const matches = (expected) => expected.length === 0
+    ? composerText.trim().length === 0
+    : readbackMatches(expected, composerText, mode);
+  const nextMatches = matches(nextPrefix);
+  const previousMatches = matches(previousPrefix);
+  if (nextMatches && previousMatches) {
+    // Whitespace normalization can make a whitespace-only insert indistinguishable.
+    // Accept only raw identity (with CRLF equivalence); otherwise the result is unprovable.
+    const raw = (value) => value.replace(/\r\n/g, "\n");
+    if (raw(composerText) === raw(nextPrefix)) return "INSERTED";
+    if (raw(composerText) === raw(previousPrefix)) return "NO_EFFECT";
+    return "MISMATCH";
+  }
+  if (nextMatches) return "INSERTED";
+  if (previousMatches) return "NO_EFFECT";
+  return "MISMATCH";
 }
 
 // R2.5-O ownership verification (frozen): full text or in-order valid prefix of the CURRENT
