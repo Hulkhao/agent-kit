@@ -96,7 +96,7 @@ const r = await page.fetch("/backend-api/conversation/" + uuid,
 
 - UI 状态只由结构化证据判定：**generating 只认可见 Stop 控件（`offsetParent!==null`）**，禁匹配「正在思考」等文本；**dead/unavailable 禁全文/子串匹配「无法加载此 ChatGPT 对话」等可被会话引用的字符串**。
 - 页面不可用：以 ChatGPT 主机、就绪门槛、Composer 控件等结构化证据判断；结构缺失时重试记 strike（状态字段 `unavailableStrikes` / `unavailablePersistent`），三次仍失败只报告 `CONVERSATION_UNAVAILABLE_PERSISTENT`，**不声称已证明会话永久死亡**。
-- 可靠信号：**「有可见停止按钮 → 没有停止按钮」的翻转** = 回答完成候选。DONE 判定（75 秒确认窗后）：生成控件消失 + **Composer 为空（按 `"\n"` 空态归一化）** + **尾部 assistant DIL UUID 稳定** + 消息长度稳定 + 无 busy/progress 控件。仍只是 `DONE_CANDIDATE`，主管终验后才 COMPLETED。
+- 可靠信号：**「有可见停止按钮 → 没有停止按钮」的翻转** = 回答完成候选。DONE 判定（75 秒确认窗后）：生成控件消失 + **Composer 为空（判空语义 = `composerText.trim() === ''`，`composerLength` 固定保留原始 `innerText.length`，R2.3 已核实落地实现）** + **尾部 assistant DIL UUID 稳定** + 消息长度稳定 + 无 busy/progress 控件。仍只是 `DONE_CANDIDATE`，主管终验后才 COMPLETED。
 - 工具调用专用选择器未取得真实 DOM/Accessibility 样本前，`toolState=UNOBSERVED`，不得伪造工具状态。
 - **两个致命误判源**：
   1. 转写里折叠的活动日志含「正在思考」字样——**生成态探测只认可见的停止按钮，禁止文本匹配**（会永久误判生成中）；
@@ -132,6 +132,7 @@ const r = await page.fetch("/backend-api/conversation/" + uuid,
   - **不再使用** `[data-message-author-role]`、`[data-message-id]`、`article` 作为消息身份锚点（2026-11-08 实测页面全部为 0）；**不匹配** `MarkdownRoot-*`、`DilRenderer-*` 等带构建哈希的类名。
   - `data-chatgpt-selection-conversation-id`、`data-chatgpt-selection-message-id` 仅作辅助锚点，不替代尾部 assistant DIL UUID。
   - **goto/刷新后 DOM 先处于骨架屏 hydration 窗口**：立即读取得到 `null` ≠ 消息丢失或状态损坏。复用现有页面就绪轮询预算（≤40 秒）等结构化 unit 出现后再读；超时按页面未就绪/探测失败处理，不得伪造尾部身份。
+  - **DOM 虚拟化裁剪规则（R2.3 冻结文字）**：长会话可能从 DOM 移除较早的 unit，实测 unit 数量可从 10 降至 8，因此 unit 数量不保证单调增长。等待、就绪及派单状态判定不得依赖 unitCount 增长；必须以当前尾部 unit 的 role、key、assistant UUID 等结构化语义，与派单前基线进行比较。unit 数量仅可作为诊断信息，不得作为消息到达或页面就绪的唯一依据。unit key（`fallback-turn-N:M:*`）在重渲染时会整体重排（实测 turn 序号随虚拟化裁剪平移），跨渲染比较只信任 assistant DIL UUID。
 - 判定元素：状态文件 `a-fast-state.json`（ts/generating/everGenerating/doneCandidate/startIdle/len/gapRejected/unavailableStrikes…），看门狗读它判「快轮询死了（≥7 分钟没更新）/startIdle/未处理」。**Windows 上 Python `open()` 默认 GBK，状态文件含中文必须 `encoding='utf-8'`**（实测崩溃教训；规范版 watchdog 已修）。
 
 ### 6.3 唤醒信号处置表
@@ -377,6 +378,8 @@ ChatGPT 页面不是稳定 API。composer、模型选择器、轮次渲染器和
 | Base64 分块 | 解码后的分块原始字节 |
 
 不为解决哈希口径问题擅自修改全局 `core.autocrlf`。
+
+**R2.3 归档记录（2026-11-08）**：Composer 空态判定为**已有实现**（`dispatch-state.mjs` 的 `composerEmpty = composerText.trim() === ''`，`composerLength` 保留原始 `innerText.length`），此前「结构上不可能通过 markAccepted」的诊断有误——两笔 UNCERTAIN 的真因是陈旧页发送静默失败（发送按钮 `disabled=true`），非空态判定。真火证明：真实派单 `64f8f821` 由 `markAccepted` 自动进入 ACCEPTED（证据 `COMPOSER_EMPTY_AND_GENERATING`，发送后 1.5 秒首轮即成立），无主管手工结算。UNCERTAIN 主管兜底机制保留未动。
 
 **上游参考：**
 
