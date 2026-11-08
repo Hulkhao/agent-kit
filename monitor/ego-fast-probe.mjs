@@ -2,6 +2,7 @@
 // Deployment adapters: MON, SPACE, and a-watch-uuid.txt only.
 import { mkdir, readFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
+import { homedir } from "node:os";
 
 const MON = "REPLACE_WITH_DEPLOY_MONITOR_DIR"; // adapter 1
 const SPACE = "REPLACE_WITH_UNIQUE_TASKSPACE"; // adapter 2
@@ -136,17 +137,47 @@ if (isBackoffActive(previous, now())) {
 
 let task;
 let spaceId = previous.spaceId || null;
+// r45 LIMITED GO (issue #6): the probe may bootstrap a MISSING space, but ONLY with the machine-local
+// account pin — bare taskSpace(SPACE) creation is forbidden (it recreates the wrong-account space,
+// the exact root cause of the mini-tier incident). Existing-space reuse keeps the prior checks.
+const readPinnedProfileId = async () => {
+  try {
+    const cfg = JSON.parse(await readFile(homedir() + "/.agents/ego-profile.json", "utf8"));
+    return (cfg && cfg.defaultProfileId) || null;
+  } catch { return null; }
+};
 try {
   const spaces = await listTaskSpaces();
   // The SPACE name is the stable identity; a stored spaceId only wins if its taskId still matches.
   const targetSpace = spaces.find((space) => space.taskId === SPACE || space.name === SPACE) ||
     (spaceId ? spaces.find((space) => space.id === spaceId && (!space.taskId || space.taskId === SPACE)) : null);
-  if (!targetSpace || targetSpace.ownership !== "agent" ||
-      (targetSpace.taskId && targetSpace.taskId !== SPACE)) {
-    throw new Error(!targetSpace ? "TASKSPACE_NOT_FOUND" : "TASKSPACE_NOT_AGENT_OWNED");
+  if (!targetSpace) {
+    const pinnedProfileId = await readPinnedProfileId();
+    if (!pinnedProfileId) throw new Error("TASKSPACE_BOOTSTRAP_NO_PIN");
+    const knownProfiles = await profiles();
+    if (!knownProfiles.some((p) => p.id === pinnedProfileId)) throw new Error("TASKSPACE_BOOTSTRAP_PROFILE_UNKNOWN");
+    task = await taskSpace(SPACE, { profileId: pinnedProfileId });
+    // verify what actually got created before continuing (name/taskId, ownership, profileId when exposed)
+    const created = (await listTaskSpaces()).find((space) => space.taskId === SPACE || space.name === SPACE);
+    if (!created || created.ownership !== "agent" ||
+        (created.taskId && created.taskId !== SPACE) ||
+        (created.profileId && created.profileId !== pinnedProfileId)) {
+      throw new Error("TASKSPACE_BOOTSTRAP_VERIFY_FAILED");
+    }
+    await appendEvent(MON, "SPACE_BOOTSTRAPPED", { space: SPACE, profileId: pinnedProfileId });
+    spaceId = created.id;
+  } else {
+    if (targetSpace.ownership !== "agent" || (targetSpace.taskId && targetSpace.taskId !== SPACE)) {
+      throw new Error("TASKSPACE_NOT_AGENT_OWNED");
+    }
+    // profile mismatch check fires only when BOTH sides expose the profile (fail-closed per r45)
+    const pinnedProfileId = await readPinnedProfileId();
+    if (targetSpace.profileId && pinnedProfileId && targetSpace.profileId !== pinnedProfileId) {
+      throw new Error("TASKSPACE_PROFILE_MISMATCH_STOP");
+    }
+    spaceId = targetSpace.id;
+    task = await taskSpace(spaceId);
   }
-  spaceId = targetSpace.id;
-  task = await taskSpace(spaceId);
 } catch (error) {
   await writeState({ spaceId, probeFailed: true, recoveryFailed: true, errorCode: "TASKSPACE_RECOVERY_FAILED", ...safeError(error) });
   await appendEvent(MON, "TASKSPACE_RECOVERY_FAILED", safeError(error));

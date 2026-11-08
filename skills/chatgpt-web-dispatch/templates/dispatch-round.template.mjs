@@ -98,11 +98,13 @@ catch { abort("ACCOUNT_CONFIG_MISSING_STOP"); } // no pin on this machine: stop,
 const expectedAccount = (profileCfg.spaceExpect && profileCfg.spaceExpect[SPACE]) || profileCfg.defaultAccount;
 if (!expectedAccount || !profileCfg.defaultProfileId) abort("ACCOUNT_CONFIG_INCOMPLETE_STOP");
 // In-page fetch (window.fetch + credentials): ego's page.fetch wrapper can return null on a freshly
-// navigated page; the in-page call is the reliable evidence channel. Email only — never log tokens.
-const accountEmail = await composerOp(() => page.evaluate(async () => {
-  try { const r = await fetch("/api/auth/session", { credentials: "include" }); const j = await r.json(); return (j && j.user && j.user.email) || null; }
+// navigated page; the in-page call is the reliable evidence channel. Email+token in memory only —
+// never logged, never persisted (handbook §11.7).
+const sessionEvidence = await composerOp(() => page.evaluate(async () => {
+  try { const r = await fetch("/api/auth/session", { credentials: "include" }); const j = await r.json(); return { email: (j && j.user && j.user.email) || null, token: (j && j.accessToken) || null }; }
   catch { return null; }
 }));
+const accountEmail = sessionEvidence ? sessionEvidence.email : null;
 if (!accountEmail) abort("ACCOUNT_UNPROVEN_STOP");
 if (accountEmail !== expectedAccount) abort("ACCOUNT_MISMATCH_STOP:" + SPACE);
 
@@ -228,6 +230,27 @@ await page.waitForTimeout(600);
 const modelOk = menuInfo && menuInfo.radios.some((r) => r.label === "GPT-6" && r.checked === "true");
 const levelOk = menuInfo && menuInfo.sliders.some((s) => String(s.now) === "2" && String(s.max) === "2");
 if (!menuInfo || !modelOk || !levelOk) abort("LEVEL_GATE_FAIL_ABORT");
+
+// ---- Gate 7.1: model_slug NEGATIVE diagnostic (r45 LIMITED GO — auxiliary evidence, NEVER a pass key).
+// It records which model produced PAST assistant turns; it cannot prove the next send's model or
+// effort level, so the live aria gate above stays primary. session+conversation = the 2-call
+// per-wake API budget exactly.
+const convEvidence = await composerOp(() => page.evaluate(async ({ uuid, token }) => {
+  try {
+    const r = await fetch("/backend-api/conversation/" + uuid, { credentials: "include", headers: token ? { Authorization: "Bearer " + token } : {} });
+    if (!r.ok) return { ok: false };
+    const j = await r.json();
+    let slug = null;
+    for (const k of Object.keys((j && j.mapping) || {})) {
+      const m = j.mapping[k] && j.mapping[k].message;
+      if (m && m.author && m.author.role === "assistant" && m.metadata && m.metadata.model_slug) slug = m.metadata.model_slug;
+    }
+    return { ok: true, slug };
+  } catch { return { ok: false }; }
+}, { uuid: CONV, token: sessionEvidence ? sessionEvidence.token : null }));
+if (!convEvidence.ok || !convEvidence.slug) abort("MODEL_EVIDENCE_UNAVAILABLE_STOP");
+if (/mini/i.test(convEvidence.slug)) abort("MODEL_HISTORY_MISMATCH"); // negative-only: historical mini = stop, supervisor decides
+await appendEvent(MON, "MODEL_HISTORY_AUX", { slug: String(convEvidence.slug).slice(0, 60) }); // compliant slug = auxiliary record only
 
 // ---- Gate 8: ref lifecycle (r44 P0-A2) — ONLY snapshot/ref/focus may retry. Once focus succeeds,
 // the send path runs exactly once: button-missing = STOP (fail-closed), final content recheck on the

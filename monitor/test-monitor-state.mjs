@@ -725,3 +725,13 @@ test("ledger reads: ENOENT is provably empty, real read errors throw (never fail
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+// r45 LIMITED GO (issue #6): probe bootstrap requires the account pin — bare taskSpace(SPACE) creation forbidden.
+test("probe bootstrap is pin-locked: explicit profileId creation + post-create verification + mismatch STOP", async () => {
+  const src = await readFile(new URL("./ego-fast-probe.mjs", import.meta.url), "utf8");
+  for (const marker of ["TASKSPACE_BOOTSTRAP_NO_PIN", "TASKSPACE_BOOTSTRAP_PROFILE_UNKNOWN", "TASKSPACE_BOOTSTRAP_VERIFY_FAILED", "TASKSPACE_PROFILE_MISMATCH_STOP", "SPACE_BOOTSTRAPPED"]) {
+    assert.ok(src.includes(marker), `missing bootstrap marker: ${marker}`);
+  }
+  assert.match(src, /taskSpace\(SPACE, \{ profileId: pinnedProfileId \}\)/);
+  assert.doesNotMatch(src, /await taskSpace\(SPACE\)/, "bare taskSpace(SPACE) creation call is forbidden");
+});

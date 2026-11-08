@@ -158,3 +158,15 @@ test("agent-kit#7 root cause: account pin gate precedes ownership; missing/incom
   // evidence channel is the in-page session fetch (page.fetch wrapper can return null)
   assert.match(src, /fetch\("\/api\/auth\/session", \{ credentials: "include" \}\)/);
 });
+
+test("r45 Gate 7.1: model_slug negative-only diagnostic sits after the level gate; token never logged", async () => {
+  const src = await template();
+  const gate7 = src.indexOf('abort("LEVEL_GATE_FAIL_ABORT")');
+  const gate71 = src.indexOf("MODEL_HISTORY_MISMATCH");
+  const gate8 = src.indexOf("---- Gate 8");
+  assert.ok(gate7 > 0 && gate71 > gate7 && gate71 < gate8, "Gate 7.1 must sit between the level gate and Gate 8");
+  assert.match(src, /MODEL_EVIDENCE_UNAVAILABLE_STOP/);
+  assert.match(src, /MODEL_HISTORY_AUX/);
+  assert.doesNotMatch(src, /console\.log\([^)]*token/);
+  assert.doesNotMatch(src, /appendEvent\([^)]*token/);
+});
