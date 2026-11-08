@@ -32,8 +32,17 @@ export async function readComposerSurface(page) {
       (element.offsetParent !== null || element.getClientRects().length > 0));
     const composerSelector = '#prompt-textarea, [data-testid="prompt-textarea"], [contenteditable="true"][role="textbox"], textarea';
     const composers = [...document.querySelectorAll(composerSelector)].filter(visible);
-    const composer = composers.find((element) => element.id === "prompt-textarea" ||
-      element.getAttribute("data-testid") === "prompt-textarea") || composers[0] || null;
+    // Issue #9: align composer localization with the dispatch template's COMPOSER_SEL (aria-label
+    // first). The generic fallback may otherwise land on code-editor textboxes
+    // ([aria-label="Edit code"]) that precede the real composer in DOM order and read as a
+    // phantom foreign draft (FOREIGN_DRAFT_STOP on an actually empty composer).
+    const composerLabels = new Set(["询问 ChatGPT", "Ask ChatGPT"]);
+    const isCodeEditor = (element) => /code/i.test(element.getAttribute("aria-label") || "");
+    const composer = composers.find((element) => composerLabels.has(element.getAttribute("aria-label"))) ||
+      composers.find((element) => element.id === "prompt-textarea" ||
+        element.getAttribute("data-testid") === "prompt-textarea") ||
+      composers.find((element) => element.matches('[contenteditable="true"][role="textbox"]') && !isCodeEditor(element)) ||
+      null;
     const composerText = !composer ? "" :
       (composer.tagName === "TEXTAREA" || composer.tagName === "INPUT"
         ? composer.value || ""

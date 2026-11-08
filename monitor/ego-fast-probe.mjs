@@ -11,6 +11,12 @@ if (MON.startsWith("REPLACE_") || SPACE.startsWith("REPLACE_")) {
   process.exit(1);
 }
 
+// Issue #4-3 stale-copy sentinel: every probe run announces its version and identity in the
+// output stream, so a stale project-local copy (old params, drifted tags) is immediately
+// visible in fast-out.txt instead of failing silently forever.
+const PROBE_VERSION = "r45.2";
+console.log(`PROBE_BOOT version=${PROBE_VERSION} space=${SPACE} mon=${MON}`);
+
 const {
   appendEvent,
   findUnconsumedComposerFreeze,

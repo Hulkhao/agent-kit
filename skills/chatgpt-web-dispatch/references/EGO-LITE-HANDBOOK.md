@@ -57,6 +57,9 @@
 
 **静默生成死亡**（实测两次）：user 气泡入库、页面转空闲、但服务端没有任何 assistant 节点——用 API 核实后发短消息催办即可激活。
 
+**附件上传 DOM 契约（2026-11-08 实测 19 文件一次挂载成功，issue #4）**：源码/任意类型附件走 composer 的 `input[aria-label="附加文件"]`（accept 为空的通用 input）；「拍照/添加照片/附加照片或视频」类按钮均限 `accept=image|video`，**不能用于源码附件**。顺序固定：**先 `setInputFiles` 一次性挂全部文件 → 再 fill 文本 → Enter 一次发送**（不要挂一个发一个）。附件落在代码解释器 `/mnt/data`，可绕过「沙箱无法承接多文件」类阻断。监控侧 composer 定位同口径：`dispatch-state.mjs` 的 `readComposerSurface` 与模板 `COMPOSER_SEL` 一致（aria-label 优先 → id/testid → 非代码编辑器的 contenteditable 回退），含代码块页面不再误读出假 FOREIGN_DRAFT_STOP（#9 实测）。
+
+
 ### 3.1 R2.5 派单冻结事务链（LIMITED GO · AUTHORIZED，规划师裁决 reply-r43）
 
 **核心验收哲学**：不会误发、不会重复发、不会覆盖用户草稿、不会因页面冻结丢失派单。完整链路：**PREPARED → 填充 → 完整回读 → 刷新 Composer ref → 所有权确认 → SEND_STARTED → Enter → AUTO_ACCEPTED**；任何一步无法证明，都不得进入下一步。规范模板：`templates/dispatch-round.template.mjs`（九闸门实现，新派单任务照抄改适配器，不要徒手重写）。
@@ -140,6 +143,8 @@ const r = await page.fetch("/backend-api/conversation/" + uuid,
 - 脚本1（快轮询）**纯 DOM 读，零脚本侧 API 配额**——这是快轮询节奏的前提（R2.4 起驻页探测约 6 次 goto/小时，见 §7）。判定=「可见停止按钮」的生成→空闲翻转 + 75 秒确认窗（滤工具链间隙假阳性）。它只报候选，真伪由主管 API 终验。
 - 脚本2（看门狗）**单实例=单 15 分钟窗口**：先睡满 15 分钟再判定（等待在前、判定在后），结果未处理即退出唤醒主管；主管审查后**必须重新布防**（重启脚本2；脚本1 若因抓到回复退出，取走交付后也重启）。
 - **退出即接力**：任何唤醒处理后不允许出现无脚本值守的空窗（实测 7 小时空转事故的根因）。
+- **良性信号自愈（issue #8，2026-11-09 起）**：fast-poll.sh wrapper 对 `START_IDLE_WAKE_SUPERVISOR` 类「重启即自愈」良性信号自动重启 probe 并留痕（`BENIGN_SIGNAL_SELFHEAL=… streak=n/20`），连续超过 20 轮仍良性才真退出唤醒——消除「wrapper 退出后接棒单点」的 50 分钟空窗形态（实测 2026-11-08）。`REPLY_ARRIVED`（DONE_CANDIDATE）/`CONVERSATION_DEAD` 等需主管裁决的信号维持真退出。
+- **长任务巡检纪律（issue #8）**：主管处于长任务链（派单/执行/多任务并行）时，值守健康巡检（`a-fast-state.json` 时间戳、fast-history.log 尾部）纳入任务步骤前后的检查点；发现 `STATE_MISSING` 或 wrapper 已退出（日志尾部 `fast-poller exit`）立即接力重启，不允许把唤醒留给「之后有空再说」。
 - probe 内置硬化（规范版已含，勿删）：**R2.4 起快轮询三分支驻页探测（FINAL PASS 65c78e4）**——STAY 轮（页面就绪）0 goto 零加载；CALIBRATE 轮（距 navRef ≥10 分钟）1 次 goto 校准；RECOVER 轮（页面失就绪/timeOrigin 读取失败）走恢复。navRef = max(lastGotoAt, performance.timeOrigin)；goto 全部收敛到统一 `navigate(reason)` 入口（单一 `gotoAt` 时间戳 + GOTO_ATTEMPT 事件）。就绪等待只认**正文 >600 字符**（上限 40s——空壳也带「发送」按钮，按按钮判就绪会假阳性）；goto/渲染失败 → **8 分钟退避**（退避期只刷状态文件时间戳）；**死页梯子**：见死标 → 刷 2 次 → 仍死记 1 strike → **8 分钟后再试** → 连续 3 strikes 才判会话真死并唤醒主管；恢复渲染后 strike 清零。429/加载风暴与 Composer 冻结走共享风暴通道（`CHAT_SURFACE_STRUCTURALLY_UNAVAILABLE` + `stormBackoffDeadline` = max(8min, 9min+SPACE相位)，单次重试由 planStormRecovery 把关，失败重新武装，详见 §3.1）。
 - **恢复首轮若为空闲态 → startIdle=true → 强制走「启动即提取」复核**（防吞退避期间已到达的回复）。
 - **Page 标签恢复顺序（R2.1 起）**：优先按已持久化标签恢复；标签缺失且仅一个 Page 时复用；无 Page 才新建；多个 Page 优先按目标 conversation UUID 的完整 URL 路径段唯一匹配（`page-recovery.mjs`）；零匹配（`PAGE_URL_MATCH_NOT_FOUND`）、多匹配（`PAGE_URL_MATCH_AMBIGUOUS`）或 URL 无法读取（`PAGE_URL_INSPECTION_FAILED`）时 STOP，不猜标签。
@@ -168,7 +173,7 @@ const r = await page.fetch("/backend-api/conversation/" + uuid,
 | `TASKSPACE_RECOVERY_FAILED`（含 `PAGE_URL_MATCH_*`） | Page 恢复 fail-closed（多标签歧义/无匹配/URL 不可读） | 人工清空间残留标签或核对 UUID 后重启 |
 | `DISPATCH_UNCERTAIN_WAKE_SUPERVISOR` | 派单账本处于 UNCERTAIN，无法证明已接受 | 先对账（结构化 unit 证据）再裁定；未接受才授权重试 |
 | `CONVERSATION_UNAVAILABLE_PERSISTENT` | 死页梯子 3 strikes | 只报「持续不可用」，深查/重派/迁移；不声称会话永久死亡 |
-| `START_IDLE_WAKE_SUPERVISOR` | 恢复首轮空闲，存在基线时序风险 | 同 startIdle：启动即提取比对派单基线 |
+| `START_IDLE_WAKE_SUPERVISOR` | 恢复首轮空闲，存在基线时序风险（issue #8 起属良性：wrapper 自动重启自愈并留痕，连续 >20 轮才升级唤醒） | 单次出现无需处置；wrapper 日志见 `BENIGN_SIGNAL_SELFHEAL` 留痕可审计 |
 
 ## 7. 统一参数表（唯一口径）
 
