@@ -44,19 +44,28 @@
 | 导航 | `page.goto(url)` + `waitForLoadState("load")` | 刚 load 完立刻 snapshot 可能缺 composer（水合瞬态），重取一次快照即可；URL 比对用 `includes(uuid)`（见 §2） |
 | 观察页面 | `page.snapshot()` 语义快照带 ref；**输入框不在默认视口快照里，必须 `snapshot({scope:"full_page"})`** | 会话页 composer 是 `textfield "询问 ChatGPT"`，项目页新聊天是 `textfield "在"XX"中新建聊天"`；输入框是 contenteditable 不是 textbox；**坑 2：snapshot 偶尔不出 textbox 行——在发送按钮附近按行号上下文找** |
 | ref 提取 | 快照行内格式是 `[ref=368]`，提取正则用 `ref=(\d+)` | 不是 `@368` 格式 |
-| 填充 | `page.fill("@368", 文本)` | ProseMirror 富编辑器可直接 fill，长中文 markdown 精确落入；模型档位按钮旁直接显示「高」即高思考档就位 |
-| 回读核对 | evaluate 取 `[contenteditable='true']` 的 innerText + **空白归一化 diff** | 旧选择器 `#prompt-textarea` 已随改版失效；fill 回执「formatted the text」警告**不算失败**；填充失败会静默，回读是唯一防线 |
-| **发送** | **默认 `page.focus("@ref")` + `page.keyboard.press("Enter")`** | **口径裁定 2026-11-08：统一默认 Enter + 双验；Enter 失败再回退 click「发送」按钮**。实测记录：一项目 click 可用、另一项目新 composer 上 click 静默无效（文字留框、零气泡、无报错）——默认序=Enter，click 作回退双通道兜底 |
+| 填充 | **~1.2KB 线边界分块 + 每块 `document.execCommand("insertText", false, chunk)`**（2026-11-08 实测口径） | `fill()` 会产生 CDP 幽灵补全且带损伤、原生 `paste()` 需前台且后台窗口静默失败、单次长文本 `execCommand` 会冻结页面数十秒——三者均不作为可靠投递通道；单行超限再按 Unicode 码点拆分 |
+| 回读核对 | 全文回读 innerText，规范化 CRLF、去除每行尾随空格后做**完整 diff** | 未完全一致不得发送；`goto` 后旧草稿复活 = STOP 标 `DRAFT_PERSISTED`，不覆盖、不追加、不发送；Composer 空态 innerText 是 `"\n"`（长度 1），勿用 `length===0` 判空 |
+| **发送** | **默认 `page.focus("@ref")` + `page.keyboard.press("Enter")`** | **口径裁定 2026-11-08：统一默认 Enter + 双验；Enter 失败再回退 click「发送」按钮**。发送前必须确认按钮可用：`button[aria-label=发送]` `disabled/aria-disabled=true` = 陈旧页（实测：文字满框但 Enter 与 click 全静默无效），先 `goto` 刷新重读再发。页面状态用 `el.focus()`（evaluate 内）不足以路由键盘事件，必须 ego 级 `page.focus("@ref")` |
 | URL 确认 | 发送后等 5~10 秒再取 URL | 过渡地址 `local-chatgpt%` 开头=草稿 id，必须重取真 `/c/<uuid>` |
-| 发送双验 | DOM 确认 user 气泡 + 生成态（「停止」按钮出现）——缺一不可 | 命令「✓ Done」回执不可信（假成功事故多起） |
-| 响应检测 | DOM 文本（「你说：」「ChatGPT 说：」） | 气泡 `data-message-author-role` 属性已彻底消失（见 §4 坑 5），以文本+停止按钮为准 |
-| 页内 API | `page.fetch("/api/auth/session")` 拿 accessToken，再带 `Authorization: Bearer` 打 `/backend-api/conversation/<uuid>` | 同源带 cookie；**这是唯一允许的 API 用法：单次验证/提取，每次唤醒最多 2 个调用，禁止轮询** |
+| 发送双验 | 结构化证据：**尾部 unit key 前进为 `:user`** + 停止按钮出现（生成态）——缺一不可 | 命令「✓ Done」回执不可信（假成功事故多起）；「你说：/You said:」计数在虚拟化 DOM 下不可靠，禁作基线 |
+| 响应检测 | 结构化尾部（`data-content-search-unit-key` 末段 role + assistant DIL UUID，见 §6.2 DOM 契约）+ 可见停止按钮 | `data-message-author-role` 属性已彻底消失（§11.10），文本标记（「你说」等）禁作状态依据 |
+| 页内 API | `page.fetch("/api/auth/session")` 拿 accessToken，再带 `Authorization: Bearer` 打 `/backend-api/conversation/<uuid>` | 同源带 cookie；**仅作辅助证据通道：单次验证/提取，每次唤醒最多 2 个调用，禁止轮询**；2026-11-08 实测该通道 404 `conversation_inaccessible`（见 §4），不得据此判会话死亡 |
+
+**模型/思考强度 UI 预检（2026-11-08 实测）**：模型选择读取 `menuitemradio` 的 `aria-checked`，目标 GPT-6 必须 `aria-checked=true`；思考强度读取 `slider` 的 `aria-valuemin`/`aria-valuemax`/`aria-valuenow`（Plus 实测 min=0、max=2、now=2 对应 High）。**不再匹配旧文案「高，第 3 项，共 3 项」**；五档会员的 High 数值需独立校准。
 
 **静默生成死亡**（实测两次）：user 气泡入库、页面转空闲、但服务端没有任何 assistant 节点——用 API 核实后发短消息催办即可激活。
 
-## 4. 回复提取（API 是唯一可靠全文通道）
+## 4. 回复提取（2026-11-08 起：以页面 DOM 结构化证据为准，API 为辅助通道）
 
-标准姿势（在任一 chatgpt.com 页面上，每次唤醒最多 2 个调用）：
+**本机实测事实（2026-11-08，R2 验收裁决）：**
+- 当前账号的 conversation API **不携带 `execution_output`**（工具输出 mapping 的 `len=0`）；API 未返回工具输出 ≠ 助手没有生成输出。
+- `page.fetch` 的 `/backend-api/conversation/{id}` 返回 404 `conversation_inaccessible`（提示要求登录）；同一授权上下文下 conversations 列表虽 200 但 `items=[]`——页面 fetch 通道缺可用 bearer token。
+- **不得把该 404 解释为会话已删除、不存在或永久死亡**，也不得据单一账号实测推断所有授权环境均不可用。
+- 当前监控以页面 DOM 的结构化 unit-key 与 assistant DIL UUID 为消息身份依据（§6.2 DOM 契约）；conversation API 只有在授权上下文明确且返回有效内容时才可作辅助证据，**不得覆盖 DOM 身份证据**。
+- 分块交付以页面 DOM 实际可见的助手文本为提取来源；无法提取时由发送方/助手以纯文本重发；每块独立 SHA256 + 整包 SHA256 验证，不得仅凭分块数量或页面「已分析」提示认定完整。
+
+标准姿势（授权上下文可用时，每次唤醒最多 2 个调用）：
 
 ```js
 const s = await page.fetch("/api/auth/session", { timeout: 25000 });
@@ -83,12 +92,15 @@ const r = await page.fetch("/backend-api/conversation/" + uuid,
 | 端点滞后/冻结 | 页面实时推进而 conversation GET total 冻结在旧值 | 完成态与内容以 DOM 为准（§4） |
 | 长回复分块 | 长回复拆多条 assistant 消息，分块可能藏在轮次中段的 tool 输出里 | **提取必须扫全响应并合并，禁只看尾部**（§4 分块交付协议） |
 
-### 5.1 判定「回复完成」——状态翻转，不用内容基线
+### 5.1 判定「回复完成」——结构化状态翻转，不用内容基线
 
-- 可靠信号：**「有可见停止按钮 → 没有停止按钮」的翻转** = 回答完成候选。再以 API 单次提取终验：尾部消息 `role=="assistant" && end_turn==true && status=="finished_successfully"`。
+- UI 状态只由结构化证据判定：**generating 只认可见 Stop 控件（`offsetParent!==null`）**，禁匹配「正在思考」等文本；**dead/unavailable 禁全文/子串匹配「无法加载此 ChatGPT 对话」等可被会话引用的字符串**。
+- 页面不可用：以 ChatGPT 主机、就绪门槛、Composer 控件等结构化证据判断；结构缺失时重试记 strike（状态字段 `unavailableStrikes` / `unavailablePersistent`），三次仍失败只报告 `CONVERSATION_UNAVAILABLE_PERSISTENT`，**不声称已证明会话永久死亡**。
+- 可靠信号：**「有可见停止按钮 → 没有停止按钮」的翻转** = 回答完成候选。DONE 判定（75 秒确认窗后）：生成控件消失 + **Composer 为空（按 `"\n"` 空态归一化）** + **尾部 assistant DIL UUID 稳定** + 消息长度稳定 + 无 busy/progress 控件。仍只是 `DONE_CANDIDATE`，主管终验后才 COMPLETED。
+- 工具调用专用选择器未取得真实 DOM/Accessibility 样本前，`toolState=UNOBSERVED`，不得伪造工具状态。
 - **两个致命误判源**：
-  1. 转写里折叠的活动日志含「正在思考」字样——**生成态探测只认可见的停止按钮（`offsetParent!==null`），禁止文本匹配「正在思考」**（会永久误判生成中）；
-  2. 长工具链中间页面显示空闲（工具调用间隙）——**假完成**。对策：检测到翻转后等 75 秒再探一次（间隙会恢复生成，真完成保持空闲）+ 主管 API 终验。
+  1. 转写里折叠的活动日志含「正在思考」字样——**生成态探测只认可见的停止按钮，禁止文本匹配**（会永久误判生成中）；
+  2. 长工具链中间页面显示空闲（工具调用间隙）——**假完成**。对策：检测到翻转后等 75 秒再探一次（间隙会恢复生成，真完成保持空闲）+ 主管终验。
 - **基线吞噬铁律**：完成判定用状态翻转或「派单时刻钉死的计数基线」，**禁止用回复完成后采集的内容哈希/计数当基线**——那会把完整回复吞进基线、相对变化永不触发（实测漏抓 15 分钟）。**监控随派单启动就是这个危险时序**：监视器启动/重启时页面已空闲 → 必须先做一次「启动即提取」比对派单基线（见 §6.3 startIdle）。
 
 ## 6. 双循环监控（PO 定稿架构，勿改结构）
@@ -112,7 +124,15 @@ const r = await page.fetch("/backend-api/conversation/" + uuid,
 - **退出即接力**：任何唤醒处理后不允许出现无脚本值守的空窗（实测 7 小时空转事故的根因）。
 - probe 内置硬化（规范版已含，勿删）：每轮全新 `goto`（ChatGPT SPA 会冻结渲染，`page.reload()` 常落 43 字符空壳）；就绪等待只认**正文 >600 字符**（上限 40s——空壳也带「发送」按钮，按按钮判就绪会假阳性）；goto/渲染失败 → **8 分钟退避**（退避期只刷状态文件时间戳）；**死页梯子**：见死标 → 刷 2 次 → 仍死记 1 strike → **8 分钟后再试** → 连续 3 strikes 才判会话真死并唤醒主管；恢复渲染后 strike 清零。
 - **恢复首轮若为空闲态 → startIdle=true → 强制走「启动即提取」复核**（防吞退避期间已到达的回复）。
-- 判定元素：状态文件 `a-fast-state.json`（ts/generating/everGenerating/doneCandidate/startIdle/len/gapRejected/deadStrikes…），看门狗读它判「快轮询死了（≥7 分钟没更新）/startIdle/未处理」。**Windows 上 Python `open()` 默认 GBK，状态文件含中文必须 `encoding='utf-8'`**（实测崩溃教训；规范版 watchdog 已修）。
+- **Page 标签恢复顺序（R2.1 起）**：优先按已持久化标签恢复；标签缺失且仅一个 Page 时复用；无 Page 才新建；多个 Page 优先按目标 conversation UUID 的完整 URL 路径段唯一匹配（`page-recovery.mjs`）；零匹配（`PAGE_URL_MATCH_NOT_FOUND`）、多匹配（`PAGE_URL_MATCH_AMBIGUOUS`）或 URL 无法读取（`PAGE_URL_INSPECTION_FAILED`）时 STOP，不猜标签。
+- **当前 ChatGPT 尾部消息 DOM 契约（实测 2026-11-08，R2.2 落地于 `dispatch-state.mjs`）**：
+  - 读取最后一个可见 `[data-content-search-unit-key]`，取 key 最后一个冒号后的 `user` / `assistant` 作为 `lastMessageRole`。
+  - assistant 的 `lastMessageKey` 只取该 unit 内唯一一个 `[data-dil-response][data-dil-message-id]` 的完整 UUID；缺失、格式非法或出现多个候选时置空并 fail-closed。
+  - user 的 `lastMessageKey` 使用 unit key（例如 `fallback-turn-N:M:user`），只用于证明派单后 user tail 前进；**不宣称该 key 跨刷新稳定**。
+  - **不再使用** `[data-message-author-role]`、`[data-message-id]`、`article` 作为消息身份锚点（2026-11-08 实测页面全部为 0）；**不匹配** `MarkdownRoot-*`、`DilRenderer-*` 等带构建哈希的类名。
+  - `data-chatgpt-selection-conversation-id`、`data-chatgpt-selection-message-id` 仅作辅助锚点，不替代尾部 assistant DIL UUID。
+  - **goto/刷新后 DOM 先处于骨架屏 hydration 窗口**：立即读取得到 `null` ≠ 消息丢失或状态损坏。复用现有页面就绪轮询预算（≤40 秒）等结构化 unit 出现后再读；超时按页面未就绪/探测失败处理，不得伪造尾部身份。
+- 判定元素：状态文件 `a-fast-state.json`（ts/generating/everGenerating/doneCandidate/startIdle/len/gapRejected/unavailableStrikes…），看门狗读它判「快轮询死了（≥7 分钟没更新）/startIdle/未处理」。**Windows 上 Python `open()` 默认 GBK，状态文件含中文必须 `encoding='utf-8'`**（实测崩溃教训；规范版 watchdog 已修）。
 
 ### 6.3 唤醒信号处置表
 
@@ -124,6 +144,12 @@ const r = await page.fetch("/backend-api/conversation/" + uuid,
 | `REPLY_ARRIVED_BUT_UNHANDLED_15MIN_WAKE_SUPERVISOR` | 回复到达但主管没处理（跟丢保护） | 立即提取，并复盘第一次唤醒为何没接 |
 | `STATE_MISSING / WATCHDOG_TRIGGER(stale>=7min)` | 快轮询死亡 | 修快轮询（页面失附→重新 goto）→全套重启 |
 | `startIdle=true` | 监视器启动/恢复时页面已空闲（基线时序风险） | 「启动即提取」：单次 API 比对派单基线，防吞已到达回复 |
+| `STATE_CORRUPT`（watchdog/probe） | 状态文件 JSON 损坏、缺字段或类型错误（v3 Schema 校验拒绝） | 不猜状态：按现场恢复流程重建状态后全套重启 |
+| `UUID_MISSING_OR_INVALID` | 被监视 UUID 文件缺失或格式非法 | 补 uuid 文件后重启 |
+| `TASKSPACE_RECOVERY_FAILED`（含 `PAGE_URL_MATCH_*`） | Page 恢复 fail-closed（多标签歧义/无匹配/URL 不可读） | 人工清空间残留标签或核对 UUID 后重启 |
+| `DISPATCH_UNCERTAIN_WAKE_SUPERVISOR` | 派单账本处于 UNCERTAIN，无法证明已接受 | 先对账（结构化 unit 证据）再裁定；未接受才授权重试 |
+| `CONVERSATION_UNAVAILABLE_PERSISTENT` | 死页梯子 3 strikes | 只报「持续不可用」，深查/重派/迁移；不声称会话永久死亡 |
+| `START_IDLE_WAKE_SUPERVISOR` | 恢复首轮空闲，存在基线时序风险 | 同 startIdle：启动即提取比对派单基线 |
 
 ## 7. 统一参数表（唯一口径）
 
@@ -143,6 +169,8 @@ const r = await page.fetch("/backend-api/conversation/" + uuid,
 | 页面就绪判定 | 正文 >600 字符（等待上限 40s） | monitor probe | 空壳也带「发送」按钮，勿按按钮判就绪 |
 | 分块大小 | ≤6KB base64 | 补丁类交付 | 必经代码解释器 tool 输出打印（§4） |
 | API 用量 | 每次唤醒最多 2 个调用 | 验证/提取 | 禁轮询；429 期停一切 API 轮询 |
+
+**冻结参数边界（2026-11-08 R2.2 裁决）**：上表全部保持原值；DOM 选择器属于 §6.2 的运行时 UI 契约，不属于 §7 冻结参数。DOM 改版不构成变更任何计时、轮询或退避参数的理由。
 
 ## 8. Windows / Git Bash 环境坑（与 ego 无关但同场实测）
 
@@ -324,6 +352,31 @@ ChatGPT 页面不是稳定 API。composer、模型选择器、轮次渲染器和
 以下数值或实现属于 codex-chatgpt-web 自身协议，**不得直接替换本手册参数**：Electron WebContentsView、最多 5 个并发标签、Responses API/SSE、MCP turn token、90 秒 MCP 调用期限、60 秒命令轮询上限、10 分钟无响应活动窗口，以及其专用 data-turn-id 选择器。
 
 本节可迁移的结论是：状态分层、工具调用因果边界、稳定最终答案确认、持久化派单记录、恢复前对账、有限重启、安全诊断和 UI 漂移显式失败。ego-browser 的具体 API、选择器和时间参数仍以实机验证及本手册 §1–§10 为准。
+
+### 11.10 R2.2 迁移记录与跨机器 SHA256 基准（2026-11-08 验收补充）
+
+**验收基线**：ego-tools R2.2 正式验收 commit `fd6da71`（父基线 `32c3658`，R2 为 `74a0b58`）；五项真实场景（assistant UUID 读取 / user 尾部识别 / 派单接受状态 / 连续读取稳定 / 刷新后 UUID 恢复）全部 PASS。本次验收不解锁 P0-3 工具调用专用识别或 Browser Process 真崩溃恢复，两项继续 HOLD。
+
+**消息身份锚点迁移（禁恢复旧锚）**：
+
+- 旧锚点 `[data-message-author-role]`、`[data-message-id]`、`article` 在 2026-11-08 实测页面中均不存在（计数 0），**禁止恢复使用**。
+- 新锚点：`[data-content-search-unit-key]`（role 在 key 末段）与 assistant 的 `[data-dil-response][data-dil-message-id]`（36 位 UUID）；assistant DIL UUID 已完成连续读取与刷新后真机验证。
+- 刷新后的短暂 `null` 属于 DOM hydration 窗口：复用既有 40 秒就绪预算等待结构化 unit，不得伪造尾部身份。
+
+**conversation API 状态**：当前账号请求缺少 bearer token，`conversation_inaccessible` 404；该结果不能用来判断会话是否存在或是否死亡（详见 §4）。
+
+**修 Bug 系统级原则（PO 令 2026-11-08，细则见用户级 AGENTS.md）**：修复 Bug 前先追溯根因并审视全局业务逻辑；优先用最少、最通用的规则覆盖最多场景，从系统层消灭一类问题；禁止按单个现象堆补丁，禁止引入无实际用途的特殊分支。本批归并为两条系统规则：①UI 状态只由结构化证据判定，不从会话正文提取状态标志；②状态由完整 Schema 和绝对 deadline 管理，不以滑动时间或部分字段推断状态。
+
+**跨机器文件校验（每个 SHA256 必须注明哈希对象和字节基准，不得只给裸哈希）**：
+
+| 验证对象 | SHA256 基准 |
+|---|---|
+| Git 源码文件 | **Git blob 原始字节**（`git cat-file blob HEAD:<path>` 再哈希）；不得拿 checkout 行尾转换后的磁盘副本哈希与 blob 哈希直接比较（实测 CRLF 陷阱：`core.autocrlf=true` 使磁盘字节≠blob 字节） |
+| 下载的 ZIP / PATCH | 下载文件原始字节 |
+| 实际部署副本 | 磁盘原始字节，并注明 LF/CRLF |
+| Base64 分块 | 解码后的分块原始字节 |
+
+不为解决哈希口径问题擅自修改全局 `core.autocrlf`。
 
 **上游参考：**
 
