@@ -70,7 +70,9 @@
 - **SEND_STARTED 后锁定**：状态一旦进入 SEND_STARTED 及之后，禁止清空、重填、重发；进程重启后先对账，UNCERTAIN 由主管人工裁定，不自动重发（at-most-once）。
 - **发送 ref 生命周期**：每次 focus 尝试前重新 `page.snapshot()` 取新 ref（旧 ref 跨尝试不复用）；最多 3 次 focus 尝试；发送按钮 `disabled` = 陈旧页，先 goto 刷新重读再发；`markSendStarted` 必须持久化在 Enter **之前**。
 - **FRESHEN 机制**：距上次成功导航已累计 ≥3 次完整填充尝试 → **在下一次填充之前**（绝不之后——goto 会毁掉当前草稿）执行 `navigate("FRESHEN")` 并清零计数，防 Composer 冻结后 ref 陈旧、事件失灵。
-- **Composer 冻结处置**：填充/回读中 evaluate 报错 → 记 `COMPOSER_RENDER_FREEZE` 事件（单写入口：只允许 dispatch-state.mjs 写，probe 只消费）→ 走共享风暴通道（`CHAT_SURFACE_STRUCTURALLY_UNAVAILABLE` + ≥9 分钟绝对 deadline，按 SPACE 相位错峰）→ 退避到期单次 `COMPOSER_FREEZE_RETRY`；重试失败重新武装，绝不退化成 GOTO_FAILED/8 分钟通道。
+- **Composer 冻结处置**：填充/回读中 evaluate 报错 → 记 `COMPOSER_RENDER_FREEZE` 事件（单写入口：只允许 dispatch-state.mjs 写，probe 只消费）→ 走共享风暴通道（`CHAT_SURFACE_STRUCTURALLY_UNAVAILABLE` + ≥9 分钟绝对 deadline，按 SPACE 相位错峰，实测退避约 9~11 分钟）→ 退避到期**单次** `COMPOSER_FREEZE_RETRY`。注意语义：重试的是「页面恢复」这一步，**不是盲重发消息**——消息本体在恢复后由派单模板走完整九闸门续投，PREPARED 指纹账本保证不重复发送。重试失败重新武装（更长退避），绝不退化成 GOTO_FAILED/8 分钟通道。
+- **Gate 7.1 model_slug 负向诊断（r45 LIMITED GO）**：live aria 门通过后，用 conversation API 读最后一条 assistant 回复的 `metadata.model_slug`，**只作负向证据，绝不能单独放行**——历史 slug 含 mini → `MODEL_HISTORY_MISMATCH` STOP 报主管；接口 404/无权限/字段缺失 → `MODEL_EVIDENCE_UNAVAILABLE_STOP`；正常 slug → 仅记 `MODEL_HISTORY_AUX` 辅助事件。每轮派单 API 预算恰为 2 次（session + conversation）；accessToken 仅内存传递，绝不落日志。
+- **Probe 钉扎式自举（r45 LIMITED GO，issue #6）**：目标空间不存在时，probe 必须读本机 `~/.agents/ego-profile.json` 的 `defaultProfileId` 显式传 `taskSpace(SPACE, { profileId })` 创建——无配置（`TASKSPACE_BOOTSTRAP_NO_PIN`）、Profile 不在 `profiles()` 清单（`TASKSPACE_BOOTSTRAP_PROFILE_UNKNOWN`）即停；创建后复核 name/ownership/profileId（`TASKSPACE_BOOTSTRAP_VERIFY_FAILED`），成功留 `SPACE_BOOTSTRAPPED` 事件。已存在空间 Profile 不符（双侧都暴露时）= `TASKSPACE_PROFILE_MISMATCH_STOP`，不删除不抢占。**禁止裸 `taskSpace(SPACE)` 自动创建**——那是 mini 事故根因。
 
 ## 4. 回复提取（2026-11-08 起：以页面 DOM 结构化证据为准，API 为辅助通道）
 
