@@ -3,7 +3,7 @@
 > 2026-11-07 由 GDC V5 任务一天内实战全链路验证整理（派单/监控/提取/迁移/429 应对全部真浏览器跑通）。
 > **2026-11-08 定为唯一真源**：已并入《ego-lite工作流交接文档》全部增量；交接文档及旧版手册副本已删除，不再维护。
 > **2026-11-08 节奏修订（PO 令）**：快轮询 3 分钟→**1 分钟**，看门狗 31 分钟→**15 分钟**（15 分钟无响应即主管介入判定「卡死/仍在处理」后重新布防）；配额影响与观察项见 §7。
-> **规范监控脚本唯一存放点：`C:\Users\haohao\ego-tools`（独立 git 仓库）**；本手册不贴脚本源码，只指向。
+> **规范监控脚本唯一存放点：agent-kit 官方仓库 `monitor/` 目录（PO 令 2026-11-08 并入，原独立 ego-tools 本地仓库停用为历史归档）**；本手册不贴脚本源码，只指向。
 > 适用：Windows + ChatGPT 网页多 Agent 派单场景。目标读者：接管派单与监控的执行 Agent。
 
 ## 0. 一句话总纲
@@ -16,7 +16,7 @@
 
 1. 安装 ego lite（本机实测 0.6.2.8，CLI 命令 `ego-browser`，skill 版本 2.2.0）。安装后运行 `ego-browser skill`，它会打印与所装版本匹配的使用指南（**任何浏览器任务前必跑；升级后重跑**）。指南结尾必须是 `[ego-browser:skill] end of guide`，缺了=输出被截断，按指南存文件分段读。
 2. **登录态（口径裁定 2026-11-08）**：**首次使用先检查是否已登录**；未登录则在 ego 浏览器窗口登一次，登录一次后长期有效。实测记载两种情形并存——一项目实测与主 Chrome 共享登录态（免登）、另一项目实测为独立 profile（需登一次）——**以实机为准，不预设**。
-   **多 profile 机器必须账号钉扎（PO 令 2026-11-08，issue #7 根因）**：`taskSpace(名字)` 按名复用旧空间，`profileId` 只在创建空间时生效（`taskSpace(名字, { profileId })`，`profiles()` 列本机 profile）——复用错号建的旧空间会永远用错号跑（实测：无会员账号整会话静默 mini 档）。因此：①本机先配 `~/.agents/ego-profile.json`（模板见 skill `config/ego-profile.example.json`，含 defaultProfileId/defaultAccount/spaceExpect，**永不进仓库**）；②新建空间一律带 profileId；③派单发送前核对页面实际账号（`/api/auth/session` 的 user.email）与钉扎是否一致，不符/无配置/字段缺失一律 STOP 报人，不猜账号；④旧空间不能换账号，不符只能重建空间或人工登录正确账号。校验工具：ego-tools `monitor/ego-profile-check.mjs`。
+   **多 profile 机器必须账号钉扎（PO 令 2026-11-08，issue #7 根因）**：`taskSpace(名字)` 按名复用旧空间，`profileId` 只在创建空间时生效（`taskSpace(名字, { profileId })`，`profiles()` 列本机 profile）——复用错号建的旧空间会永远用错号跑（实测：无会员账号整会话静默 mini 档）。因此：①本机先配 `~/.agents/ego-profile.json`（模板见 skill `config/ego-profile.example.json`，含 defaultProfileId/defaultAccount/spaceExpect，**永不进仓库**）；②新建空间一律带 profileId；③派单发送前核对页面实际账号（`/api/auth/session` 的 user.email）与钉扎是否一致，不符/无配置/字段缺失一律 STOP 报人，不猜账号；④旧空间不能换账号，不符只能重建空间或人工登录正确账号。校验工具：本仓库 `monitor/ego-profile-check.mjs`。
 3. 编程模型：`ego-browser nodejs < 脚本.mjs`（Git Bash 支持重定向）跑脚本；**每次运行都是新进程**，但 TaskSpace/页面标签（p1/p2…）持久，用 `taskSpace("唯一名")` 恢复。Windows PowerShell 不支持 heredoc；**脚本一律走 UTF-8 `.mjs` 文件**：
    - 每轮新写完整文件（round-01.mjs、round-02.mjs…），不要改旧文件重放（每轮是新进程，旧步骤会重跑）。
    - 一个目标一个目录，如 `C:/Users/<name>/ego/<目标>-<日期时间>/`。
@@ -121,8 +121,8 @@ const r = await page.fetch("/backend-api/conversation/" + uuid,
 
 ## 6. 双循环监控（PO 定稿架构，勿改结构）
 
-**规范脚本唯一存放点：`C:\Users\haohao\ego-tools\monitor\`（独立 git 仓库）**——`ego-fast-probe.mjs`（探测本体）+ `fast-poll.sh`（脚本1 快轮询）+ `watchdog.sh`（脚本2 看门狗）+ `a-watch-uuid.txt.example`。**要改脚本只改 ego-tools 这一份**（历史实战副本在 GDC 各项目 worktree 里，随任务清理失效，不再引用）。
-> 本机部署状态（2026-11-08）：ego-tools 仓库部署于 haohao 机；本机（Administrator）尚无副本。本机需要跑双循环监控时，先从源机同步/克隆 ego-tools 到本机固定位置并在此登记路径，不得在项目里散落脚本副本。
+**规范脚本唯一存放点：agent-kit 官方仓库 `monitor/` 目录（PO 令 2026-11-08 并入）**——`ego-fast-probe.mjs`（探测本体）+ `fast-poll.sh`（脚本1 快轮询）+ `watchdog.sh`（脚本2 看门狗）+ `a-watch-uuid.txt.example`。**要改脚本只改 agent-kit 仓库 monitor/ 这一份**（历史实战副本在 GDC 各项目 worktree 里，随任务清理失效，不再引用）。
+> 本机部署状态（2026-11-08）：原 ego-tools 本地仓库（haohao 机）内容已并入 agent-kit monitor/，作为历史归档保留；本机（Administrator）尚无副本。本机需要跑双循环监控时，先从源机同步/克隆 ego-tools 到本机固定位置并在此登记路径，不得在项目里散落脚本副本。
 
 架构（PO 定稿；节奏 2026-11-08 修订，原 3 分钟/31 分钟）：**脚本1** 每 1 分钟轮询一次窗口，看是否抓到回复；**脚本2** 每 15 分钟看一下结果有没有得到处理，没有得到处理就退出唤醒主管——**大模型介入一次：判定是卡死了还是仍在处理，然后重新激发脚本**；全面智能审查什么卡住了、有没有得到结果，然后整个重新做计划。
 
@@ -210,7 +210,7 @@ const r = await page.fetch("/backend-api/conversation/" + uuid,
 
 1. 安装 ego lite → 打开 ego 浏览器，**先检查 ChatGPT 是否已登录**（§1 口径），未登录登一次。
 2. `ego-browser skill` 通读指南（升级后重跑）。
-3. 取规范脚本：复制（或 clone）`C:\Users\haohao\ego-tools\monitor\` 三件套到目标项目 `.monitor\`，按 §6.1 改 2 个适配点 + 填 uuid。
+3. 取规范脚本：从 agent-kit 官方仓库 `monitor/` 复制三件套到目标项目 `.monitor\`，按 §6.1 改 2 个适配点 + 填 uuid。
 4. 派单流程：goto 会话页 → full_page 快照找 textfield（§3 两种文案）→ fill+回读 → **focus+Enter**（失败回退 click）→ 5~10 秒后取真 UUID → DOM 双验。
 5. 同时启动 fast-poll.sh + watchdog.sh（受管后台，不得 `&`）；被唤醒按 §6.3 处置；处理完重新布防。
 6. 会话消息数接近 2000 → 提前按 §5 迁移（自包含简报开新会话）。
@@ -372,7 +372,7 @@ ChatGPT 页面不是稳定 API。composer、模型选择器、轮次渲染器和
 
 ### 11.10 R2.2 迁移记录与跨机器 SHA256 基准（2026-11-08 验收补充）
 
-**验收基线**：ego-tools R2.2 正式验收 commit `fd6da71`（父基线 `32c3658`，R2 为 `74a0b58`）；五项真实场景（assistant UUID 读取 / user 尾部识别 / 派单接受状态 / 连续读取稳定 / 刷新后 UUID 恢复）全部 PASS。本次验收不解锁 P0-3 工具调用专用识别或 Browser Process 真崩溃恢复，两项继续 HOLD。
+**验收基线**：（原 ego-tools 仓库，已并入本仓库 monitor/）R2.2 正式验收 commit `fd6da71`（父基线 `32c3658`，R2 为 `74a0b58`）；五项真实场景（assistant UUID 读取 / user 尾部识别 / 派单接受状态 / 连续读取稳定 / 刷新后 UUID 恢复）全部 PASS。本次验收不解锁 P0-3 工具调用专用识别或 Browser Process 真崩溃恢复，两项继续 HOLD。
 
 **消息身份锚点迁移（禁恢复旧锚）**：
 

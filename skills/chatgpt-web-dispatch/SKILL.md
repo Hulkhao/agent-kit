@@ -28,7 +28,7 @@ metadata:
 
 **行为口径**：本机没有该配置文件或字段缺失 → `ACCOUNT_CONFIG_MISSING_STOP` / `ACCOUNT_CONFIG_INCOMPLETE_STOP`，**立即停止报人，不猜测账号**；页面实测账号与钉扎不符 → `ACCOUNT_MISMATCH_STOP`。**新建空间**一律 `taskSpace(名字, { profileId })` 带上钉扎的 profile；**旧空间无法换账号**——核对不符只能换空间名重建或人工登录正确账号。
 
-校验工具：ego-tools 仓库 `monitor/ego-profile-check.mjs`（`ego-browser nodejs < ego-profile-check.mjs`，MODE=list/init/verify，详见文件头注释）。
+校验工具：本仓库 `monitor/ego-profile-check.mjs`（`ego-browser nodejs < ego-profile-check.mjs`，MODE=list/init/verify，详见文件头注释）。
 
 ## 七条铁律（细则见手册）
 
@@ -42,7 +42,7 @@ metadata:
 
 ## 相关事实源
 
-- 监控脚本唯一存放点：**官方仓库 `github.com/Hulkhao/ego-tools`**（R2.5 复审基线见分支 feat/stay-on-page-probe-20261108；要改脚本只改仓库内这一份，禁止本地另立孤本副本）。**开工前 `git pull` 同步官方最新**（与 agent-kit 同一口径，任务边界更新）。状态机文件：`dispatch-state.mjs`（派单账本 + 结构化 Composer/尾部读取）、`state-schema.mjs`（v3 Schema + 绝对 deadline）、`page-recovery.mjs`（多 Page URL-UUID 消歧）、`ego-profile-check.mjs`（本机账号钉扎校验）。
+- 监控脚本唯一存放点：**本仓库 `monitor/` 目录（PO 令 2026-11-08 并入 agent-kit；原独立 ego-tools 本地仓库停用为历史归档）**；要改脚本只改仓库内这一份，禁止本地另立孤本副本。**开工前 `git pull` 同步官方最新**（任务边界更新，skill 与脚本天然同版交付）。状态机文件：`dispatch-state.mjs`（派单账本 + 结构化 Composer/尾部读取）、`state-schema.mjs`（v3 Schema + 绝对 deadline）、`page-recovery.mjs`（多 Page URL-UUID 消歧）、`ego-profile-check.mjs`（本机账号钉扎校验）。
 - **派单规范模板**：`templates/dispatch-round.template.mjs`（R2.5 九闸门冻结事务链，见手册 §3.1）。新派单任务以它为底本，只改顶部适配器常量（MON/SPACE/MSG_FILE/CONV），遇到 `ADAPTATION_REQUIRED` 说明环境与模板假设不符，STOP 上报，不要徒手重写链路。
 - 跨机器交付的 SHA256 必须注明哈希对象与字节基准（Git blob / 下载文件 / 部署磁盘，注明 LF/CRLF），见手册 §11.10。
 - 通用浏览器操作（非 ChatGPT 派单流）见 `ego-browser` skill。
@@ -53,7 +53,7 @@ metadata:
 不搞独立测试战役：skill 的能力**在实际派单任务中验证**。实战遇到问题时的标准路径：
 
 1. **当场止损**：按手册对应章节处置（STOP / 退避 / 对账），保住现场证据（状态文件、事件日志，脱敏后留存），不盲目重试。
-2. **报 GitHub issue**：到 `github.com/Hulkhao/agent-kit/issues` 留言——现象、复现轮次、现场证据摘要（**不含提示词正文/Cookie/Token**）、手册或模板哪一节不符。监控脚本类问题（ego-tools）也先报到 agent-kit issues 记账。
+2. **报 GitHub issue**：到 `github.com/Hulkhao/agent-kit/issues` 留言——现象、复现轮次、现场证据摘要（**不含提示词正文/Cookie/Token**）、手册或模板哪一节不符。监控脚本类问题同样直接报 agent-kit issues 记账。
 3. **等修复发布**：issue 由 skill 维护会话解决并 commit → push → deploy；修复落地前不要自行改动仓库源或部署副本（维护口径见上）。
 4. **继续主线**：修复发布前主线任务不受阻——按手册兜底路径继续推进，把 issue 编号留在值班记录里供后续回归验证。
 
