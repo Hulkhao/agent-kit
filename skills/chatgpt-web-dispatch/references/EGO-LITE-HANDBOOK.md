@@ -61,6 +61,8 @@
 
 **核心验收哲学**：不会误发、不会重复发、不会覆盖用户草稿、不会因页面冻结丢失派单。完整链路：**PREPARED → 填充 → 完整回读 → 刷新 Composer ref → 所有权确认 → SEND_STARTED → Enter → AUTO_ACCEPTED**；任何一步无法证明，都不得进入下一步。规范模板：`templates/dispatch-round.template.mjs`（九闸门实现，新派单任务照抄改适配器，不要徒手重写）。
 
+**R2.5 复审补强（reply-r44 REWORK REQUIRED 定点修正，全部已落地模板）**：①账本读取 fail-closed——冻结事件/派单账本**文件缺失=可证明为空**，**读取损坏/IO 错误必须 STOP**（`FREEZE_LEDGER_READ_FAILED`/`DISPATCH_LEDGER_READ_FAILED`），绝不把读失败当「没有记录」；②PREPARED 持久化**前移到首次填充之前**（中断后凭持久化身份恢复，不靠运行时现场）；③导航只有**一个 `navigate(reason)` 入口**（单一 gotoAt 时间戳 + GOTO_ATTEMPT 事件），模板禁止直接 `page.goto`；**任何 goto 后必须重跑草稿复活检查**（重读 Composer → 所有权 → 必要时清空 → 验空）；④发送路径**只允许 snapshot/ref/focus 重试**：focus 成功后发送最多执行一次——发送按钮**不存在也是 STOP**（`SEND_BUTTON_MISSING_STOP`），SEND_STARTED 后先对当前 Composer 做最终内容复核，Enter 单独 try、抛错即标 UNCERTAIN 且**绝不重进发送循环**；⑤**所有 Composer evaluate/读取统一包进冻结通道**（composerOp 包装），初始表面读、草稿读、清空、复核无一例外。
+
 - **账本指纹化（R2.5 起）**：PREPARED 记录只存 `payload_sha256` / `payload_bytes` / `composer_baseline`，**禁止保存完整提示词正文、前缀后缀片段、事件日志正文、诊断用 Composer 全文副本**。哈希是指纹不是匿名化——泄漏原文的风险不因哈希消除，绝不能把哈希当脱敏后仍可外发的原文用。
 - **填充分块规则**：以行为单位切分；每个非末块携带自己的行尾换行；每块 ≤1.2KB（UTF-8 字节）；`chunks.join()` 必须精确还原原文；单行超限报 `CHUNK_LINE_EXCEEDS_LIMIT` 停止，不静默拆行。
 - **两级回读核对**：普通文本走**归一化**（折叠空白伪影 `\s+→" "` 后比对）；含 URL / 代码块 / 命令行（`/https?:\/\/|www\.|```|^\s*[$>]/m` 命中）走**严格保真**原文比对——innerText 无法证明字节级保真即 STOP（`SENSITIVE_FIDELITY_UNPROVEN`），宁可不发，不发错。

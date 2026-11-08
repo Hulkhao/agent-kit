@@ -1,11 +1,11 @@
-// Standard ChatGPT dispatch round — R2.5 frozen transaction chain (planner ruling reply-r43.txt).
+// Standard ChatGPT dispatch round — R2.5 frozen transaction chain (planner rulings reply-r43 + reply-r44).
 //
-// PREPARED → 填充 → 完整回读 → 刷新 Composer ref → 所有权确认 → SEND_STARTED → Enter → AUTO_ACCEPTED
+// PREPARED → 填充 → 完整回读 → 刷新 Composer ref → 所有权复核 → SEND_STARTED → Enter → AUTO_ACCEPTED
 // 任何一步无法证明，都不得进入下一步。
 //
 // Deployment adapters (edit only these four constants):
 const MON = "REPLACE_WITH_DEPLOY_MONITOR_DIR"; // monitor dir with dispatch-state.mjs + state-schema.mjs
-const SPACE = "REPLACE_WITH_UNIQUE_TASKSPACE"; // unique per agent/monitor instance
+const SPACE = "REPLACE_WITH_UNIQUE_TASKSPACE"; // unique per agent/monitor instance; account pinned via ~/.agents/ego-profile.json (Gate 1.5)
 const MSG_FILE = "REPLACE_WITH_MESSAGE_FILE_PATH"; // UTF-8 file holding the payload text
 const CONV = "REPLACE_WITH_CONVERSATION_UUID"; // page located by URL containing CONV, never by label
 
@@ -38,25 +38,56 @@ for (const p of (await task.pages())) {
 if (!page) { console.log("RESULT=CONVERSATION_PAGE_MISSING"); process.exit(1); }
 
 const abort = (code) => { console.log("RESULT=" + code); process.exit(1); };
-// Targeted composer selection: the first contenteditable on the page may be a rendered
-// code block's "Edit code" editor (EN-UI field test, agent-kit#7) — aria-label wins, generic fallbacks last.
-const COMPOSER_SEL = '[contenteditable="true"][role="textbox"][aria-label="询问 ChatGPT"], [contenteditable="true"][role="textbox"][aria-label="Ask ChatGPT"], #prompt-textarea, [data-testid="prompt-textarea"], [contenteditable="true"][role="textbox"]';
 
-const readRaw = () => page.evaluate((sel) => {
+// Targeted composer selection: the first contenteditable may be a rendered code block's "Edit code"
+// editor (EN-UI field test, agent-kit#7) — aria-label wins, generic fallbacks last.
+const COMPOSER_SEL = '[contenteditable="true"][role="textbox"][aria-label="询问 ChatGPT"], [contenteditable="true"][role="textbox"][aria-label="Ask ChatGPT"], #prompt-textarea, [contenteditable="true"][role="textbox"], [data-testid="prompt-textarea"]';
+
+// Unified composer-operation wrapper: EVERY composer evaluate/read sits inside the freeze channel.
+// A renderer freeze (PageEvaluationTimeout family) is recorded through the SHARED single-writer
+// entry then routed to storm backoff by the probe — no composer entry point bypasses it (r44 P0-B5).
+const composerOp = async (fn) => {
+  try { return await fn(); }
+  catch (error) {
+    await markComposerFreeze(MON, { space: SPACE, error }).catch(() => {});
+    abort("COMPOSER_RENDER_FREEZE");
+  }
+};
+
+const readRaw = () => composerOp(() => page.evaluate((sel) => {
   const el = document.querySelector(sel);
   return el ? (el.innerText || "") : "";
-}, COMPOSER_SEL);
+}, COMPOSER_SEL));
 
-// ---- Gate 0: unprocessed composer freeze (R2.5-H) — the probe owns the storm backoff ----
-const pendingFreeze = await findUnconsumedComposerFreeze(MON).catch(() => null);
+// ---- Gate 0: unprocessed composer freeze (R2.5-H) — the probe owns the storm backoff.
+// Fail-closed read (r44 P0-A1): a ledger read failure must never masquerade as "no freeze".
+let pendingFreeze = null;
+try { pendingFreeze = await findUnconsumedComposerFreeze(MON); }
+catch (error) { abort("FREEZE_LEDGER_READ_FAILED"); }
 if (pendingFreeze) abort("FROZEN_BACKOFF_PENDING");
 
-// ---- Gate 1: ledger state + surface gates ----
-const surface0 = await readComposerSurface(page);
+// ---- Gate 1: surface gates + dispatch ledger — fail-closed read (r44 P0-A1).
+let surface0 = null;
+try { surface0 = await readComposerSurface(page); }
+catch (error) {
+  await markComposerFreeze(MON, { space: SPACE, error }).catch(() => {});
+  abort("COMPOSER_RENDER_FREEZE");
+}
 if (!surface0.hostOk || !surface0.composerPresent) abort("COMPOSER_SURFACE_UNAVAILABLE");
 if (surface0.generating) abort("PREVIOUS_GENERATION_STILL_ACTIVE");
 
-const existing = await readDispatchState(MON).catch(() => null);
+let existing = null;
+try { existing = await readDispatchState(MON); }
+catch (error) { abort("DISPATCH_LEDGER_READ_FAILED"); }
+
+// Resume only a PREPARED record of THIS exact payload (interrupted dispatch of the same message).
+const resume = existing?.status === "PREPARED" && existing.payload_sha256 === payloadHash;
+if (existing && ["SEND_STARTED", "ACCEPTED", "UNCERTAIN", "RETRY_AUTHORIZED"].includes(existing.status)) {
+  abort("DISPATCH_IN_FLIGHT_" + existing.status); // already sent: acceptance reconciliation only
+}
+if (existing?.status === "PREPARED" && !resume) {
+  abort("STALE_PREPARED_RECORD_STOP"); // interrupted dispatch of a DIFFERENT payload: supervisor
+}
 
 // ---- Gate 1.5: account pin (PO 令 2026-11-08, issue #7 root cause) — profileId only applies at
 // space CREATION, so a resumed space keeps whatever account it was born with. Verify the account
@@ -66,82 +97,95 @@ try { profileCfg = JSON.parse(await fs.readFile(homedir() + "/.agents/ego-profil
 catch { abort("ACCOUNT_CONFIG_MISSING_STOP"); } // no pin on this machine: stop, never guess the account
 const expectedAccount = (profileCfg.spaceExpect && profileCfg.spaceExpect[SPACE]) || profileCfg.defaultAccount;
 if (!expectedAccount || !profileCfg.defaultProfileId) abort("ACCOUNT_CONFIG_INCOMPLETE_STOP");
-let session = null;
-try { session = await page.fetch("/api/auth/session"); } catch {} // 1 call, inside the ≤2-per-wake budget
-const accountEmail = session?.user?.email || null;
+// In-page fetch (window.fetch + credentials): ego's page.fetch wrapper can return null on a freshly
+// navigated page; the in-page call is the reliable evidence channel. Email only — never log tokens.
+const accountEmail = await composerOp(() => page.evaluate(async () => {
+  try { const r = await fetch("/api/auth/session", { credentials: "include" }); const j = await r.json(); return (j && j.user && j.user.email) || null; }
+  catch { return null; }
+}));
 if (!accountEmail) abort("ACCOUNT_UNPROVEN_STOP");
 if (accountEmail !== expectedAccount) abort("ACCOUNT_MISMATCH_STOP:" + SPACE);
 
-// Resume only a PREPARED record of THIS exact payload (interrupted fill of the same message).
-const resume = existing?.status === "PREPARED" && existing.payload_sha256 === payloadHash;
-if (existing && ["SEND_STARTED", "ACCEPTED", "UNCERTAIN", "RETRY_AUTHORIZED"].includes(existing.status)) {
-  abort("DISPATCH_IN_FLIGHT_" + existing.status); // already sent: acceptance reconciliation only
-}
-if (existing?.status === "PREPARED" && !resume) {
-  abort("STALE_PREPARED_RECORD_STOP"); // interrupted dispatch of a DIFFERENT payload: supervisor
-}
-
-// ---- Gate 2: draft ownership (R2.5-O) — full text / in-order prefix of THIS dispatch only ----
-if (!surface0.composerEmpty) {
+// ---- Gate 2 as a REUSABLE procedure: ownership + clear + verify-empty, re-run after EVERY goto —
+// a goto can resurrect an old draft (r44 P0-B2).
+const ensureOwnEmptyComposer = async () => {
+  const surface = await composerOp(() => readComposerSurface(page));
+  if (surface.composerEmpty) return;
   const draft = await readRaw();
   const ownership = verifyDraftOwnership({ draft, payload, record: existing });
   if (!ownership.owned) abort(ownership.kind === "empty" ? "DRAFT_STATE_CONFLICT_STOP" : "FOREIGN_DRAFT_STOP:" + (ownership.reason || ownership.kind));
   if (ownership.kind === "historical-identity" && !resume) abort("HISTORICAL_DRAFT_STOP");
-  if (ownership.kind !== "empty") {
-    // ownership proven for THIS dispatch: clear → re-read → prove empty → refill
-    const cleared = await page.evaluate((sel) => {
-      const el = document.querySelector(sel);
-      if (!el) return false;
-      el.focus();
-      const range = document.createRange();
-      range.selectNodeContents(el);
-      const sel2 = window.getSelection();
-      sel2.removeAllRanges();
-      sel2.addRange(range);
-      sel2.deleteFromDocument();
-      return true;
-    }, COMPOSER_SEL);
-    if (!cleared) abort("DRAFT_CLEAR_FAILED");
-    await page.waitForTimeout(600);
-    const after = await readComposerSurface(page);
-    if (!after.composerEmpty) abort("DRAFT_CLEAR_UNVERIFIED");
-  }
-}
+  const cleared = await composerOp(() => evaluateClearComposer(COMPOSER_SEL));
+  if (!cleared) abort("DRAFT_CLEAR_FAILED");
+  await page.waitForTimeout(600);
+  const after = await composerOp(() => readComposerSurface(page));
+  if (!after.composerEmpty) abort("DRAFT_CLEAR_UNVERIFIED");
+};
 
-// ---- Gate 3: FRESHEN (R2.5-H) — 3 completed fill attempts since the last successful navigation;
-// refresh happens BEFORE this round's fill, never after (a goto would destroy the fresh draft) ----
-if (await getFillCount(MON, SPACE) >= 3) {
-  await appendEvent(MON, "GOTO_ATTEMPT", { goto_reason: "FRESHEN", at: Date.now(), agent_id: SPACE, space: SPACE });
+// ---- Gate 3: FRESHEN — 3 completed fill attempts since the last successful navigation.
+// Navigation funnels through the ONE navigate() entry (single gotoAt timestamp + GOTO_ATTEMPT event);
+// the template must not open a second navigation channel (r44 P0-B1). After any goto the full
+// draft-resurrection check re-runs (r44 P0-B2).
+const evaluateClearComposer = (sel) => page.evaluate((selArg) => {
+  const el = document.querySelector(selArg);
+  if (!el) return false;
+  el.focus();
+  const range = document.createRange();
+  range.selectNodeContents(el);
+  const sel2 = window.getSelection();
+  sel2.removeAllRanges();
+  sel2.addRange(range);
+  sel2.deleteFromDocument();
+  return true;
+}, sel);
+
+const navigate = async (reason) => {
+  const gotoAt = Date.now(); // single timestamp per navigation (R2.4 unified entry contract)
+  await appendEvent(MON, "GOTO_ATTEMPT", { goto_reason: reason, at: gotoAt, agent_id: SPACE, space: SPACE, lastGotoAt: gotoAt });
   await page.goto("https://chatgpt.com/c/" + CONV, { timeout: 45000 });
   await page.waitForLoadState("load", { timeout: 30000 });
+  let ready = false;
+  for (let i = 0; i < 20 && !ready; i++) {
+    const len = await composerOp(() => page.evaluate(() => document.body.innerText.length));
+    if (len > 600) { ready = true; break; }
+    await page.waitForTimeout(2000);
+  }
+  if (!ready) abort("PAGE_NOT_READY_AFTER_NAVIGATE");
+  await page.waitForTimeout(1000);
+};
+
+await ensureOwnEmptyComposer(); // Gate 2 (initial)
+
+if (await getFillCount(MON, SPACE) >= 3) { // Gate 3 (FRESHEN)
+  await navigate("FRESHEN");
   await resetFillCount(MON, SPACE);
-  await page.waitForTimeout(2000);
+  await ensureOwnEmptyComposer(); // resurrection check, never skipped
 }
 
-// ---- Gate 4: fill (R2.5-F chunk rule); one whole round = one fill attempt ----
+// ---- Gate 4: PREPARED persisted BEFORE the first insertText (r44 P0-B3 — frozen chain order:
+// PREPARED → 填充 → 回读 → …). An interrupted fill then resumes from the persisted dispatch identity,
+// not from runtime file contents.
+const dispatch = resume ? existing :
+  await prepareDispatch({ monitorDir: MON, conversationUuid: CONV, taskSpace: SPACE, pageLabel: page.label, page, payload });
+
+// ---- Gate 5: fill (R2.5-F chunk rule); one whole round = one fill attempt ----
 await recordFillAttempt(MON, SPACE);
 const chunks = chunkPayload(payload, 1200);
 for (const chunk of chunks) {
   let ok = false;
   for (let attempt = 0; attempt < 2 && !ok; attempt++) {
-    let r = null;
-    try {
-      r = await page.evaluate(({ sel, text }) => {
-        const el = document.querySelector(sel);
-        if (!el) return { ok: false };
-        el.focus();
-        const range = document.createRange();
-        range.selectNodeContents(el);
-        range.collapse(false);
-        const selObj = window.getSelection();
-        selObj.removeAllRanges();
-        selObj.addRange(range);
-        return { ok: !!document.execCommand("insertText", false, text) };
-      }, { sel: COMPOSER_SEL, text: chunk });
-    } catch (error) {
-      await markComposerFreeze(MON, { space: SPACE, error }); // PageEvaluationTimeout family → storm channel
-      abort("COMPOSER_RENDER_FREEZE");
-    }
+    const r = await composerOp(() => page.evaluate(({ sel, text }) => {
+      const el = document.querySelector(sel);
+      if (!el) return { ok: false };
+      el.focus();
+      const range = document.createRange();
+      range.selectNodeContents(el);
+      range.collapse(false);
+      const selObj = window.getSelection();
+      selObj.removeAllRanges();
+      selObj.addRange(range);
+      return { ok: !!document.execCommand("insertText", false, text) };
+    }, { sel: COMPOSER_SEL, text: chunk }));
     ok = r?.ok === true;
     if (!ok && attempt === 0) await page.waitForTimeout(2500);
   }
@@ -149,13 +193,10 @@ for (const chunk of chunks) {
   await page.waitForTimeout(450);
 }
 
-// ---- Gate 5: full readback, two-level per payload class (R2.5-F) ----
+// ---- Gate 6: full readback, two-level per payload class (R2.5-F) ----
 let composerText = "";
 for (let a = 0; a < 8 && !composerText; a++) {
-  try { composerText = await readRaw(); } catch (error) {
-    await markComposerFreeze(MON, { space: SPACE, error });
-    abort("COMPOSER_RENDER_FREEZE");
-  }
+  composerText = await readRaw();
   if (!composerText) await page.waitForTimeout(3000);
 }
 // strict mode (URL/code/commands): raw compare only — rendered innerText cannot prove fidelity,
@@ -163,10 +204,6 @@ for (let a = 0; a < 8 && !composerText; a++) {
 if (!readbackMatches(payload, composerText)) {
   abort(readbackMode(payload) === "strict" ? "SENSITIVE_FIDELITY_UNPROVEN" : "READBACK_NOT_VERIFIED_ABORT");
 }
-
-// ---- Gate 6: PREPARED before send, with fingerprint-only ledger (R2.5-O) ----
-const dispatch = resume ? existing :
-  await prepareDispatch({ monitorDir: MON, conversationUuid: CONV, taskSpace: SPACE, pageLabel: page.label, page, payload });
 
 // ---- Gate 7: thinking-level precheck — READ is locale-independent (aria attrs); ENTRY is bilingual.
 // The EN-UI variant may have NO model menu at all (agent-kit#7): a click failure or missing menu is
@@ -192,29 +229,43 @@ const modelOk = menuInfo && menuInfo.radios.some((r) => r.label === "GPT-6" && r
 const levelOk = menuInfo && menuInfo.sliders.some((s) => String(s.now) === "2" && String(s.max) === "2");
 if (!menuInfo || !modelOk || !levelOk) abort("LEVEL_GATE_FAIL_ABORT");
 
-// ---- Gate 8: fresh ref lifecycle (R2.5-S) — every attempt re-snapshots; ≤3 focus tries;
-// send-button disabled check; SEND_STARTED persisted BEFORE Enter; old refs never reused ----
+// ---- Gate 8: ref lifecycle (r44 P0-A2) — ONLY snapshot/ref/focus may retry. Once focus succeeds,
+// the send path runs exactly once: button-missing = STOP (fail-closed), final content recheck on the
+// CURRENT composer (r44 P0-B4), SEND_STARTED persisted, then a single Enter in its own try — an Enter
+// error marks UNCERTAIN and never re-enters the loop (at-most-once).
 let sent = false;
 for (let focusAttempt = 1; focusAttempt <= 3 && !sent; focusAttempt++) {
-  const snap = await page.snapshot({ scope: "full_page" });
-  const tfLine = snap.split("\n").reverse().find((l) => /textfield "(询问 ChatGPT|Ask ChatGPT)"/.test(l));
-  const ref = tfLine && (tfLine.match(/\[ref=(\d+)/) || [])[1];
-  if (!ref) continue;
+  let ref = null;
   try {
+    const snap = await page.snapshot({ scope: "full_page" });
+    const tfLine = snap.split("\n").reverse().find((l) => /textfield "(询问 ChatGPT|Ask ChatGPT)"/.test(l));
+    ref = tfLine && (tfLine.match(/\[ref=(\d+)/) || [])[1];
+    if (!ref) continue;
     await page.focus("@" + ref);
-    await page.waitForTimeout(800);
-    const btn = await page.evaluate(() => {
-      const el = document.querySelector("button[aria-label='发送'], button[data-testid='send-button']");
-      return el ? { disabled: el.disabled, ariaDisabled: el.getAttribute("aria-disabled") } : null;
-    });
-    if (btn && (btn.disabled || btn.ariaDisabled === "true")) abort("SEND_DISABLED_ABORT");
-    await markSendStarted(MON, dispatch.dispatchId);
-    await page.keyboard.press("Enter");
-    sent = true;
   } catch (error) {
     if (focusAttempt === 3) abort("FOCUS_FAILED_AFTER_RETRIES");
     await page.waitForTimeout(1500); // stale ref → next iteration takes a fresh snapshot
+    continue;
   }
+  // ---- focus succeeded: the send path below runs at most once, never re-entered ----
+  await page.waitForTimeout(800);
+  const btn = await composerOp(() => page.evaluate(() => {
+    const el = document.querySelector("button[aria-label='发送'], button[data-testid='send-button']");
+    return el ? { disabled: el.disabled, ariaDisabled: el.getAttribute("aria-disabled") } : null;
+  }));
+  if (!btn) abort("SEND_BUTTON_MISSING_STOP"); // button not found: fail-closed, never skip the check
+  if (btn.disabled || btn.ariaDisabled === "true") abort("SEND_DISABLED_ABORT");
+  const finalText = await readRaw();
+  if (!finalText || !readbackMatches(payload, finalText)) {
+    abort(readbackMode(payload) === "strict" ? "SENSITIVE_FINAL_RECHECK_UNPROVEN" : "FINAL_RECHECK_NOT_VERIFIED_ABORT");
+  }
+  await markSendStarted(MON, dispatch.dispatchId);
+  try { await page.keyboard.press("Enter"); }
+  catch (error) {
+    await markUncertain(MON, dispatch.dispatchId, "SEND_ENTER_ERROR").catch(() => {});
+    abort("SEND_ENTER_ERROR_MARKED_UNCERTAIN"); // reconciliation decides next action; no auto-resend
+  }
+  sent = true;
 }
 if (!sent) abort("SEND_NOT_EXECUTED");
 
@@ -223,7 +274,7 @@ let accepted = null, acceptErr = null;
 for (let i = 0; i < 24 && !accepted; i++) {
   await page.waitForTimeout(1500);
   try {
-    const s = await readComposerSurface(page);
+    const s = await composerOp(() => readComposerSurface(page));
     if (s.composerEmpty && (s.generating || (s.lastMessageRole === "assistant" && s.lastMessageKey && s.lastMessageKey !== dispatch.baselineTailKey))) {
       try { accepted = await markAccepted(MON, dispatch.dispatchId, page); }
       catch (error) { acceptErr = String(error).slice(0, 120); }
