@@ -2,7 +2,7 @@
 name: chatgpt-web-dispatch
 description: ChatGPT 网页 Agent 派单工作流（ego-browser）——向 ChatGPT 网页会话派发任务、双循环监控回复、API 提取、会话迁移、429/死页/巨型会话处置。凡涉及 chatgpt.com 会话的派单、监控、提取、迁移任务（含关键词：派单/值守/看门狗/快轮询/提取/迁移会话）必读本 skill。Use for any ChatGPT web conversation dispatch, reply monitoring, extraction, or migration task driven by ego-browser.
 metadata:
-  version: "1.3.0"
+  version: "1.4.0"
   date: "2026-11-08"
 ---
 
@@ -28,7 +28,19 @@ metadata:
 ## 相关事实源
 
 - 监控脚本唯一存放点：ego-tools 仓库（R2.2 验收基线 `fd6da71`，父基线 `32c3658`；路径与本机部署状态见手册 §6；要改脚本只改那一份）。状态机文件：`dispatch-state.mjs`（派单账本 + 结构化 Composer/尾部读取）、`state-schema.mjs`（v3 Schema + 绝对 deadline）、`page-recovery.mjs`（多 Page URL-UUID 消歧）。
+- **派单规范模板**：`templates/dispatch-round.template.mjs`（R2.5 九闸门冻结事务链，见手册 §3.1）。新派单任务以它为底本，只改顶部适配器常量（MON/SPACE/MSG_FILE/CONV），遇到 `ADAPTATION_REQUIRED` 说明环境与模板假设不符，STOP 上报，不要徒手重写链路。
 - 跨机器交付的 SHA256 必须注明哈希对象与字节基准（Git blob / 下载文件 / 部署磁盘，注明 LF/CRLF），见手册 §11.10。
 - 通用浏览器操作（非 ChatGPT 派单流）见 `ego-browser` skill。
 - 弃用声明：chrome-use / chatgpt-use 已全面弃用，仅存量旧脚本可读，禁止新建依赖。
+
+## 实战问题协作方式（PO 令 2026-11-08，所有使用本 skill 的 Agent 遵守）
+
+不搞独立测试战役：skill 的能力**在实际派单任务中验证**。实战遇到问题时的标准路径：
+
+1. **当场止损**：按手册对应章节处置（STOP / 退避 / 对账），保住现场证据（状态文件、事件日志，脱敏后留存），不盲目重试。
+2. **报 GitHub issue**：到 `github.com/Hulkhao/agent-kit/issues` 留言——现象、复现轮次、现场证据摘要（**不含提示词正文/Cookie/Token**）、手册或模板哪一节不符。监控脚本类问题（ego-tools）也先报到 agent-kit issues 记账。
+3. **等修复发布**：issue 由 skill 维护会话解决并 commit → push → deploy；修复落地前不要自行改动仓库源或部署副本（维护口径见上）。
+4. **继续主线**：修复发布前主线任务不受阻——按手册兜底路径继续推进，把 issue 编号留在值班记录里供后续回归验证。
+
+这样其他 Agent 遇到同类问题能直接查 issue 看到已知现象与修复进度，避免各自踩坑、各自打补丁。
 

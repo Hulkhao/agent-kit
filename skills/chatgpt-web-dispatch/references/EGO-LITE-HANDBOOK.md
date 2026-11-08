@@ -56,6 +56,19 @@
 
 **静默生成死亡**（实测两次）：user 气泡入库、页面转空闲、但服务端没有任何 assistant 节点——用 API 核实后发短消息催办即可激活。
 
+### 3.1 R2.5 派单冻结事务链（LIMITED GO · AUTHORIZED，规划师裁决 reply-r43）
+
+**核心验收哲学**：不会误发、不会重复发、不会覆盖用户草稿、不会因页面冻结丢失派单。完整链路：**PREPARED → 填充 → 完整回读 → 刷新 Composer ref → 所有权确认 → SEND_STARTED → Enter → AUTO_ACCEPTED**；任何一步无法证明，都不得进入下一步。规范模板：`templates/dispatch-round.template.mjs`（九闸门实现，新派单任务照抄改适配器，不要徒手重写）。
+
+- **账本指纹化（R2.5 起）**：PREPARED 记录只存 `payload_sha256` / `payload_bytes` / `composer_baseline`，**禁止保存完整提示词正文、前缀后缀片段、事件日志正文、诊断用 Composer 全文副本**。哈希是指纹不是匿名化——泄漏原文的风险不因哈希消除，绝不能把哈希当脱敏后仍可外发的原文用。
+- **填充分块规则**：以行为单位切分；每个非末块携带自己的行尾换行；每块 ≤1.2KB（UTF-8 字节）；`chunks.join()` 必须精确还原原文；单行超限报 `CHUNK_LINE_EXCEEDS_LIMIT` 停止，不静默拆行。
+- **两级回读核对**：普通文本走**归一化**（折叠空白伪影 `\s+→" "` 后比对）；含 URL / 代码块 / 命令行（`/https?:\/\/|www\.|```|^\s*[$>]/m` 命中）走**严格保真**原文比对——innerText 无法证明字节级保真即 STOP（`SENSITIVE_FIDELITY_UNPROVEN`），宁可不发，不发错。
+- **草稿所有权（R2.5-O）**：Composer 现文必须等于本次 payload 全文、或为其按顺序的有效前缀（同样空白折叠后比对），才算「我们的草稿」；历史草稿只凭持久化哈希精确匹配认领；**禁止把任意子串当所有权证据**；空草稿是独立分支。不归属 → `FOREIGN_DRAFT_STOP` 停止；确认为自己的残留才清空（`selectNodeContents` + `deleteFromDocument`，清空后必须回验空态）。
+- **SEND_STARTED 后锁定**：状态一旦进入 SEND_STARTED 及之后，禁止清空、重填、重发；进程重启后先对账，UNCERTAIN 由主管人工裁定，不自动重发（at-most-once）。
+- **发送 ref 生命周期**：每次 focus 尝试前重新 `page.snapshot()` 取新 ref（旧 ref 跨尝试不复用）；最多 3 次 focus 尝试；发送按钮 `disabled` = 陈旧页，先 goto 刷新重读再发；`markSendStarted` 必须持久化在 Enter **之前**。
+- **FRESHEN 机制**：距上次成功导航已累计 ≥3 次完整填充尝试 → **在下一次填充之前**（绝不之后——goto 会毁掉当前草稿）执行 `navigate("FRESHEN")` 并清零计数，防 Composer 冻结后 ref 陈旧、事件失灵。
+- **Composer 冻结处置**：填充/回读中 evaluate 报错 → 记 `COMPOSER_RENDER_FREEZE` 事件（单写入口：只允许 dispatch-state.mjs 写，probe 只消费）→ 走共享风暴通道（`CHAT_SURFACE_STRUCTURALLY_UNAVAILABLE` + ≥9 分钟绝对 deadline，按 SPACE 相位错峰）→ 退避到期单次 `COMPOSER_FREEZE_RETRY`；重试失败重新武装，绝不退化成 GOTO_FAILED/8 分钟通道。
+
 ## 4. 回复提取（2026-11-08 起：以页面 DOM 结构化证据为准，API 为辅助通道）
 
 **本机实测事实（2026-11-08，R2 验收裁决）：**
@@ -119,10 +132,10 @@ const r = await page.fetch("/backend-api/conversation/" + uuid,
 
 ### 6.2 设计要点（每条都是实测事故换来的）
 
-- 脚本1（快轮询）**纯 DOM 读，零脚本侧 API 配额**——这是快轮询节奏的前提（1 分钟节奏下页面加载 60 次/小时，配额观察项见 §7）。判定=「可见停止按钮」的生成→空闲翻转 + 75 秒确认窗（滤工具链间隙假阳性）。它只报候选，真伪由主管 API 终验。
+- 脚本1（快轮询）**纯 DOM 读，零脚本侧 API 配额**——这是快轮询节奏的前提（R2.4 起驻页探测约 6 次 goto/小时，见 §7）。判定=「可见停止按钮」的生成→空闲翻转 + 75 秒确认窗（滤工具链间隙假阳性）。它只报候选，真伪由主管 API 终验。
 - 脚本2（看门狗）**单实例=单 15 分钟窗口**：先睡满 15 分钟再判定（等待在前、判定在后），结果未处理即退出唤醒主管；主管审查后**必须重新布防**（重启脚本2；脚本1 若因抓到回复退出，取走交付后也重启）。
 - **退出即接力**：任何唤醒处理后不允许出现无脚本值守的空窗（实测 7 小时空转事故的根因）。
-- probe 内置硬化（规范版已含，勿删）：每轮全新 `goto`（ChatGPT SPA 会冻结渲染，`page.reload()` 常落 43 字符空壳）；就绪等待只认**正文 >600 字符**（上限 40s——空壳也带「发送」按钮，按按钮判就绪会假阳性）；goto/渲染失败 → **8 分钟退避**（退避期只刷状态文件时间戳）；**死页梯子**：见死标 → 刷 2 次 → 仍死记 1 strike → **8 分钟后再试** → 连续 3 strikes 才判会话真死并唤醒主管；恢复渲染后 strike 清零。
+- probe 内置硬化（规范版已含，勿删）：**R2.4 起快轮询三分支驻页探测（FINAL PASS 65c78e4）**——STAY 轮（页面就绪）0 goto 零加载；CALIBRATE 轮（距 navRef ≥10 分钟）1 次 goto 校准；RECOVER 轮（页面失就绪/timeOrigin 读取失败）走恢复。navRef = max(lastGotoAt, performance.timeOrigin)；goto 全部收敛到统一 `navigate(reason)` 入口（单一 `gotoAt` 时间戳 + GOTO_ATTEMPT 事件）。就绪等待只认**正文 >600 字符**（上限 40s——空壳也带「发送」按钮，按按钮判就绪会假阳性）；goto/渲染失败 → **8 分钟退避**（退避期只刷状态文件时间戳）；**死页梯子**：见死标 → 刷 2 次 → 仍死记 1 strike → **8 分钟后再试** → 连续 3 strikes 才判会话真死并唤醒主管；恢复渲染后 strike 清零。429/加载风暴与 Composer 冻结走共享风暴通道（`CHAT_SURFACE_STRUCTURALLY_UNAVAILABLE` + `stormBackoffDeadline` = max(8min, 9min+SPACE相位)，单次重试由 planStormRecovery 把关，失败重新武装，详见 §3.1）。
 - **恢复首轮若为空闲态 → startIdle=true → 强制走「启动即提取」复核**（防吞退避期间已到达的回复）。
 - **Page 标签恢复顺序（R2.1 起）**：优先按已持久化标签恢复；标签缺失且仅一个 Page 时复用；无 Page 才新建；多个 Page 优先按目标 conversation UUID 的完整 URL 路径段唯一匹配（`page-recovery.mjs`）；零匹配（`PAGE_URL_MATCH_NOT_FOUND`）、多匹配（`PAGE_URL_MATCH_AMBIGUOUS`）或 URL 无法读取（`PAGE_URL_INSPECTION_FAILED`）时 STOP，不猜标签。
 - **当前 ChatGPT 尾部消息 DOM 契约（实测 2026-11-08，R2.2 落地于 `dispatch-state.mjs`）**：
@@ -157,7 +170,7 @@ const r = await page.fetch("/backend-api/conversation/" + uuid,
 | 参数 | 值 | 适用场景 | 备注 |
 |---|---|---|---|
 | 快轮询间隔 | **1 分钟**（sleep 60s + 探测耗时，有效 ~65~100s/轮） | ego 双循环脚本1 | PO 2026-11-08 令（原 3 分钟）；**旧 16 铁律的「90~100 秒」是 chrome-use/chatgpt-use 路由口径，不适用于 ego 纯 DOM 双循环** |
-| 快轮询页面加载频次 | 60 次 goto/小时（600 轮上限 ≈10h 值守） | 配额观察项 | 每轮全新 goto=页面重载，页面自身拉会话数据、耗账号配额（3 分钟→1 分钟压力 ×3）；出现加载变慢/429 征兆按 §5 处置并回调节奏（如回 3 分钟） |
+| 快轮询页面加载频次 | **约 6 次 goto/小时/Agent**（R2.4 起实测口径） | 配额观察项 | **R2.4 FINAL PASS（65c78e4）修订**：快轮询改驻页 STAY 轮 0 goto，仅 CALIBRATE（距上次导航 ≥10 分钟）1 次 goto + 异常 RECOVER，收敛到约 6 次/小时；旧「60 次 goto/小时」是 pre-R2.4 每轮 goto 口径，已作废。异常恢复与 429/冻结走共享风暴通道（≥9 分钟 + SPACE 相位错峰）。若观察到 429/加载变慢征兆仍按 §5 处置并回调节奏 |
 | 看门狗窗口 | 15 分钟 | 脚本2 单实例 | 睡满再判（等待在前、判定在后）；未处理即退出唤醒，主管介入判定卡死/仍在处理后重新布防 |
 | 翻转确认窗 | 75 秒 | 生成→空闲翻转后 | 滤工具链间隙假完成 |
 | 状态陈旧阈值 | ≥7 分钟 | 看门狗判快轮询死 | 快轮询死亡信号 |
