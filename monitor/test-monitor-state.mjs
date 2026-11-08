@@ -575,38 +575,96 @@ test("probe stamps one shared gotoAt and emits goto_reason/agent_id on GOTO_ATTE
 
 // ---- R2.5 Composer delivery reliability: chunk/ownership/ledger/freeze helpers ----
 
-test("chunkPayload: line-boundary split, non-last chunks carry trailing newline, join reconstructs exactly", async () => {
+test("chunkPayload: 600-grapheme target, 1200-byte hard cap, exact reconstruction, and line-edge adjustment", async () => {
   const { chunkPayload } = await import("./dispatch-state.mjs");
-  // plain multiline text
-  const text = Array.from({ length: 50 }, (_, i) => `line-${i} with some padding text to reach sizes`).join("\n");
-  const chunks = chunkPayload(text, 200);
-  assert.equal(chunks.join(""), text);
-  for (const c of chunks) assert.ok(Buffer.byteLength(c, "utf8") <= 200, "chunk exceeds byte limit");
-  for (let i = 0; i < chunks.length - 1; i++) assert.ok(chunks[i].endsWith("\n"), "non-last chunk must carry its newline");
-  // single line longer than limit is rejected, never silently split mid-line
-  assert.throws(() => chunkPayload("x".repeat(1300), 1200), { message: "CHUNK_LINE_EXCEEDS_LIMIT" });
-  // empty and single-line payloads
-  assert.deepEqual(chunkPayload("", 1200), []);
-  assert.deepEqual(chunkPayload("hello", 1200), ["hello"]);
-  // CRLF survives inside lines (payload fidelity is the caller's concern; chunking preserves bytes)
-  const crlf = "a\r\nb\nc";
-  assert.deepEqual(chunkPayload(crlf, 100).join(""), crlf);
+  const countGraphemes = (value) =>
+    Array.from(new Intl.Segmenter("und", { granularity: "grapheme" }).segment(value)).length;
+
+  const longLines = Array.from({ length: 24 }, (_, i) => "line-" + i + ":" + "园".repeat(80)).join("\n");
+  const chunks = chunkPayload(longLines);
+  assert.equal(chunks.join(""), longLines);
+  for (const chunk of chunks) {
+    assert.ok(Buffer.byteLength(chunk, "utf8") <= 1200, "chunk exceeds the hard UTF-8 byte limit");
+    assert.ok(countGraphemes(chunk) <= 602, "chunk exceeded the 600-grapheme target beyond line adjustment");
+  }
+  assert.ok(chunks.slice(0, -1).every((chunk) => !chunk.endsWith("\n") && !chunk.endsWith("\r")),
+    "non-final chunks should not end at a line break when an interior boundary is available");
+
+  // An 1831-character payload remains lossless and is split by the target size.
+  const incidentSample = "x".repeat(1831);
+  const incidentChunks = chunkPayload(incidentSample);
+  assert.equal(incidentChunks.join(""), incidentSample);
+  assert.deepEqual(incidentChunks.map(countGraphemes), [600, 600, 600, 31]);
+
+  // A boundary immediately before or after a line break moves into the next line.
+  const beforeBreak = "a".repeat(20) + "\n" + "b".repeat(30);
+  assert.equal(chunkPayload(beforeBreak, 100, 20)[0], "a".repeat(20) + "\nb");
+  const afterBreak = "a".repeat(19) + "\n" + "b".repeat(30);
+  assert.equal(chunkPayload(afterBreak, 100, 20)[0], "a".repeat(19) + "\nb");
+  const byteLimitedEdge = "a".repeat(1199) + "\n" + "b".repeat(10);
+  const byteLimitedChunks = chunkPayload(byteLimitedEdge, 1200, 2000);
+  assert.equal(byteLimitedChunks.join(""), byteLimitedEdge);
+  assert.equal(byteLimitedChunks[0], "a".repeat(1198));
+
+  // Long blank-line runs must not make a boundary adjustment exceed the chunk target.
+  const blankLineRun = "a".repeat(19) + "\n" + "\n".repeat(1000) + "b".repeat(30);
+  const blankLineChunks = chunkPayload(blankLineRun, 100, 20);
+  assert.equal(blankLineChunks.join(""), blankLineRun);
+  assert.ok(blankLineChunks.every((chunk) => countGraphemes(chunk) <= 22));
+  assert.ok(blankLineChunks.every((chunk) => Buffer.byteLength(chunk, "utf8") <= 100));
+
+  // CJK reaches the byte cap before the grapheme target.
+  const cjk = "庭".repeat(900);
+  const cjkChunks = chunkPayload(cjk);
+  assert.equal(cjkChunks.join(""), cjk);
+  assert.ok(cjkChunks.every((chunk) => Buffer.byteLength(chunk, "utf8") <= 1200));
+  assert.deepEqual(cjkChunks.map(countGraphemes), [400, 400, 100]);
+
+  // Emoji ZWJ sequences and combining marks are indivisible grapheme clusters.
+  const family = "👨‍👩‍👧‍👦";
+  const emojiChunks = chunkPayload(family.repeat(5), 120, 2);
+  assert.deepEqual(emojiChunks, [family + family, family + family, family]);
+  const composed = "e\u0301";
+  assert.deepEqual(chunkPayload(composed.repeat(5), 100, 2), [composed + composed, composed + composed, composed]);
+
+  // CRLF/LF and trailing separators survive exactly.
+  const mixedLines = "a\r\nb\nc\r\n";
+  const mixedChunks = chunkPayload(mixedLines, 100, 2);
+  assert.equal(mixedChunks.join(""), mixedLines);
+  assert.ok(mixedChunks.slice(0, -1).every((chunk) => !chunk.endsWith("\n") && !chunk.endsWith("\r")));
+  assert.deepEqual(chunkPayload("", 1200, 600), []);
+  assert.deepEqual(chunkPayload("hello", 1200, 600), ["hello"]);
+  assert.throws(() => chunkPayload("a" + "\u0301".repeat(700), 1200, 600),
+    { message: "CHUNK_GRAPHEME_EXCEEDS_LIMIT" });
+  assert.throws(() => chunkPayload("hello", 0, 600), { message: "BYTE_LIMIT_NOT_POSITIVE_INT" });
+  assert.throws(() => chunkPayload("hello", 1200, 0), { message: "TARGET_CHARS_NOT_POSITIVE_INT" });
 });
 
-test("composer artifact normalization is collapse-to-one-space and readback two-level", async () => {
+test("composer artifact normalization is collapse-to-one-space and chunk readback outcomes are explicit", async () => {
   const m = await import("./dispatch-state.mjs");
-  // block-level artifact: composer renders \n\n between lines
   const payload = "alpha line\nbeta line\nfinal";
   assert.equal(m.collapseComposerArtifacts("alpha line\n\nbeta line\n\nfinal"), "alpha line beta line final");
   assert.equal(m.readbackMatches(payload, "alpha line\n\nbeta line\n\nfinal"), true);
   assert.equal(m.readbackMatches(payload, "alpha line\nbeta line\nfinal"), true);
   assert.equal(m.readbackMatches(payload, "alpha line\nbeta line CHANGED"), false);
-  // plain text is "normalized" mode; sensitive payload must compare strictly
   assert.equal(m.readbackMode(payload), "normalized");
-  const sensitive = "check https://example.com/a b and ```code```";
+
+  const fence = String.fromCharCode(96).repeat(3);
+  const sensitive = "check https://example.com/a b and " + fence + "code" + fence;
   assert.equal(m.readbackMode(sensitive), "strict");
   assert.equal(m.readbackMatches(sensitive, sensitive), true);
-  // artifacts that altered the raw bytes must NOT pass the strict gate
+  assert.equal(m.readbackMatches("safe prefix", "safe prefix\n", "strict"), false);
+  assert.equal(m.readbackMatches("safe prefix", "safe prefix\n", "normalized"), true);
+
+  assert.equal(m.classifyChunkReadback("", "first chunk", "\n", "normalized"), "NO_EFFECT");
+  assert.equal(m.classifyChunkReadback("", "first chunk", "first chunk", "strict"), "INSERTED");
+  assert.equal(m.classifyChunkReadback("first", "first second", "first second", "strict"), "INSERTED");
+  assert.equal(m.classifyChunkReadback("first", "first second", "first", "strict"), "NO_EFFECT");
+  assert.equal(m.classifyChunkReadback("first", "first second", "second first", "normalized"), "MISMATCH");
+  // A whitespace-only chunk is accepted only when raw readback proves which side won.
+  assert.equal(m.classifyChunkReadback("prefix", "prefix ", "prefix ", "normalized"), "INSERTED");
+  assert.equal(m.classifyChunkReadback("prefix", "prefix ", "prefix", "normalized"), "NO_EFFECT");
+  assert.equal(m.classifyChunkReadback("prefix", "prefix ", "prefix  ", "normalized"), "MISMATCH");
   assert.equal(m.readbackMatches("see https://x.com/a\nb", "see https://x.com/a\n\nb"), false);
   assert.equal(m.readbackMatches("$deploy --flag\nsecond line", "$deploy  --flag\nsecond line"), false);
 });

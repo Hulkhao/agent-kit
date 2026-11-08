@@ -14,7 +14,7 @@ test("template freezes the transaction chain: PREPARED before fill, ownership be
     'await navigate("FRESHEN")',
     "prepareDispatch({ monitorDir: MON",
     "recordFillAttempt(MON, SPACE)",
-    "if (!readbackMatches(payload, composerText))",
+    "if (!readbackMatches(payload, composerText, fillReadbackMode))",
     "markSendStarted(MON",
     "markAccepted(MON",
     'markUncertain(MON, dispatch.dispatchId, "SEND_ACK_MISSING")',
@@ -61,17 +61,33 @@ test("r44 P0-A2: missing send button is fail-closed; final content recheck prece
   assert.match(src, /FINAL_RECHECK_NOT_VERIFIED_ABORT/);
 });
 
-test("chunk rule: line-boundary chunks, byte limit, freeze channel wired via composerOp", async () => {
+test("adaptive chunk fill is readback-driven; retry only when the previous cumulative prefix remains", async () => {
   const src = await template();
-  assert.match(src, /chunkPayload\(payload, 1200\)/);
+  const fillStart = src.indexOf("// ---- Gate 5: adaptive fill");
+  const gate6 = src.indexOf("// ---- Gate 6: final full-payload verdict");
+  const fill = src.slice(fillStart, gate6);
+  assert.match(fill, /chunkPayload\(payload, 1200, 600\)/);
+  assert.match(fill, /classifyChunkReadback\(expectedPrefix, nextPrefix, composerText, fillReadbackMode\)/);
+  assert.match(fill, /readbackState === "INSERTED"/);
+  assert.match(fill, /readbackState === "MISMATCH"/);
+  assert.match(fill, /retryReadbackState = classifyChunkReadback/);
+  assert.match(fill, /retryReadbackState === "INSERTED"/);
+  assert.match(fill, /CHUNK_READBACK_MISMATCH/);
+  assert.match(fill, /CHUNK_INSERT_NO_EFFECT/);
+  assert.match(fill, /attempt < 2/);
+  assert.doesNotMatch(fill, /ok = r\?\.ok === true/);
+  const gate6Body = src.slice(gate6, src.indexOf("// ---- Gate 7:"));
+  assert.match(gate6Body, /readbackMatches\(payload, composerText, fillReadbackMode\)/);
+  assert.match(gate6Body, /if \(chunks.length === 0\) composerText = await readRaw\(\)/);
+  assert.equal((gate6Body.match(/readRaw\(/g) || []).length, 1);
   assert.match(src, /composerOp/);
-  assert.match(src, /markComposerFreeze\(MON, \{ space: SPACE, error \}\)/);
 });
 
 test("two-level readback: strict for sensitive payloads, normalized only for plain text", async () => {
   const src = await template();
-  assert.match(src, /readbackMode\(payload\) === "strict" \? "SENSITIVE_FIDELITY_UNPROVEN" : "READBACK_NOT_VERIFIED_ABORT"/);
-  assert.match(src, /readbackMatches\(payload, composerText\)/);
+  assert.match(src, /fillReadbackMode === "strict" \? "SENSITIVE_FIDELITY_UNPROVEN" : "READBACK_NOT_VERIFIED_ABORT"/);
+  assert.match(src, /readbackMatches\(payload, composerText, fillReadbackMode\)/);
+  assert.match(src, /classifyChunkReadback\(expectedPrefix, nextPrefix, composerText, fillReadbackMode\)/);
 });
 
 test("r44 P0-B1: exactly ONE navigation channel — page.goto appears only inside navigate(reason)", async () => {

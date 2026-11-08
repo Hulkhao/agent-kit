@@ -36,14 +36,14 @@ metadata:
 2. UI 状态只由结构化证据判定（可见停止按钮、尾部 `data-content-search-unit-key` / assistant DIL UUID），不从会话正文提取状态标志；完成判定=「可见停止按钮」消失的状态翻转 + 75 秒确认窗 + 尾部 assistant DIL UUID 稳定；禁文本匹配「正在思考」、禁用回复完成后采集的内容哈希/计数当基线；监视器启动即提取比对派单基线。
 3. 快轮询纯 DOM 零 API 配额；API 仅唤醒后单次提取（每唤醒最多 2 调用）；`page.fetch` 的 conversation API 返回 404 `conversation_inaccessible` ≠ 会话死亡（授权上下文缺 token，见手册 §4），以页面 DOM 结构化证据为准；429 期停一切 API 与密集导航，页面重试 ≥9 分钟。
 4. 双循环监控（1 分钟快轮询 + 15 分钟看门狗）一律受管后台任务，退出即接力；消息数接近 2000 提前自包含简报迁移。
-5. 发送默认 focus+Enter（失败回退 click）；发送前确认「发送」按钮可用（`disabled=true`=陈旧页，先 goto 刷新再重读，陈旧页上 Enter 与 click 都会静默无效）；填充用 ~1.2KB 线边界分块 `execCommand("insertText")`，fill/原生 paste/单次长文本不作为可靠通道；Composer 空态是 innerText=`"\n"`（长度 1），勿用 `length===0` 判空；发送前持久化派单状态，发送后以结构化证据双验（user unit-key 尾部前进 + 停止按钮出现）；进程重启后先对账，禁止盲目重发；向外发送前查敏感信息。
+5. 发送默认 focus+Enter（失败回退 click）；发送前确认「发送」按钮可用（`disabled=true`=陈旧页，先 goto 刷新再重读，陈旧页上 Enter 与 click 都会静默无效）；填充用 600 grapheme 目标 / 1200 UTF-8 byte 硬上限；每块 `execCommand("insertText")` 后回读累计前缀，只有确认内容未变化才重试当前块一次，错位立即 STOP；fill/原生 paste/单次长文本不作为可靠通道；Composer 空态是 innerText=`"\n"`（长度 1），勿用 `length===0` 判空；发送前持久化派单状态，发送后以结构化证据双验（user unit-key 尾部前进 + 停止按钮出现）；进程重启后先对账，禁止盲目重发；向外发送前查敏感信息。
 6. 任务状态分离：浏览器存活、轮次生成、工具调用、最终完成是不同状态；超时或 stream reconnect 不等于任务失败。
 7. 崩溃恢复采用有上限的重启与安全诊断；失败后立即保留状态证据，禁止记录 Cookie、Token、提示词正文和工具参数。
 
 ## 相关事实源
 
 - 监控脚本唯一存放点：**本仓库 `monitor/` 目录（PO 令 2026-11-08 并入 agent-kit；原独立 ego-tools 本地仓库停用为历史归档）**；要改脚本只改仓库内这一份，禁止本地另立孤本副本。**开工前 `git pull` 同步官方最新**（任务边界更新，skill 与脚本天然同版交付）。状态机文件：`dispatch-state.mjs`（派单账本 + 结构化 Composer/尾部读取）、`state-schema.mjs`（v3 Schema + 绝对 deadline）、`page-recovery.mjs`（多 Page URL-UUID 消歧）、`ego-profile-check.mjs`（本机账号钉扎校验）。
-- **派单规范模板**：`templates/dispatch-round.template.mjs`（R2.5 九闸门冻结事务链，见手册 §3.1）。新派单任务以它为底本，只改顶部适配器常量（MON/SPACE/MSG_FILE/CONV），遇到 `ADAPTATION_REQUIRED` 说明环境与模板假设不符，STOP 上报，不要徒手重写链路。
+- **派单规范模板**：`templates/dispatch-round.template.mjs`（R2.5 九闸门冻结事务链 + R2.6-F 自适应填充，见手册 §3.1）。新派单任务以它为底本，只改顶部适配器常量（MON/SPACE/MSG_FILE/CONV），遇到 `ADAPTATION_REQUIRED` 说明环境与模板假设不符，STOP 上报，不要徒手重写链路。
 - 跨机器交付的 SHA256 必须注明哈希对象与字节基准（Git blob / 下载文件 / 部署磁盘，注明 LF/CRLF），见手册 §11.10。
 - 通用浏览器操作（非 ChatGPT 派单流）见 `ego-browser` skill。
 - 弃用声明：chrome-use / chatgpt-use 已全面弃用，仅存量旧脚本可读，禁止新建依赖。
