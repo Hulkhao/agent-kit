@@ -45,6 +45,28 @@ test("safe error metadata cannot overwrite application error classifications", a
   assert.ok(codes.every((code) => code !== "UNKNOWN"), `unknown-clobbered site present: ${codes.join(",")}`);
 });
 
+test("watchdog REQUIRED set stays in lockstep with the probe state schema (issue #11)", async () => {
+  const schemaSource = await readFile(new URL("./state-schema.mjs", import.meta.url), "utf8");
+  const watchdogSource = await readFile(new URL("./watchdog.sh", import.meta.url), "utf8");
+  const defaultsBlock = schemaSource.match(/FAST_STATE_DEFAULTS = Object\.freeze\(\{([\s\S]*?)\}\);/);
+  assert.ok(defaultsBlock, "FAST_STATE_DEFAULTS block not found");
+  const schemaFields = [...defaultsBlock[1].matchAll(/^\s{2}([a-zA-Z]+):/gm)].map((m) => m[1]);
+  assert.ok(schemaFields.length >= 30, `unexpectedly few schema fields: ${schemaFields.length}`);
+  const requiredBlock = watchdogSource.match(/REQUIRED = \{([\s\S]*?)\}/);
+  assert.ok(requiredBlock, "watchdog REQUIRED block not found");
+  const watchdogFields = [...requiredBlock[1].matchAll(/"([a-zA-Z]+)"/g)].map((m) => m[1]);
+  assert.deepEqual(
+    watchdogFields.filter((field) => !schemaFields.includes(field)).sort(),
+    [],
+    `watchdog REQUIRED has fields the probe never writes: ${watchdogFields.filter((f) => !schemaFields.includes(f)).join(",")}`,
+  );
+  assert.deepEqual(
+    schemaFields.filter((field) => !watchdogFields.includes(field)).sort(),
+    [],
+    `probe writes fields watchdog REQUIRED does not accept (STATE_CORRUPT every window): ${schemaFields.filter((f) => !watchdogFields.includes(f)).join(",")}`,
+  );
+});
+
 test("SPACE phase is a stable deterministic value in the 0-9min span", () => {
   const phase = spacePhaseMs("fast-poll-6aef5b8c-mon");
   assert.equal(phase, spacePhaseMs("fast-poll-6aef5b8c-mon"));

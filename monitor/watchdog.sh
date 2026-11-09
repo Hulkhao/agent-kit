@@ -16,7 +16,7 @@ REQUIRED = {
     "everGenerating", "len", "bodyChanged", "lastProgressAt", "startIdle",
     "doneCandidate", "gapRejected", "probeFailed", "backoffUntil",
     "unavailableStrikes", "unavailablePersistent", "uiSchema", "composerCount", "composerEmpty",
-    "lastMessageRole", "lastMessageKey", "lastMessageTextLength",
+    "lastMessageRole", "lastMessageKey", "lastMessageTextLength", "lastGotoAt",
     "stopLabelCount", "buttonLabels", "activityMarkers", "busyCount",
     "dispatchId", "dispatchStatus", "toolState", "finalVerification",
     "recoveryFailed", "errorName", "errorCode"
@@ -54,6 +54,9 @@ try:
     deadline = state.get("backoffUntil")
     if deadline is not None and (isinstance(deadline, bool) or not isinstance(deadline, (int, float)) or not math.isfinite(deadline) or deadline < 0):
         raise ValueError("backoffUntil")
+    last_goto = state.get("lastGotoAt")
+    if last_goto is not None and (isinstance(last_goto, bool) or not isinstance(last_goto, (int, float)) or not math.isfinite(last_goto) or last_goto < 0):
+        raise ValueError("lastGotoAt")
     age = (time.time() * 1000 - state.get("ts", 0)) / 1000
     print("state age=%.0fs generating=%s everGenerating=%s done=%s startIdle=%s dispatch=%s tool=%s" % (
         age, state.get("generating", False), state.get("everGenerating", False),
