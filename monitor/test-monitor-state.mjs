@@ -174,6 +174,59 @@ test("multiple Pages fail closed if any URL cannot be inspected", async () => {
   );
 });
 
+// The probe recovery flow is inline; assert its branch order and required
+// evidence instead of importing the adapter-bound executable monitor.
+async function probeRecoverySource() {
+  const source = await readFile(new URL("./ego-fast-probe.mjs", import.meta.url), "utf8");
+  const start = source.indexOf("  const previousPageLabel = previous.pageLabel;");
+  const end = source.indexOf("  pages = await task.pages();\n  await writeState(", start);
+  assert.ok(start >= 0 && end > start, "probe page-recovery block not found");
+  return source.slice(start, end);
+}
+
+test("probe recovery: zero matching pages creates a Page only after checking unmanaged tabs", async () => {
+  const block = await probeRecoverySource();
+  const inventory = block.indexOf("const tabs = await task.tabs()");
+  const unmanaged = block.indexOf("const unmanagedMatches = tabs.filter");
+  const create = block.indexOf("page = await task.newPage()");
+  assert.ok(block.includes("pages = await task.pages()"));
+  assert.ok(inventory > 0 && unmanaged > inventory && create > unmanaged);
+  assert.match(block, /if \(unmanagedMatches\.length === 1\) \{[\s\S]*?\} else \{\s*page = await task\.newPage\(\)/);
+  assert.equal((block.match(/task\.newPage\(/g) || []).length, 1);
+});
+
+test("probe recovery: one managed URL match reuses its Page without relying on label", async () => {
+  const block = await probeRecoverySource();
+  assert.match(block, /pages\.length === 1[\s\S]*?currentUrl = await pages\[0\]\.url\(\)/);
+  assert.match(block, /if \(urlMatchesConversation\(currentUrl\)\) \{\s*page = pages\[0\]/);
+  assert.doesNotMatch(block, /page = pages\.find\(/);
+  assert.doesNotMatch(block, /previousPageLabel === page\.label/);
+});
+
+test("probe recovery: duplicate managed UUID URLs retain the ambiguous-page stop", async () => {
+  const uuid = "12345678-1234-1234-1234-123456789abc";
+  const makePage = (label) => ({ label, url: async () => `https://chatgpt.com/c/${uuid}` });
+  await assert.rejects(selectUniqueConversationPage([makePage("p1"), makePage("p2")], uuid), {
+    code: "PAGE_URL_MATCH_AMBIGUOUS",
+  });
+  const block = await probeRecoverySource();
+  assert.match(block, /pages\.length > 1[\s\S]*?selectUniqueConversationPage\(pages, uuid\)/);
+  assert.match(block, /error\?\.code !== "PAGE_URL_MATCH_NOT_FOUND"\) throw error/);
+});
+
+test("probe recovery: unique unmanaged UUID tab is adopted only with structured evidence", async () => {
+  const block = await probeRecoverySource();
+  assert.match(block, /exactHost \? parsed\.hostname === "chatgpt\.com"/);
+  assert.match(block, /parsed\.pathname\.split\("\/"\)\.includes\(uuid\)/);
+  assert.match(block, /!tab\.label && urlMatchesConversation\(tab\.url, true\)/);
+  assert.match(block, /unmanagedMatches\.length > 1[\s\S]*?PAGE_URL_MATCH_AMBIGUOUS/);
+  assert.match(block, /candidate\.openedBy !== "agent"[\s\S]*?candidate\.targetId/);
+  assert.match(block, /page = await task\.adopt\(candidate\.page\)/);
+  assert.match(block, /selectionEvidence = "UNIQUE_UNMANAGED_CONVERSATION_URL"/);
+  assert.match(block, /appendEvent\(MON, "PAGE_ADOPTED"/);
+  assert.ok(block.indexOf("PAGE_ADOPTED") < block.indexOf("page = await task.newPage()"));
+});
+
 function makeSurface({ composerText = "prompt body", role = "assistant", key = "11111111-1111-4111-8111-111111111111", generating = false, includeUnit = true, includeDilId = true } = {}) {
   const composer = {
     id: "prompt-textarea", tagName: "DIV", value: "", innerText: composerText,

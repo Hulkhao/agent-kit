@@ -197,15 +197,65 @@ let roundKind = "CALIBRATE";
 try {
   const previousPageLabel = previous.pageLabel;
   pages = await task.pages();
-  let selectionEvidence = "SINGLE_PAGE";
-  if (pages.length === 1) {
-    page = pages[0];
-  } else if (pages.length > 1) {
-    page = await selectUniqueConversationPage(pages, uuid);
-    selectionEvidence = "UNIQUE_CONVERSATION_URL";
-  } else {
-    page = await task.newPage();
-    selectionEvidence = "NEW_PAGE";
+  const tabs = await task.tabs();
+  // Inspect the URL, not the page label. An unmanaged tab must have the exact
+  // chatgpt.com host and an intact UUID path segment before it can be adopted.
+  const urlMatchesConversation = (rawUrl, exactHost = false) => {
+    let parsed;
+    try { parsed = new URL(rawUrl); } catch { return false; }
+    const hostOk = exactHost ? parsed.hostname === "chatgpt.com" :
+      parsed.hostname === "chatgpt.com" || parsed.hostname.endsWith(".chatgpt.com");
+    return hostOk && (!exactHost || parsed.protocol === "https:") &&
+      parsed.pathname.split("/").includes(uuid);
+  };
+  let selectionEvidence = null;
+  if (pages.length > 1) {
+    try {
+      page = await selectUniqueConversationPage(pages, uuid);
+      selectionEvidence = "UNIQUE_CONVERSATION_URL";
+    } catch (error) {
+      if (error?.code !== "PAGE_URL_MATCH_NOT_FOUND") throw error;
+    }
+  } else if (pages.length === 1) {
+    let currentUrl;
+    try { currentUrl = await pages[0].url(); }
+    catch (cause) {
+      const error = new Error("PAGE_URL_INSPECTION_FAILED", { cause });
+      error.code = "PAGE_URL_INSPECTION_FAILED";
+      throw error;
+    }
+    if (urlMatchesConversation(currentUrl)) {
+      page = pages[0];
+      selectionEvidence = "SINGLE_CONVERSATION_URL";
+    }
+  }
+  if (!page) {
+    const unmanagedMatches = tabs.filter((tab) => !tab.label && urlMatchesConversation(tab.url, true));
+    if (unmanagedMatches.length > 1) {
+      const error = new Error("PAGE_URL_MATCH_AMBIGUOUS");
+      error.code = "PAGE_URL_MATCH_AMBIGUOUS";
+      throw error;
+    }
+    if (unmanagedMatches.length === 1) {
+      const candidate = unmanagedMatches[0];
+      // Unknown-origin tabs are user-owned; never take them over automatically.
+      if (candidate.openedBy !== "agent" || !candidate.page ||
+          typeof candidate.targetId !== "string" || !candidate.targetId ||
+          (candidate.page.targetId && candidate.page.targetId !== candidate.targetId)) {
+        const error = new Error("PAGE_ADOPTION_EVIDENCE_INCOMPLETE");
+        error.code = "PAGE_ADOPTION_EVIDENCE_INCOMPLETE";
+        throw error;
+      }
+      page = await task.adopt(candidate.page);
+      selectionEvidence = "UNIQUE_UNMANAGED_CONVERSATION_URL";
+      await appendEvent(MON, "PAGE_ADOPTED", {
+        spaceId, pageLabel: page.label, targetId: candidate.targetId,
+        conversationUuid: uuid, host: "chatgpt.com", selectionEvidence,
+      });
+    } else {
+      page = await task.newPage();
+      selectionEvidence = "NEW_PAGE";
+    }
   }
   pages = await task.pages();
   await writeState({ spaceId, pageLabel: page.label, pageCount: pages.length, recoveryFailed: false, errorCode: null, errorName: null });
