@@ -197,15 +197,80 @@ let roundKind = "CALIBRATE";
 try {
   const previousPageLabel = previous.pageLabel;
   pages = await task.pages();
-  let selectionEvidence = "SINGLE_PAGE";
-  if (pages.length === 1) {
-    page = pages[0];
-  } else if (pages.length > 1) {
-    page = await selectUniqueConversationPage(pages, uuid);
-    selectionEvidence = "UNIQUE_CONVERSATION_URL";
-  } else {
-    page = await task.newPage();
-    selectionEvidence = "NEW_PAGE";
+  const tabs = await task.tabs();
+  // Resolve managed Pages by conversation URL; never select by a stale page label.
+  const urlMatchesConversation = (rawUrl, exactHost = false) => {
+    let parsed;
+    try { parsed = new URL(rawUrl); } catch { return false; }
+    const hostOk = exactHost ? parsed.hostname === "chatgpt.com" :
+      parsed.hostname === "chatgpt.com" || parsed.hostname.endsWith(".chatgpt.com");
+    return hostOk && (!exactHost || parsed.protocol === "https:") &&
+      parsed.pathname.split("/").includes(uuid);
+  };
+  // Blank-page reuse (agent-kit#18 R1): a fresh ego Page may sit on either URL.
+  const isBlankPageUrl = (rawUrl) => rawUrl === "about:blank" || rawUrl === "chrome://new-tab-page/";
+  let selectionEvidence = null;
+  let singlePageUrl = null;
+  if (pages.length > 1) {
+    try {
+      page = await selectUniqueConversationPage(pages, uuid);
+      selectionEvidence = "UNIQUE_CONVERSATION_URL";
+    } catch (error) {
+      if (error?.code !== "PAGE_URL_MATCH_NOT_FOUND") throw error;
+    }
+  } else if (pages.length === 1) {
+    try { singlePageUrl = await pages[0].url(); }
+    catch (cause) {
+      const error = new Error("PAGE_URL_INSPECTION_FAILED", { cause });
+      error.code = "PAGE_URL_INSPECTION_FAILED";
+      throw error;
+    }
+    if (urlMatchesConversation(singlePageUrl)) {
+      page = pages[0];
+      selectionEvidence = "SINGLE_CONVERSATION_URL";
+    }
+  }
+  if (!page) {
+    // Unmanaged tabs may be adopted only with a unique exact-host URL and agent ownership.
+    const unmanagedMatches = tabs.filter((tab) => !tab.label && urlMatchesConversation(tab.url, true));
+    if (unmanagedMatches.length > 1) {
+      const error = new Error("PAGE_URL_MATCH_AMBIGUOUS");
+      error.code = "PAGE_URL_MATCH_AMBIGUOUS";
+      throw error;
+    }
+    if (unmanagedMatches.length === 1) {
+      const candidate = unmanagedMatches[0];
+      if (candidate.openedBy !== "agent" || !candidate.page ||
+          typeof candidate.targetId !== "string" || !candidate.targetId ||
+          (candidate.page.targetId && candidate.page.targetId !== candidate.targetId)) {
+        const error = new Error("PAGE_ADOPTION_EVIDENCE_INCOMPLETE");
+        error.code = "PAGE_ADOPTION_EVIDENCE_INCOMPLETE";
+        throw error;
+      }
+      page = await task.adopt(candidate.page);
+      selectionEvidence = "UNIQUE_UNMANAGED_CONVERSATION_URL";
+      await appendEvent(MON, "PAGE_ADOPTED", {
+        spaceId, pageLabel: page.label, targetId: candidate.targetId,
+        conversationUuid: uuid, host: "chatgpt.com", selectionEvidence,
+      });
+    } else if (pages.length === 1 && isBlankPageUrl(singlePageUrl) &&
+        tabs.filter((tab) => tab.label === pages[0].label &&
+          tab.openedBy === "agent" && isBlankPageUrl(tab.url) &&
+          typeof tab.targetId === "string" && tab.targetId &&
+          (!pages[0].targetId || pages[0].targetId === tab.targetId)).length === 1) {
+      // Reuse the same agent-owned blank Page; the existing RECOVER path navigates it.
+      page = pages[0];
+      selectionEvidence = "AGENT_OWNED_BLANK_PAGE";
+    } else if (pages.length > 0) {
+      // Never create p2/p3 while managed Pages already exist but do not match.
+      const error = new Error("PAGE_URL_MATCH_NOT_FOUND");
+      error.code = "PAGE_URL_MATCH_NOT_FOUND";
+      throw error;
+    } else {
+      // Only an empty managed inventory without a matching adoptable tab may create a Page.
+      page = await task.newPage();
+      selectionEvidence = "NEW_PAGE";
+    }
   }
   pages = await task.pages();
   await writeState({ spaceId, pageLabel: page.label, pageCount: pages.length, recoveryFailed: false, errorCode: null, errorName: null });

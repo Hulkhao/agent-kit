@@ -44,9 +44,9 @@ if (!page) { console.log("RESULT=CONVERSATION_PAGE_MISSING"); process.exit(1); }
 
 const abort = (code) => { console.log("RESULT=" + code); process.exit(1); };
 
-// Targeted composer selection: the first contenteditable may be a rendered code block's "Edit code"
-// editor (EN-UI field test, agent-kit#7) — aria-label wins, generic fallbacks last.
-const COMPOSER_SEL = '[contenteditable="true"][role="textbox"][aria-label="询问 ChatGPT"], [contenteditable="true"][role="textbox"][aria-label="Ask ChatGPT"], #prompt-textarea, [contenteditable="true"][role="textbox"], [data-testid="prompt-textarea"]';
+// Query all visible composer candidates; selector order does NOT express priority.
+// Resolve by aria-label, then id/testid, then non-code contenteditable (agent-kit#14).
+const COMPOSER_SEL = '#prompt-textarea, [data-testid="prompt-textarea"], [contenteditable="true"][role="textbox"], textarea';
 
 // Unified composer-operation wrapper: EVERY composer evaluate/read sits inside the freeze channel.
 // A renderer freeze (PageEvaluationTimeout family) is recorded through the SHARED single-writer
@@ -59,10 +59,46 @@ const composerOp = async (fn) => {
   }
 };
 
-const readRaw = () => composerOp(() => page.evaluate((sel) => {
-  const el = document.querySelector(sel);
-  return el ? (el.innerText || "") : "";
-}, COMPOSER_SEL));
+// Same tier order and visibility rule as monitor/dispatch-state.mjs readComposerSurface.
+// One page-evaluate implementation covers read, clear and fill; ambiguous tiers fail closed.
+const evaluateComposer = (action, text = "") => page.evaluate(({ sel, action, text }) => {
+  const visible = (element) => Boolean(element &&
+    (element.offsetParent !== null || element.getClientRects().length > 0));
+  const composers = [...document.querySelectorAll(sel)].filter(visible);
+  const composerLabels = new Set(["询问 ChatGPT", "Ask ChatGPT"]);
+  const isCodeEditor = (element) => /code/i.test(element.getAttribute("aria-label") || "");
+  const tiers = [
+    composers.filter((element) => composerLabels.has(element.getAttribute("aria-label"))),
+    composers.filter((element) => element.id === "prompt-textarea" ||
+      element.getAttribute("data-testid") === "prompt-textarea"),
+    composers.filter((element) => element.matches('[contenteditable="true"][role="textbox"]') &&
+      !isCodeEditor(element)),
+  ];
+  const tier = tiers.find((matches) => matches.length > 0);
+  const el = tier?.length === 1 ? tier[0] : null; // multiple matches at the highest tier are unsafe
+  if (!el) return action === "read" ? "" : false;
+  if (action === "read") return el.tagName === "TEXTAREA" || el.tagName === "INPUT"
+    ? (el.value || "") : (el.innerText || "");
+  el.focus();
+  const range = document.createRange();
+  range.selectNodeContents(el);
+  const sel2 = window.getSelection();
+  sel2.removeAllRanges();
+  if (action === "clear") {
+    sel2.addRange(range);
+    sel2.deleteFromDocument();
+    return true;
+  }
+  if (action === "insert") {
+    range.collapse(false);
+    sel2.addRange(range);
+    document.execCommand("insertText", false, text);
+    return true;
+  }
+  return false;
+}, { sel: COMPOSER_SEL, action, text });
+
+const readRaw = () => composerOp(() => evaluateComposer("read"));
 
 // ---- Gate 0: unprocessed composer freeze (R2.5-H) — the probe owns the storm backoff.
 // Fail-closed read (r44 P0-A1): a ledger read failure must never masquerade as "no freeze".
@@ -122,7 +158,7 @@ const ensureOwnEmptyComposer = async () => {
   const ownership = verifyDraftOwnership({ draft, payload, record: existing });
   if (!ownership.owned) abort(ownership.kind === "empty" ? "DRAFT_STATE_CONFLICT_STOP" : "FOREIGN_DRAFT_STOP:" + (ownership.reason || ownership.kind));
   if (ownership.kind === "historical-identity" && !resume) abort("HISTORICAL_DRAFT_STOP");
-  const cleared = await composerOp(() => evaluateClearComposer(COMPOSER_SEL));
+  const cleared = await composerOp(() => evaluateClearComposer());
   if (!cleared) abort("DRAFT_CLEAR_FAILED");
   await page.waitForTimeout(600);
   const after = await composerOp(() => readComposerSurface(page));
@@ -133,18 +169,7 @@ const ensureOwnEmptyComposer = async () => {
 // Navigation funnels through the ONE navigate() entry (single gotoAt timestamp + GOTO_ATTEMPT event);
 // the template must not open a second navigation channel (r44 P0-B1). After any goto the full
 // draft-resurrection check re-runs (r44 P0-B2).
-const evaluateClearComposer = (sel) => page.evaluate((selArg) => {
-  const el = document.querySelector(selArg);
-  if (!el) return false;
-  el.focus();
-  const range = document.createRange();
-  range.selectNodeContents(el);
-  const sel2 = window.getSelection();
-  sel2.removeAllRanges();
-  sel2.addRange(range);
-  sel2.deleteFromDocument();
-  return true;
-}, sel);
+const evaluateClearComposer = () => evaluateComposer("clear");
 
 const navigate = async (reason) => {
   const gotoAt = Date.now(); // single timestamp per navigation (R2.4 unified entry contract)
@@ -187,19 +212,8 @@ for (const chunk of chunks) {
   for (let attempt = 0; attempt < 2 && !verified; attempt++) {
     // execCommand's boolean is not proof of insertion. The Composer's actual cumulative text
     // is authoritative: accept a completed insert even if execCommand returned false.
-    await composerOp(() => page.evaluate(({ sel, text }) => {
-      const el = document.querySelector(sel);
-      if (!el) return false;
-      el.focus();
-      const range = document.createRange();
-      range.selectNodeContents(el);
-      range.collapse(false);
-      const selObj = window.getSelection();
-      selObj.removeAllRanges();
-      selObj.addRange(range);
-      document.execCommand("insertText", false, text);
-      return true;
-    }, { sel: COMPOSER_SEL, text: chunk }));
+    const inserted = await composerOp(() => evaluateComposer("insert", chunk));
+    if (!inserted) abort("CHUNK_INSERT_NO_EFFECT");
     await page.waitForTimeout(450);
     composerText = await readRaw();
 
