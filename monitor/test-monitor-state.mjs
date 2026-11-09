@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { copyFile, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { runInNewContext } from "node:vm";
 import {
   appendEvent,
   hasResponseTailAdvanced,
@@ -174,57 +175,144 @@ test("multiple Pages fail closed if any URL cannot be inspected", async () => {
   );
 });
 
-// The probe recovery flow is inline; assert its branch order and required
-// evidence instead of importing the adapter-bound executable monitor.
-async function probeRecoverySource() {
+// Exercise the actual inline recovery block and navigate(reason) in an isolated VM.
+// The probe module itself is adapter-bound and cannot be imported into node --test.
+async function executeProbePageRecovery(task, { uuid = "12345678-1234-1234-1234-123456789abc", previousPageLabel = "p0", events = [] } = {}) {
   const source = await readFile(new URL("./ego-fast-probe.mjs", import.meta.url), "utf8");
-  const start = source.indexOf("  const previousPageLabel = previous.pageLabel;");
-  const end = source.indexOf("  pages = await task.pages();\n  await writeState(", start);
-  assert.ok(start >= 0 && end > start, "probe page-recovery block not found");
-  return source.slice(start, end);
+  const begin = source.indexOf("  const previousPageLabel = previous.pageLabel;");
+  const end = source.indexOf("  pages = await task.pages();\n  await writeState(", begin);
+  const navBegin = source.indexOf("async function navigate(reason) {");
+  const navEnd = source.indexOf("// Any 429_RETRY failure", navBegin);
+  assert.ok(begin >= 0 && end > begin && navBegin > end && navEnd > navBegin);
+  const recovery = source.slice(begin, end) + source.slice(end, source.indexOf("\n} catch (error) {", end));
+  const navigateSource = source.slice(navBegin, navEnd);
+  const code = `(async () => {
+    let page; let pages = []; let roundKind = "RECOVER";
+    let navigatedThisRound = false;
+    const want = "https://chatgpt.com/c/" + uuid;
+    ${recovery}
+    ${navigateSource}
+    return { page, pages, navigate };
+  })()`;
+  const writes = [];
+  const result = await runInNewContext(code, {
+    task, uuid, URL, MON: "test-monitor", SPACE: "test-space", spaceId: "space-1",
+    previous: { pageLabel: previousPageLabel }, now: () => 1_000_000,
+    selectUniqueConversationPage,
+    writeState: async (value) => { writes.push(value); },
+    appendEvent: async (_dir, type, detail) => { events.push({ type, detail }); },
+  });
+  return { ...result, writes, events };
 }
 
-test("probe recovery: zero matching pages creates a Page only after checking unmanaged tabs", async () => {
-  const block = await probeRecoverySource();
-  const inventory = block.indexOf("const tabs = await task.tabs()");
-  const unmanaged = block.indexOf("const unmanagedMatches = tabs.filter");
-  const create = block.indexOf("page = await task.newPage()");
-  assert.ok(block.includes("pages = await task.pages()"));
-  assert.ok(inventory > 0 && unmanaged > inventory && create > unmanaged);
-  assert.match(block, /if \(unmanagedMatches\.length === 1\) \{[\s\S]*?\} else \{\s*page = await task\.newPage\(\)/);
-  assert.equal((block.match(/task\.newPage\(/g) || []).length, 1);
+function managedRecoveryTask(initialPages, tabs) {
+  const pages = [...initialPages];
+  let newPages = 0;
+  const task = {
+    pages: async () => [...pages],
+    tabs: async () => tabs,
+    newPage: async () => {
+      newPages++;
+      if (pages.length >= 3) throw new Error("Page budget reached (3/3)");
+      const page = { label: `p${pages.length + 1}`, url: async () => "about:blank" };
+      pages.push(page);
+      return page;
+    },
+  };
+  return { task, pages, get newPages() { return newPages; } };
+}
+
+test("probe recovery behavior: one agent-owned blank managed Page is reused and navigated", async () => {
+  const url = "about:blank";
+  let navigations = 0;
+  const p1 = { label: "p1", targetId: "target-1", url: async () => url,
+    goto: async () => { navigations++; }, waitForLoadState: async () => {} };
+  const fixture = managedRecoveryTask([p1], [
+    { label: "p1", openedBy: "agent", targetId: "target-1", url },
+  ]);
+  const selected = await executeProbePageRecovery(fixture.task);
+  assert.equal(selected.page, p1);
+  await selected.navigate("RECOVERY");
+  assert.equal(navigations, 1);
+  assert.equal(fixture.newPages, 0);
+  assert.equal(selected.events.some(({ type, detail }) =>
+    type === "PAGE_LABEL_RECOVERED" && detail.selectionEvidence === "AGENT_OWNED_BLANK_PAGE"), true);
 });
 
-test("probe recovery: one managed URL match reuses its Page without relying on label", async () => {
-  const block = await probeRecoverySource();
-  assert.match(block, /pages\.length === 1[\s\S]*?currentUrl = await pages\[0\]\.url\(\)/);
-  assert.match(block, /if \(urlMatchesConversation\(currentUrl\)\) \{\s*page = pages\[0\]/);
-  assert.doesNotMatch(block, /page = pages\.find\(/);
-  assert.doesNotMatch(block, /previousPageLabel === page\.label/);
+test("probe recovery behavior: chrome://new-tab-page/ blank managed Page is also reused (field-observed form, 2026-11-10)", async () => {
+  const url = "chrome://new-tab-page/";
+  let navigations = 0;
+  const p1 = { label: "p1", targetId: "target-1", url: async () => url,
+    goto: async () => { navigations++; }, waitForLoadState: async () => {} };
+  const fixture = managedRecoveryTask([p1], [
+    { label: "p1", openedBy: "agent", targetId: "target-1", url },
+  ]);
+  const selected = await executeProbePageRecovery(fixture.task);
+  assert.equal(selected.page, p1);
+  await selected.navigate("RECOVERY");
+  assert.equal(navigations, 1);
+  assert.equal(fixture.newPages, 0);
+  assert.equal(selected.events.some(({ type, detail }) =>
+    type === "PAGE_LABEL_RECOVERED" && detail.selectionEvidence === "AGENT_OWNED_BLANK_PAGE"), true);
 });
 
-test("probe recovery: duplicate managed UUID URLs retain the ambiguous-page stop", async () => {
+test("probe recovery behavior: multiple nonmatching managed Pages fail closed without allocation", async () => {
+  const p1 = { label: "p1", url: async () => "about:blank" };
+  const p2 = { label: "p2", url: async () => "https://chatgpt.com/c/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" };
+  const fixture = managedRecoveryTask([p1, p2], []);
+  await assert.rejects(executeProbePageRecovery(fixture.task), { code: "PAGE_URL_MATCH_NOT_FOUND" });
+  assert.equal(fixture.newPages, 0);
+  assert.equal(fixture.pages.length, 2);
+});
+
+test("probe recovery behavior: four failed navigation rounds do not consume Page budget", async () => {
+  let attempts = 0;
+  const p1 = { label: "p1", targetId: "target-1", url: async () => "about:blank",
+    goto: async () => { attempts++; throw new Error("simulated navigation failure"); } };
+  const fixture = managedRecoveryTask([p1], [
+    { label: "p1", openedBy: "agent", targetId: "target-1", url: "about:blank" },
+  ]);
+  for (let round = 0; round < 4; round++) {
+    const selected = await executeProbePageRecovery(fixture.task);
+    assert.equal(selected.page, p1);
+    await assert.rejects(selected.navigate("RECOVERY"), /simulated navigation failure/);
+    assert.equal(fixture.newPages, 0, `newPage invoked in round ${round + 1}`);
+    assert.equal(fixture.pages.length, 1);
+  }
+  assert.equal(attempts, 4);
+});
+
+test("probe recovery behavior: zero managed and zero matching unmanaged tabs creates one Page", async () => {
+  const fixture = managedRecoveryTask([], []);
+  const selected = await executeProbePageRecovery(fixture.task);
+  assert.equal(selected.page, fixture.pages[0]);
+  assert.equal(fixture.newPages, 1);
+});
+
+test("probe recovery behavior: unique agent-owned unmanaged tab is adopted, user-owned is rejected", async () => {
   const uuid = "12345678-1234-1234-1234-123456789abc";
-  const makePage = (label) => ({ label, url: async () => `https://chatgpt.com/c/${uuid}` });
-  await assert.rejects(selectUniqueConversationPage([makePage("p1"), makePage("p2")], uuid), {
-    code: "PAGE_URL_MATCH_AMBIGUOUS",
-  });
-  const block = await probeRecoverySource();
-  assert.match(block, /pages\.length > 1[\s\S]*?selectUniqueConversationPage\(pages, uuid\)/);
-  assert.match(block, /error\?\.code !== "PAGE_URL_MATCH_NOT_FOUND"\) throw error/);
+  const page = { targetId: "target-adopt" };
+  const baseTab = { url: `https://chatgpt.com/c/${uuid}`, openedBy: "agent", targetId: "target-adopt", page };
+  const fixture = managedRecoveryTask([], [baseTab]);
+  let adoptions = 0;
+  fixture.task.adopt = async (candidate) => { adoptions++; assert.equal(candidate, page); return { label: "p1" }; };
+  const selected = await executeProbePageRecovery(fixture.task);
+  assert.equal(adoptions, 1);
+  assert.equal(fixture.newPages, 0);
+  assert.equal(selected.events.some(({ type }) => type === "PAGE_ADOPTED"), true);
+  const untrusted = managedRecoveryTask([], [{ ...baseTab, openedBy: "user" }]);
+  untrusted.task.adopt = async () => { throw new Error("must not adopt user tab"); };
+  await assert.rejects(executeProbePageRecovery(untrusted.task), { code: "PAGE_ADOPTION_EVIDENCE_INCOMPLETE" });
+  assert.equal(untrusted.newPages, 0);
 });
 
-test("probe recovery: unique unmanaged UUID tab is adopted only with structured evidence", async () => {
-  const block = await probeRecoverySource();
-  assert.match(block, /exactHost \? parsed\.hostname === "chatgpt\.com"/);
-  assert.match(block, /parsed\.pathname\.split\("\/"\)\.includes\(uuid\)/);
-  assert.match(block, /!tab\.label && urlMatchesConversation\(tab\.url, true\)/);
-  assert.match(block, /unmanagedMatches\.length > 1[\s\S]*?PAGE_URL_MATCH_AMBIGUOUS/);
-  assert.match(block, /candidate\.openedBy !== "agent"[\s\S]*?candidate\.targetId/);
-  assert.match(block, /page = await task\.adopt\(candidate\.page\)/);
-  assert.match(block, /selectionEvidence = "UNIQUE_UNMANAGED_CONVERSATION_URL"/);
-  assert.match(block, /appendEvent\(MON, "PAGE_ADOPTED"/);
-  assert.ok(block.indexOf("PAGE_ADOPTED") < block.indexOf("page = await task.newPage()"));
+test("probe recovery behavior: duplicate managed UUID URLs retain the ambiguity fuse", async () => {
+  const url = "https://chatgpt.com/c/12345678-1234-1234-1234-123456789abc";
+  const fixture = managedRecoveryTask([
+    { label: "p1", url: async () => url }, { label: "p2", url: async () => url },
+  ], []);
+  await assert.rejects(executeProbePageRecovery(fixture.task), { code: "PAGE_URL_MATCH_AMBIGUOUS" });
+  assert.equal(fixture.newPages, 0);
 });
 
 function makeSurface({ composerText = "prompt body", role = "assistant", key = "11111111-1111-4111-8111-111111111111", generating = false, includeUnit = true, includeDilId = true } = {}) {
