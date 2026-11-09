@@ -18,6 +18,8 @@
 2. **登录态（口径裁定 2026-11-08）**：**首次使用先检查是否已登录**；未登录则在 ego 浏览器窗口登一次，登录一次后长期有效。实测记载两种情形并存——一项目实测与主 Chrome 共享登录态（免登）、另一项目实测为独立 profile（需登一次）——**以实机为准，不预设**。
    **多 profile 机器必须账号钉扎（PO 令 2026-11-08，issue #7 根因）**：`taskSpace(名字)` 按名复用旧空间，`profileId` 只在创建空间时生效（`taskSpace(名字, { profileId })`，`profiles()` 列本机 profile）——复用错号建的旧空间会永远用错号跑（实测：无会员账号整会话静默 mini 档）。因此：①本机先配 `~/.agents/ego-profile.json`（模板见 skill `config/ego-profile.example.json`，含 defaultProfileId/defaultAccount/spaceExpect，**永不进仓库**）；②新建空间一律带 profileId；③派单发送前核对页面实际账号（`/api/auth/session` 的 user.email）与钉扎是否一致，不符/无配置/字段缺失一律 STOP 报人，不猜账号；④旧空间不能换账号，不符只能重建空间或人工登录正确账号。校验工具：本仓库 `monitor/ego-profile-check.mjs`。
 3. 编程模型：`ego-browser nodejs < 脚本.mjs`（Git Bash 支持重定向）跑脚本；**每次运行都是新进程**，但 TaskSpace/页面标签（p1/p2…）持久，用 `taskSpace("唯一名")` 恢复。Windows PowerShell 不支持 heredoc；**脚本一律走 UTF-8 `.mjs` 文件**：
+   - **#17 三环境命令对照（agent-kit#17，2026-11-10 复现）**：Git Bash：`ego-browser nodejs < script.mjs`（stdin 重定向）；cmd：`ego-browser nodejs < script.mjs`（stdin 重定向）；PowerShell：`ego-browser nodejs -e "await import('file:///C:/path/script.mjs')"`（`-e` 动态导入文件）。
+   - **#17 错误用法**：`ego-browser nodejs script.mjs`（将路径直接作为参数）→ CLI 把路径当内联 JS 求值，不会打开文件；实测报 `ReferenceError: round is not defined`（具体标识符随文件名变化）。
    - 每轮新写完整文件（round-01.mjs、round-02.mjs…），不要改旧文件重放（每轮是新进程，旧步骤会重跑）。
    - 一个目标一个目录，如 `C:/Users/<name>/ego/<目标>-<日期时间>/`。
    - **中文只能进文件，不能进 `-e` 参数**（Windows PowerShell 5.1 会把 native 参数截断/乱码）。
@@ -203,6 +205,7 @@ const r = await page.fetch("/backend-api/conversation/" + uuid,
 2. Git Bash 里 `powershell -Command "...$_..."` 会被 bash 展开毁掉——复杂 PowerShell 逻辑写成 `.ps1` 文件再 `-File` 执行。
 3. Windows 后台进程要杀 ego/node 时：`Get-CimInstance Win32_Process` 按 Name+CommandLine 过滤拿 PID 再 `Stop-Process`（`wmic` 已不可靠）。
 4. 跨 bash/pwsh 传路径一律 Windows 绝对路径（Git Bash 的 `/tmp` 会被 pwsh 解析成 `C:\tmp`）。
+5. **node:test 在 ego 内置 Electron node 上不可用作测试证据（2026-11-10 本机实测）**：`run({files})` 只报文件级计数且不反映内部用例失败（故意失败的文件仍报 pass 1，阴性对照证伪）；TAP stdout 输出触发 `ERR_UNKNOWN_ENCODING: buffer` 崩溃。验收测试用独立便携版 Node 官方 `node --test`（本机 `D:/Users/Administrator/ego/node-portable/` v20.18.0）。限定为本机观察结果，其他机器以实机为准。
 
 ## 9. 其他实战纪律（沿用 16 铁律中仍适用者）
 

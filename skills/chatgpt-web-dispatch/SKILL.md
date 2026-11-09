@@ -30,6 +30,8 @@ metadata:
 
 校验工具：本仓库 `monitor/ego-profile-check.mjs`（`ego-browser nodejs < ego-profile-check.mjs`，MODE=list/init/verify，详见文件头注释）。
 
+**#17 `ego-browser nodejs` 脚本调用（agent-kit#17）**：Git Bash/cmd：`ego-browser nodejs < script.mjs`（stdin 重定向）；PowerShell：`ego-browser nodejs -e "await import('file:///C:/path/script.mjs')"`；错误用法 `ego-browser nodejs script.mjs` 会把路径当内联 JS 求值并报错。
+
 ## 七条铁律（细则见手册）
 
 1. 脚本一律 UTF-8 `.mjs` 文件（`ego-browser nodejs < round-N.mjs`），中文不进 `-e` 参数，每轮新写完整文件。
