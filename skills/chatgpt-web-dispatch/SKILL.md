@@ -2,8 +2,8 @@
 name: chatgpt-web-dispatch
 description: ChatGPT 网页 Agent 派单工作流（ego-browser）——向 ChatGPT 网页会话派发任务、双循环监控回复、API 提取、会话迁移、429/死页/巨型会话处置。凡涉及 chatgpt.com 会话的派单、监控、提取、迁移任务（含关键词：派单/值守/看门狗/快轮询/提取/迁移会话）必读本 skill。Use for any ChatGPT web conversation dispatch, reply monitoring, extraction, or migration task driven by ego-browser.
 metadata:
-  version: "1.5.0"
-  date: "2026-11-08"
+  version: "1.5.1"
+  date: "2026-11-09"
 ---
 
 # ChatGPT 网页派单（ego-browser 工作流）

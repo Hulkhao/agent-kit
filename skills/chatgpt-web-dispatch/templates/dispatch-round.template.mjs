@@ -3,6 +3,11 @@
 // PREPARED → 填充 → 完整回读 → 刷新 Composer ref → 所有权复核 → SEND_STARTED → Enter → AUTO_ACCEPTED
 // 任何一步无法证明，都不得进入下一步。
 //
+// ADAPTATION_REQUIRED 级红线（issue #12-4 实测：自定义 round 脚本漏抄即卡死）：
+// ① resume 分支（Gate 1 内 status==="PREPARED" && payload_sha256 匹配的复用路径）必须原样保留，
+//    删除它 = 派单中断后 PREPARED 记录永久 ACTIVE_BLOCKS_SEND；
+// ② 派单账本文件名是 a-dispatch-state.json（带 a- 前缀，与 a-fast-state.json 同族），patch 时勿写错。
+//
 // Deployment adapters (edit only these four constants):
 const MON = "REPLACE_WITH_DEPLOY_MONITOR_DIR"; // monitor dir with dispatch-state.mjs + state-schema.mjs
 const SPACE = "REPLACE_WITH_UNIQUE_TASKSPACE"; // unique per agent/monitor instance; account pinned via ~/.agents/ego-profile.json (Gate 1.5)
