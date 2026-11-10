@@ -59,7 +59,7 @@
 
 **静默生成死亡**（实测两次）：user 气泡入库、页面转空闲、但服务端没有任何 assistant 节点——用 API 核实后发短消息催办即可激活。
 
-**附件上传 DOM 契约（2026-11-08 实测 19 文件一次挂载成功，issue #4；挂载验证补强 2026-11-09，issue #12）**：源码/任意类型附件走 composer 的 `input[aria-label="附加文件"]`（accept 为空的通用 input）；「拍照/添加照片/附加照片或视频」类按钮均限 `accept=image|video`，**不能用于源码附件**。顺序固定：**先 `setInputFiles` 一次性挂全部文件 → 再 fill 文本 → Enter 一次发送**（不要挂一个发一个）。**挂载验证（#12-3 实测）**：`data-testid=attachment-token/file-token` 类选择器在当前 UI 匹配 0，可靠证据 = composer 所属 form 的 innerText 包含挂载文件名；且**上传进行中发送按钮保持 disabled**——chips 出现≠可发送，必须轮询发送键 enabled 再 Enter（~50-100KB md 附件实测 4-8s）。附件落在代码解释器 `/mnt/data`，可绕过「沙箱无法承接多文件」类阻断。**大 payload 分流（2026-11-09 补）**：payload 超过约 4KB 时优先走**附件通道**（整册任务书 .md 一次性挂载，composer 正文只放封面：派单号、附件清单、验收标准、第一步动作）——分块逐字校验对 75KB 级任务书实测 3 分钟以上且占屏，附件秒级落地；分块 insertText 通道保留给「附件不可用时」的兜底，两条通道都是正选，按 payload 体积分流。**产物下载通道序（2026-11-09 补，PO 确认方向）**：取对端产物文件（代码解释器输出、ZIP/PATCH、导出文件等）按序降级——①**首选 `page.waitForEvent("download")`**（ego 官方一等 API，`ego-browser skill` 指南有全例）：**先 arm 事件再点下载触发钮**（竞态），`download.saveAs("/绝对路径")` 必须在脚本回合内完成（临时文件回合结束即删）；②事件超时或 UI 无下载钮 → 页内 fetch 文件端点（`/backend-api/files/<id>/download` 带 Bearer）写盘，遵守 §页内 API 纪律（token 只留内存、每次唤醒 ≤2 调用）；③末端才是 DOM 抄文本/要求对端贴全文（字节保真无保证，敏感红线同 §11）。禁止在不知道①存在的情况下直接跳②③绕远路。监控侧与模板均采用分级 Composer 定位：`dispatch-state.mjs` 的 `readComposerSurface` 与模板的 `evaluateComposer` 都用 `querySelectorAll` 枚举可见候选，按 aria-label（`询问 ChatGPT`/`Ask ChatGPT`）→ id/testid（`prompt-textarea`）→ 非代码编辑器的 contenteditable 分级选择；模板读取、清空、填充复用同一定位逻辑，不再用按 DOM 文档序返回首个匹配的 `querySelector`（#14）。含代码块页面不再误读出假 FOREIGN_DRAFT_STOP（#9 实测）。**严格度差别（终审裁决 2026-11-10）**：模板 evaluateComposer 同级多匹配即 fail-closed（返回空/走失败路径）；监控侧 readComposerSurface 为 find-first 取第一个可见候选——两者分级顺序一致但歧义处理严格度不同，监控侧以读取为主、无同级多匹配误判实测证据，暂不收紧。
+**附件上传 DOM 契约（2026-11-08 实测 19 文件一次挂载成功，issue #4；挂载验证补强 2026-11-09，issue #12）**：源码/任意类型附件走 composer 的 `input[aria-label="附加文件"]`（accept 为空的通用 input）；「拍照/添加照片/附加照片或视频」类按钮均限 `accept=image|video`，**不能用于源码附件**。顺序固定：**先 `setInputFiles` 一次性挂全部文件 → 再 fill 文本 → Enter 一次发送**（不要挂一个发一个）。**挂载验证（#12-3 实测）**：`data-testid=attachment-token/file-token` 类选择器在当前 UI 匹配 0，可靠证据 = composer 所属 form 的 innerText 包含挂载文件名；且**上传进行中发送按钮保持 disabled**——chips 出现≠可发送，必须轮询发送键 enabled 再 Enter（~50-100KB md 附件实测 4-8s）。附件落在代码解释器 `/mnt/data`，可绕过「沙箱无法承接多文件」类阻断。**大 payload 分流（2026-11-10 更新）**：payload 超过约 4KB 时优先按 §3.2 走 GitHub 文件指针；若仓库不可读，可使用已授权文档连接器或本节附件通道。附件发送只在 Composer 放短封面（派单号、附件清单、验收标准、第一步动作），上传完成且发送按钮可用后再发；分块 insertText 用于短文本及文件通道均不可用时的少量兜底，不再将 75KB 级任务书作为长正文发送。**产物下载通道序（2026-11-09 补，PO 确认方向）**：取对端产物文件（代码解释器输出、ZIP/PATCH、导出文件等）按序降级——①**首选 `page.waitForEvent("download")`**（ego 官方一等 API，`ego-browser skill` 指南有全例）：**先 arm 事件再点下载触发钮**（竞态），`download.saveAs("/绝对路径")` 必须在脚本回合内完成（临时文件回合结束即删）；②事件超时或 UI 无下载钮 → 页内 fetch 文件端点（`/backend-api/files/<id>/download` 带 Bearer）写盘，遵守 §页内 API 纪律（token 只留内存、每次唤醒 ≤2 调用）；③末端才是 DOM 抄文本/要求对端贴全文（字节保真无保证，敏感红线同 §11）。禁止在不知道①存在的情况下直接跳②③绕远路。监控侧与模板均采用分级 Composer 定位：`dispatch-state.mjs` 的 `readComposerSurface` 与模板的 `evaluateComposer` 都用 `querySelectorAll` 枚举可见候选，按 aria-label（`询问 ChatGPT`/`Ask ChatGPT`）→ id/testid（`prompt-textarea`）→ 非代码编辑器的 contenteditable 分级选择；模板读取、清空、填充复用同一定位逻辑，不再用按 DOM 文档序返回首个匹配的 `querySelector`（#14）。含代码块页面不再误读出假 FOREIGN_DRAFT_STOP（#9 实测）。**严格度差别（终审裁决 2026-11-10）**：模板 evaluateComposer 同级多匹配即 fail-closed（返回空/走失败路径）；监控侧 readComposerSurface 为 find-first 取第一个可见候选——两者分级顺序一致但歧义处理严格度不同，监控侧以读取为主、无同级多匹配误判实测证据，暂不收紧。
 
 
 ### 3.1 R2.5 派单冻结事务链（R2.6-F 自适应填充扩展，LIMITED GO · AUTHORIZED，规划师裁决 reply-r43）
@@ -78,6 +78,16 @@
 - **Composer 冻结处置**：填充/回读中 evaluate 报错 → 记 `COMPOSER_RENDER_FREEZE` 事件（单写入口：只允许 dispatch-state.mjs 写，probe 只消费）→ 走共享风暴通道（`CHAT_SURFACE_STRUCTURALLY_UNAVAILABLE` + ≥9 分钟绝对 deadline，按 SPACE 相位错峰，实测退避约 9~11 分钟）→ 退避到期**单次** `COMPOSER_FREEZE_RETRY`。注意语义：重试的是「页面恢复」这一步，**不是盲重发消息**——消息本体在恢复后由派单模板走完整九闸门续投，PREPARED 指纹账本保证不重复发送。重试失败重新武装（更长退避），绝不退化成 GOTO_FAILED/8 分钟通道。
 - **Gate 7.1 model_slug 负向诊断（r45 LIMITED GO）**：live aria 门通过后，用 conversation API 读最后一条 assistant 回复的 `metadata.model_slug`，**只作负向证据，绝不能单独放行**——历史 slug 含 mini → `MODEL_HISTORY_MISMATCH` STOP 报主管；接口 404/无权限/字段缺失 → `MODEL_EVIDENCE_UNAVAILABLE_STOP`；正常 slug → 仅记 `MODEL_HISTORY_AUX` 辅助事件。每轮派单 API 预算恰为 2 次（session + conversation）；accessToken 仅内存传递，绝不落日志。
 - **Probe 钉扎式自举（r45 LIMITED GO，issue #6）**：目标空间不存在时，probe 必须读本机 `~/.agents/ego-profile.json` 的 `defaultProfileId` 显式传 `taskSpace(SPACE, { profileId })` 创建——无配置（`TASKSPACE_BOOTSTRAP_NO_PIN`）、Profile 不在 `profiles()` 清单（`TASKSPACE_BOOTSTRAP_PROFILE_UNKNOWN`）即停；创建后复核 name/ownership/profileId（`TASKSPACE_BOOTSTRAP_VERIFY_FAILED`），成功留 `SPACE_BOOTSTRAPPED` 事件。已存在空间 Profile 不符（双侧都暴露时）= `TASKSPACE_PROFILE_MISMATCH_STOP`，不删除不抢占。**禁止裸 `taskSpace(SPACE)` 自动创建**——那是 mini 事故根因。
+
+### 3.2 GitHub 优先的项目材料交接（两人项目组）
+
+**文件走 GitHub，网页只发短消息和定位指针。** 项目已有 GitHub 仓库、双方已有读写权限时，任务书、代码摘录、证据、测试结果、补丁与交付文件优先放对应**项目仓库**。既有项目材料直接指向版本化路径；临时往返材料在同仓库单独建 `handoff/YYYYMMDD-任务名` 分支，并集中放在 `.handoff/任务名/` 下。临时分支与开发主线隔离，不将交接文件直接混进 `dev` / `main`。不为两人协作引入额外服务或审批层。
+
+**发送流程**：发送方将材料提交并推送到已授权的项目仓库 → 获取**完整 40 位 commit SHA** → 通过网页发一条短消息，包含 `owner/repo`、分支、完整 SHA、材料路径、任务目标和交付要求。收件方先按 `SHA:文件路径` 读取，并核对路径与版本；成功读取再执行任务，不能只看到分支名就假定读的是原文件。更新材料或返回产物时再提交新 commit，回传新 SHA 和路径；同一轮不得默默改用分支最新 HEAD 覆盖原锚点。
+
+**失败与备用通道**：仓库不存在、权限不足、SHA/路径错误或读取失败，原样报告实际错误及未获取的材料。若已授权 Google Drive 等文档连接器且能读取该文件，改发连接器可访问的文档链接/标识；否则使用 ChatGPT 附件通道（§3 的挂载、确认规则），**不退回大段网页正文反复粘贴**。只有短指令、短问答直接用 Composer；原 §3 的约 4KB 阈值只用于选择“短文本还是文件”，文件默认先选 GitHub，再选文档连接器/附件。
+
+**清理与边界**：任务收件方确认已获取且交付完成后，临时分支可以由有权限的人员按既有授权清理；删除分支或 `.handoff/` 文件**不代表从 Git 历史、镜像、缓存彻底删除**。Cookie、Token、密钥、客户隐私和不适合进入远端历史的材料不得提交；这类材料仅使用获准的私密通道。不得为了传料强制推送、改动无关代码或更换仓库/账号绕过权限。GitHub 仅承载材料；§3.1 的网页发送九闸门、派单幂等和 §6 监控不变。
 
 ## 4. 回复提取（2026-11-08 起：以页面 DOM 结构化证据为准，API 为辅助通道）
 
@@ -126,10 +136,21 @@ const r = await page.fetch("/backend-api/conversation/" + uuid,
   2. 长工具链中间页面显示空闲（工具调用间隙）——**假完成**。对策：检测到翻转后等 75 秒再探一次（间隙会恢复生成，真完成保持空闲）+ 主管终验。
 - **基线吞噬铁律**：完成判定用状态翻转或「派单时刻钉死的计数基线」，**禁止用回复完成后采集的内容哈希/计数当基线**——那会把完整回复吞进基线、相对变化永不触发（实测漏抓 15 分钟）。**监控随派单启动就是这个危险时序**：监视器启动/重启时页面已空闲 → 必须先做一次「启动即提取」比对派单基线（见 §6.3 startIdle）。
 
+### 5.2 长时间无进展与疑似僵尸轮（应急预案）
+
+**已发生的案例**：页面恢复后，停止按钮持续显示、正文停在约 295 字超过 5 小时、未观察到活动标记；执行 Agent 复核后手动点击停止。该案例证明需要“看门狗唤醒 Agent 复核”这条应急路径，但**文本一段时间不增长、停止按钮持续出现或单次 15 分钟超时，均不足以自动判定僵尸轮**；长工具链可能长时间没有可见正文。
+
+看门狗 15 分钟窗口触发、快轮询状态超过 7 分钟未更新，或其他明确异常出现时，由本地 Agent 执行：
+
+1. **留现场**：记录时间、会话 UUID、最后状态文件时间戳、`generating` / `startIdle` / 尾部消息标识、最近几条脱敏监控事件；不记录提示词正文、令牌或客户数据。
+2. **复核是否仍有进展**：单次读取结构化 DOM 状态和既有事件日志，比较前后有无尾部 assistant UUID 变化、工具活动或进度信号；页面不可用按 §6.2 死页/退避梯子，不用高频刷新制造压力。证据不足就保留现有任务、重新布防并在下个窗口复核。
+3. **裁定后动作**：若已确认收到完整回复，按 §4 提取并关闭本轮监控；若确认僵死，先保留证据再由 Agent 决定是否手动停止、发短催办或迁移会话。停止后核对旧轮确已终止、提交账本状态明确，再考虑新轮；禁止一边旧轮仍在生成一边重派同一任务。
+4. **预案无法覆盖**：按 §9.1 查重/上报 Issue，说明“疑似”“已确认”分别有哪些证据；能继续的主线继续，不能恢复的明确报告阻塞。**不通过故意卡死、密集刷新、异常注入来演练。**
+
 ## 6. 双循环监控（PO 定稿架构，勿改结构）
 
 **规范脚本唯一存放点：agent-kit 官方仓库 `monitor/` 目录（PO 令 2026-11-08 并入）**——`ego-fast-probe.mjs`（探测本体）+ `fast-poll.sh`（脚本1 快轮询）+ `watchdog.sh`（脚本2 看门狗）+ `a-watch-uuid.txt.example`。**要改脚本只改 agent-kit 仓库 monitor/ 这一份**（历史实战副本在 GDC 各项目 worktree 里，随任务清理失效，不再引用）。
-> 本机部署状态（2026-11-08）：原 ego-tools 本地仓库（haohao 机）内容已并入 agent-kit monitor/，作为历史归档保留；本机（Administrator）尚无副本。本机需要跑双循环监控时，先从源机同步/克隆 ego-tools 到本机固定位置并在此登记路径，不得在项目里散落脚本副本。
+> 历史说明（2026-11-08）：原 ego-tools 内容已并入 `agent-kit/monitor/`。新机以当前 `agent-kit/monitor/` 为来源部署监控脚本，无需再克隆已归档的 ego-tools。
 
 架构（PO 定稿；节奏 2026-11-08 修订，原 3 分钟/31 分钟）：**脚本1** 每 1 分钟轮询一次窗口，看是否抓到回复；**脚本2** 每 15 分钟看一下结果有没有得到处理，没有得到处理就退出唤醒主管——**大模型介入一次：判定是卡死了还是仍在处理，然后重新激发脚本**；全面智能审查什么卡住了、有没有得到结果，然后整个重新做计划。
 
@@ -138,13 +159,13 @@ const r = await page.fetch("/backend-api/conversation/" + uuid,
 1. 把 `monitor\` 三个脚本复制到目标项目监控目录（如 `<项目>\.monitor\`）。
 2. 改 `ego-fast-probe.mjs` 头部两个适配点：①`MON`=本部署监控目录（正斜杠绝对路径）；②`SPACE`=taskSpace 唯一名（每项目/每 Agent 一个，撞名报 `EGO_TASK_SPACE_NAME_IN_USE`）。
 3. 复制 `a-watch-uuid.txt.example` 为 `a-watch-uuid.txt`，填被监视会话 UUID（`chatgpt.com/c/` 后那串，一行纯文本）。
-4. 两个脚本都用受管后台任务跑（如 ZCode Bash 的 run_in_background，**绝不能 `&` 脱离后台**——脱离后退出叫不醒人，实测要靠杀进程重建），**脚本退出=任务通知=唤醒信号**。
+4. 两个脚本都用受管后台任务跑（如 ZCode Bash 的 run_in_background，**绝不能 `&` 脱离后台**——脱离后退出叫不醒人，实测要靠杀进程重建）。启动时核对两个任务的受管 ID，以及各自**退出后向本地 Agent 递交通知/回调**的实际能力；`WAKE_SUPERVISOR` 只是一条脚本输出，**不等于本地大模型已被唤醒**。无法确认接棒通道时按 §6.4 报告监控能力缺失。
 
 ### 6.2 设计要点（每条都是实测事故换来的）
 
 - 脚本1（快轮询）**纯 DOM 读，零脚本侧 API 配额**——这是快轮询节奏的前提（R2.4 起驻页探测约 6 次 goto/小时，见 §7）。判定=「可见停止按钮」的生成→空闲翻转 + 75 秒确认窗（滤工具链间隙假阳性）。它只报候选，真伪由主管 API 终验。
 - 脚本2（看门狗）**单实例=单 15 分钟窗口**：先睡满 15 分钟再判定（等待在前、判定在后），结果未处理即退出唤醒主管；主管审查后**必须重新布防**（重启脚本2；脚本1 若因抓到回复退出，取走交付后也重启）。
-- **退出即接力**：任何唤醒处理后不允许出现无脚本值守的空窗（实测 7 小时空转事故的根因）。
+- **退出后必须有实际接棒**：任何告警后先确认本地 Agent 收到任务退出通知并处理；未证明通知链路时不得宣称“已唤醒”或“有人值守”（实测 7 小时空转事故的根因）。
 - **良性信号自愈（issue #8，2026-11-09 起）**：fast-poll.sh wrapper 对 `START_IDLE_WAKE_SUPERVISOR` 类「重启即自愈」良性信号自动重启 probe 并留痕（`BENIGN_SIGNAL_SELFHEAL=… streak=n/20`），连续超过 20 轮仍良性才真退出唤醒——消除「wrapper 退出后接棒单点」的 50 分钟空窗形态（实测 2026-11-08）。`REPLY_ARRIVED`（DONE_CANDIDATE）/`CONVERSATION_DEAD` 等需主管裁决的信号维持真退出。
 - **长任务巡检纪律（issue #8）**：主管处于长任务链（派单/执行/多任务并行）时，值守健康巡检（`a-fast-state.json` 时间戳、fast-history.log 尾部）纳入任务步骤前后的检查点；发现 `STATE_MISSING` 或 wrapper 已退出（日志尾部 `fast-poller exit`）立即接力重启，不允许把唤醒留给「之后有空再说」。
 - probe 内置硬化（规范版已含，勿删）：**R2.4 起快轮询三分支驻页探测（FINAL PASS 65c78e4）**——STAY 轮（页面就绪）0 goto 零加载；CALIBRATE 轮（距 navRef ≥10 分钟）1 次 goto 校准；RECOVER 轮（页面失就绪/timeOrigin 读取失败）走恢复。navRef = max(lastGotoAt, performance.timeOrigin)；goto 全部收敛到统一 `navigate(reason)` 入口（单一 `gotoAt` 时间戳 + GOTO_ATTEMPT 事件）。就绪等待只认**正文 >600 字符**（上限 40s——空壳也带「发送」按钮，按按钮判就绪会假阳性）；**例外：NEW_CONV 类导航（新聊天落地页，无会话体可渲染，#12-1 实测 bodyLen 455-467）**就绪改认结构化证据——composer（aria-label 口径）与模型菜单按钮同时存在且 bodyLen>300，空壳防线不放宽（会话页仍按 >600）。goto/渲染失败 → **8 分钟退避**（退避期只刷状态文件时间戳）；**死页梯子**：见死标 → 刷 2 次 → 仍死记 1 strike → **8 分钟后再试** → 连续 3 strikes 才判会话真死并唤醒主管；恢复渲染后 strike 清零。dispatch 侧 `PAGE_NOT_READY_AFTER_NAVIGATE` / `COMPOSER_SURFACE_UNAVAILABLE` abort 后**不自行重试导航**，转交既有 probe 恢复流程（含本梯子），避免双责任方写同一梯子状态（规划师裁决 2026-11-10）；会话页 `bodyLen≈305-308`（侧栏完整、主区空）是实测可恢复形态（#21/#23），梯子轮次内不判死。429/加载风暴与 Composer 冻结走共享风暴通道（`CHAT_SURFACE_STRUCTURALLY_UNAVAILABLE` + `stormBackoffDeadline` = max(8min, 9min+SPACE相位)，单次重试由 planStormRecovery 把关，失败重新武装，详见 §3.1）。
@@ -177,6 +198,16 @@ const r = await page.fetch("/backend-api/conversation/" + uuid,
 | `DISPATCH_UNCERTAIN_WAKE_SUPERVISOR` | 派单账本处于 UNCERTAIN，无法证明已接受 | 先对账（结构化 unit 证据）再裁定；未接受才授权重试 |
 | `CONVERSATION_UNAVAILABLE_PERSISTENT` | 死页梯子 3 strikes | 只报「持续不可用」，深查/重派/迁移；不声称会话永久死亡 |
 | `START_IDLE_WAKE_SUPERVISOR` | 恢复首轮空闲，存在基线时序风险（issue #8 起属良性：wrapper 自动重启自愈并留痕，连续 >20 轮才升级唤醒） | 单次出现无需处置；wrapper 日志见 `BENIGN_SIGNAL_SELFHEAL` 留痕可审计 |
+
+### 6.4 异常接棒、监控健康与重新布防
+
+**双轨职责保持现状**：脚本1 每 1 分钟做低成本 DOM 快轮询；脚本2 每 15 分钟独立检查结果是否已处理、快轮询状态是否陈旧（≥7 分钟），再输出信号并退出。它们均是脚本，**不会自行启动或唤醒大模型推理**；真正的接棒方是运行它们的本地 Agent 与受管任务回调/通知机制。
+
+**派单后核对**：两个后台任务都有受管任务 ID；它们的结束/异常退出能进入当前本地 Agent 的可处理通知或回调；在现有运行平台上拿不到此保障，就立即报告“监控接棒能力缺失”，说明缺的是哪条通知链路，不宣称双轨闭环。无需特意制造网页卡死来验收。
+
+**收到唤醒后**：先读 §6.3 的具体信号和状态文件，判断是完整回复、正常长工具链、页面不可用、进程崩溃还是疑似僵尸轮（§5.2）；保留证据后选提取、继续等待、有限恢复、人工停轮或迁移。任务仍在执行/等待则确认脚本1 和脚本2 各自是否存活，缺哪条重启哪条；单次 15 分钟看门狗窗口结束后必须重新布防。任务确认完成后停止本轮两个监控任务；不得让旧会话的监控盯到下一轮。
+
+**异常处理闭环**：脚本退出或某条 `WAKE_SUPERVISOR` 日志出现后，本地 Agent 若未实际接到通知，按“监控能力缺失”上报 §9.1，不能把写日志视为恢复成功。未能照预案恢复的实战问题同样进入 Issues；普通执行 Agent 不私改 `monitor/` 或 Skill。
 
 ## 7. 统一参数表（唯一口径）
 
@@ -215,7 +246,17 @@ const r = await page.fetch("/backend-api/conversation/" + uuid,
 4. 一问一答：网页 GPT 不会自主推进，收到阶段性回复必须立即裁定并下发下一步，不留无主空转会话。
 5. 会话用完 `task.finish({keep:[]})` 或按需保留；测试产生的草稿会话记得清理（长期值守的监控空间除外，见 §2）。
 6. 大输出不整读进主上下文：提取先落盘文件再脚本化解析。
-7. 长寿命会话要主动管理轮次（大会话是定时炸弹）；监控永远做成「退出即唤醒」的受管后台任务（§6.1）。
+7. 长寿命会话要主动管理轮次（大会话是定时炸弹）；监控使用有退出通知的受管后台任务，实际唤醒与重新布防按 §6.4 复核。
+
+### 9.1 实战故障通过 GitHub Issues 上报（两人团队）
+
+**触发**：实际派单、监控、网页恢复、材料交接出现手册预案无法解决的故障，或发现监控退出后无人接棒。执行 Agent 先按 §5/§6 进行一次有界处置和现场保全，随后对固定仓库 `Hulkhao/agent-kit` 查重 Issues（含已关闭的相似问题）。
+
+**有权限时直接上报**：已有 Issue 描述相同根因/症状就追加一条脱敏现场证据；没有就新建 Issue。内容只需写明：现象与影响、发生时间和任务环境、预期与实际结果、触发信号/状态摘要、已执行的有限恢复及其结果、相关手册章节、能否继续主线。不得附 Cookie、Token、客户资料、完整提示词/回答、原始无脱敏日志。不要为复现而高频刷新或诱发偶发异常。
+
+**权限/失败分支**：读取、查重、评论、创建任一步遭遇认证/权限/网络/限流错误，记录**该步的实际错误**，停止该次上报；不换仓库/账号规避，也不把失败说成成功。确实无法验证 Issue 已创建时报告“提交结果未确认”，先查询同仓库是否已有该记录，避免重复开单。成功则向 PO 明确通知：`Issue #编号 已上报：<链接>；当前任务：可继续/阻塞（原因）`；失败则通知：`未上报：<失败操作与实际错误>；当前任务：...`。
+
+**维护归口**：PO 指定的 Skill 维护 Agent 负责分析、修复、发布和关闭 Issue。普通执行 Agent 有能力按既有预案继续则继续执行，不能继续就标明阻塞并交还 PO；不临时修改已部署 Skill、脚本或他人仓库来绕过故障。
 
 ## 10. 新机快速上手顺序
 
