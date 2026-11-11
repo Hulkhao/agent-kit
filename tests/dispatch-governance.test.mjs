@@ -10,9 +10,35 @@ import { parseArgs, adaptTemplate, bindNewConversation, classifyManagerResult, l
 import { checkDispatchTool } from "../plugins/chatgpt-dispatch-guard/hooks/policy.mjs";
 import { installConfig, install } from "../monitor/install-zcode-guard.mjs";
 import { extractDomReply, extractApiReply, saveReply, verifiedReply, acknowledgeReply, verifiedConsumption, sha256, visibleTextHash } from "../monitor/reply-delivery.mjs";
-import { markCompleted, readDispatchState, verifyAttachmentEvidence } from "../monitor/dispatch-state.mjs";
+import { dispatchStormGate, markCompleted, readDispatchState, verifyAttachmentEvidence } from "../monitor/dispatch-state.mjs";
 
 const uuid = "11111111-1111-4111-8111-111111111111";
+
+test("#24: dispatch waits for probe-confirmed recovery after storm deadline", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ego-storm-gate-"));
+  const start = 1_800_000_000_000;
+  const stateFile = join(dir, "a-fast-state.json");
+  try {
+    const unavailable = normalizeFastState({}, {
+      errorCode: "CHAT_SURFACE_STRUCTURALLY_UNAVAILABLE",
+      backoffUntil: start + 9 * 60_000,
+    }, start);
+    await writeFile(stateFile, JSON.stringify(unavailable));
+    assert.equal(await dispatchStormGate(dir, start + 60_000), "STORM_BACKOFF_PENDING");
+    assert.equal(await dispatchStormGate(dir, start + 10 * 60_000), "STORM_BACKOFF_PENDING");
+
+    const recovered = normalizeFastState(unavailable, {
+      errorCode: null,
+      backoffUntil: null,
+    }, start + 11 * 60_000);
+    await writeFile(stateFile, JSON.stringify(recovered));
+    assert.equal(await dispatchStormGate(dir, start + 11 * 60_000), null);
+    await writeFile(stateFile, "{}");
+    await assert.rejects(dispatchStormGate(dir, start + 12 * 60_000), /FAST_STATE_INVALID/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
 
 test("startup with a dispatch-time reply tail enters the full completion confirmation", () => {
   assert.equal(shouldReviewStartupIdle(true, true), false);
