@@ -1,0 +1,4 @@
+{
+  "supervisionMinutes": 10,
+  "maxAbnormalRounds": 3
+}

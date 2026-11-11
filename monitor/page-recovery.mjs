@@ -1,5 +1,21 @@
 // Resolve a monitored conversation among multiple managed Pages using URL evidence.
 // A multi-Page space is never selected by label alone when the target UUID is not unique.
+export function conversationIdFromUrl(rawUrl, exactHost = false) {
+  let parsed;
+  try { parsed = new URL(rawUrl); } catch { return null; }
+  const hostOk = exactHost ? parsed.hostname === "chatgpt.com" :
+    parsed.hostname === "chatgpt.com" || parsed.hostname.endsWith(".chatgpt.com");
+  if (!hostOk || parsed.protocol !== "https:") return null;
+  // Both ordinary and project conversations end in /c/<UUID>.
+  const match = parsed.pathname.match(/(?:^|\/)c\/([0-9a-f-]{36})\/?$/i);
+  return match?.[1]?.toLowerCase() || null;
+}
+
+export function isConversationUrl(rawUrl, conversationUuid, exactHost = false) {
+  return typeof conversationUuid === "string" &&
+    conversationIdFromUrl(rawUrl, exactHost) === conversationUuid.toLowerCase();
+}
+
 export async function selectUniqueConversationPage(pages, conversationUuid) {
   if (!Array.isArray(pages) || pages.length < 2) {
     throw new TypeError("PAGE_URL_SELECTION_REQUIRES_MULTIPLE_PAGES");
@@ -19,14 +35,7 @@ export async function selectUniqueConversationPage(pages, conversationUuid) {
       throw error;
     }
 
-    let parsed;
-    try {
-      parsed = new URL(currentUrl);
-    } catch {
-      continue;
-    }
-    const chatGptHost = parsed.hostname === "chatgpt.com" || parsed.hostname.endsWith(".chatgpt.com");
-    if (chatGptHost && parsed.pathname.split("/").includes(conversationUuid)) {
+    if (isConversationUrl(currentUrl, conversationUuid)) {
       matches.push(page);
     }
   }

@@ -2,8 +2,8 @@
 name: chatgpt-web-dispatch
 description: 两人项目组的 ChatGPT 网页派单工作流（ego-browser）——GitHub 优先交接材料、双循环监控与异常接管、回复提取、会话迁移、GitHub Issues 反馈。凡涉及 chatgpt.com 会话派单、监控、提取、迁移或故障上报必读本 skill。Use for ChatGPT web dispatch, GitHub handoff, reply monitoring, recovery, and issue reporting.
 metadata:
-  version: "1.6.0"
-  date: "2026-11-10"
+  version: "1.7.0"
+  date: "2026-11-11"
 ---
 
 # ChatGPT 网页派单（ego-browser 工作流）
@@ -15,6 +15,8 @@ metadata:
 3. **跑 `ego-browser skill`** 获取与所装版本匹配的 API 指南（ego 升级后重跑；输出缺 `[ego-browser:skill] end of guide` 尾行 = 被截断，存文件分段读）。
 
 维护口径：本 skill 随 agent-kit git 仓库多机同步；**改手册/skill 只改仓库内这一份**（各机全局公用 `~/.agents/skills/` 下是 `deploy.ps1` 生成的部署副本，勿直接改），改完 commit → push → 各机 pull + 重新 deploy。
+
+**目标复核**：仓库根 `README.md` 的「ChatGPT 网页派单治理目标与复核表」是六项长期验收合同。实战发现异常时，对照相关项核查行为证据，按 §9.1 查重并报 Issue；维护 Agent 每次修复、发布前复核六项，逐项记录 `PASS / FAIL / 未验证` 与证据。未取得宿主实机回执的 Hook 拦截、Agent 唤醒与回复接棒均填「未验证」，不得只凭单元测试结案。
 
 ## 本机账号钉扎（ego-profile.json，PO 令 2026-11-08，首次使用本 skill 前必配）
 
@@ -28,6 +30,8 @@ metadata:
 
 **行为口径**：本机没有该配置文件或字段缺失 → `ACCOUNT_CONFIG_MISSING_STOP` / `ACCOUNT_CONFIG_INCOMPLETE_STOP`，**立即停止报人，不猜测账号**；页面实测账号与钉扎不符 → `ACCOUNT_MISMATCH_STOP`。**新建空间**一律 `taskSpace(名字, { profileId })` 带上钉扎的 profile；**旧空间无法换账号**——核对不符只能换空间名重建或人工登录正确账号。
 
+**TaskSpace 归属**：一个 Agent 固定一个空间，任务各占一个 Page；空间显示名可用中文（如 `GDC-本地执行A`），技术归属使用跨任务稳定的 `AGENT_ID`。派单、探测、监管、回复提取和释放统一通过 `monitor/dispatch-manager.mjs` 的 `send/send-new/probe/watch/collect/consume/release/ack` 执行；新会话 `send-new` 必须带稳定的 `--request-id`，返回真实会话 UUID 后使用该 UUID 监控。完成候选唤醒后，Agent `collect` 并读取完整回执，再 `consume --reply-sha256`，最后 `release`。同一 Agent 创建第二空间或抢用别人的空间直接 STOP。旧空间照原名复用，不擅自迁移。
+
 校验工具：本仓库 `monitor/ego-profile-check.mjs`（`ego-browser nodejs < ego-profile-check.mjs`，MODE=list/init/verify，详见文件头注释）。
 
 **#17 `ego-browser nodejs` 脚本调用（agent-kit#17）**：Git Bash/cmd：`ego-browser nodejs < script.mjs`（stdin 重定向）；PowerShell：`ego-browser nodejs -e "await import('file:///C:/path/script.mjs')"`；错误用法 `ego-browser nodejs script.mjs` 会把路径当内联 JS 求值并报错。
@@ -37,8 +41,8 @@ metadata:
 1. 脚本一律 UTF-8 `.mjs` 文件（`ego-browser nodejs < round-N.mjs`），中文不进 `-e` 参数，每轮新写完整文件。
 2. UI 状态只由结构化证据判定（可见停止按钮、尾部 `data-content-search-unit-key` / assistant DIL UUID），不从会话正文提取状态标志；完成判定=「可见停止按钮」消失的状态翻转 + 75 秒确认窗 + 尾部 assistant DIL UUID 稳定；禁文本匹配「正在思考」、禁用回复完成后采集的内容哈希/计数当基线；监视器启动即提取比对派单基线。
 3. 快轮询纯 DOM 零 API 配额；API 仅唤醒后单次提取（每唤醒最多 2 调用）；`page.fetch` 的 conversation API 返回 404 `conversation_inaccessible` ≠ 会话死亡（授权上下文缺 token，见手册 §4），以页面 DOM 结构化证据为准；429 期停一切 API 与密集导航，页面重试 ≥9 分钟。
-4. 双循环监控（1 分钟快轮询 + 15 分钟看门狗）一律受管后台任务；**启动时确认脚本退出能通知并唤醒本地 Agent**，仅在日志里出现 `WAKE_SUPERVISOR` 不算已唤醒；仍在执行的任务处理异常后重新布防。消息数接近 2000 提前迁移。
-5. 发送默认 focus+Enter（失败回退 click）；发送前确认「发送」按钮可用（`disabled=true`=陈旧页，先 goto 刷新再重读，陈旧页上 Enter 与 click 都会静默无效）；填充用 600 grapheme 目标 / 1200 UTF-8 byte 硬上限；每块 `execCommand("insertText")` 后回读累计前缀，只有确认内容未变化才重试当前块一次，错位立即 STOP；fill/原生 paste/单次长文本不作为可靠通道；Composer 空态是 innerText=`"\n"`（长度 1），勿用 `length===0` 判空；发送前持久化派单状态，发送后以结构化证据双验（user unit-key 尾部前进 + 停止按钮出现）；进程重启后先对账，禁止盲目重发；向外发送前查敏感信息。
+4. 双循环监控统一运行一个受管 `dispatch-manager.mjs watch` 任务，内含 1 分钟快轮询和默认 10 分钟监管判定；修改各会话监控目录 `conversations/<UUID>/supervision.config.json` 的 `supervisionMinutes`，可动态设为 15/20/30 等分钟。**启动时确认受管任务退出能实际通知并唤醒本地 Agent**；收到唤醒、完成诊断后通过管理器 `ack` 确认 `wakeId`，未确认不得宣称已接棒。连续 3 轮无进展要求联系 PO（即时聊天/邮件接入暂缓）；消息数接近 2000 提前迁移。
+5. 发送前确认「发送」按钮可用，再执行一次 focus+Enter；进入 `SEND_STARTED` 后无论 Enter 的返回结果如何，都先按账本与 DOM 双验对账，无法证明未发送即标 `UNCERTAIN` 并 STOP，禁止补点 click 或盲目重发。按钮 `disabled=true` 时先按页面恢复契约处理。填充用 600 grapheme 目标 / 1200 UTF-8 byte 硬上限；每块 CDP `Input.insertText` 后回读累计前缀，只有确认内容未变化才重试当前块一次，错位立即 STOP；fill/原生 paste/单次长文本不作为可靠通道；Composer 空态是 innerText=`"\n"`（长度 1），勿用 `length===0` 判空；向外发送前查敏感信息。
 6. 任务状态分离：浏览器存活、轮次生成、工具调用、最终完成是不同状态；超时或 stream reconnect 不等于任务失败。
 7. 崩溃恢复采用有上限的重启与安全诊断；失败后立即保留状态证据，禁止记录 Cookie、Token、提示词正文和工具参数。
 
@@ -51,7 +55,7 @@ metadata:
 ## 相关事实源
 
 - 监控脚本唯一存放点：**本仓库 `monitor/` 目录（PO 令 2026-11-08 并入 agent-kit；原独立 ego-tools 本地仓库停用为历史归档）**；要改脚本只改仓库内这一份，禁止本地另立孤本副本。**开工前 `git pull` 同步官方最新**（任务边界更新，skill 与脚本天然同版交付）。状态机文件：`dispatch-state.mjs`（派单账本 + 结构化 Composer/尾部读取）、`state-schema.mjs`（v3 Schema + 绝对 deadline）、`page-recovery.mjs`（多 Page URL-UUID 消歧）、`ego-profile-check.mjs`（本机账号钉扎校验）。
-- **派单规范模板**：`templates/dispatch-round.template.mjs`（R2.5 九闸门冻结事务链 + R2.6-F 自适应填充，见手册 §3.1）。新派单任务以它为底本，只改顶部适配器常量（MON/SPACE/MSG_FILE/CONV），遇到 `ADAPTATION_REQUIRED` 说明环境与模板假设不符，STOP 上报，不要徒手重写链路。
+- **派单规范模板**：`templates/dispatch-round.template.mjs`（R2.5 九闸门冻结事务链 + R2.6-F 自适应填充，见手册 §3.1）。统一管理器内部使用此模板生成每轮脚本，业务 Agent 不手改模板适配器。遇到 `ADAPTATION_REQUIRED` 说明环境与模板假设不符，STOP 上报，不要徒手重写链路。
 - 跨机器交付的 SHA256 必须注明哈希对象与字节基准（Git blob / 下载文件 / 部署磁盘，注明 LF/CRLF），见手册 §11.10。
 - 通用浏览器操作（非 ChatGPT 派单流）见 `ego-browser` skill。
 - 弃用声明：chrome-use / chatgpt-use 已全面弃用，仅存量旧脚本可读，禁止新建依赖。

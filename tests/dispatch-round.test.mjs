@@ -108,7 +108,7 @@ test("r44 P0-B2: ownership+clear+verify is a reusable procedure re-run after FRE
   const freshenAt = src.indexOf('await navigate("FRESHEN")');
   const recallAt = src.indexOf("await ensureOwnEmptyComposer(); // resurrection check");
   assert.ok(defAt > 0 && freshenAt > defAt && recallAt > freshenAt, "resurrection check must re-run after the FRESHEN goto");
-  assert.match(src, /abort\("DRAFT_CLEAR_UNVERIFIED"\)/);
+  assert.match(src, /abort\("DRAFT_RESURRECTED_AFTER_CLEAR"\)/);
 });
 
 test("ref lifecycle: fresh snapshot per attempt, at most 3 focus tries, SEND_STARTED before Enter", async () => {
@@ -124,7 +124,7 @@ test("ownership: never clears a draft that is not provably ours; empty is its ow
   const src = await template();
   assert.match(src, /verifyDraftOwnership\(\{ draft, payload, record: existing \}\)/);
   assert.match(src, /FOREIGN_DRAFT_STOP:" \+ \(ownership\.reason \|\| ownership\.kind\)/);
-  assert.match(src, /abort\("DRAFT_CLEAR_UNVERIFIED"\)/);
+  assert.match(src, /abort\("DRAFT_RESURRECTED_AFTER_CLEAR"\)/);
   assert.match(src, /abort\("DISPATCH_IN_FLIGHT_" \+ existing\.status\)/);
   assert.match(src, /abort\("STALE_PREPARED_RECORD_STOP"\)/);
 });
@@ -152,7 +152,7 @@ test("agent-kit#7: level-gate entry is fail-closed (no silent skip) and bilingua
   assert.match(gate7, /!menuInfo \|\| !modelOk \|\| !levelOk/, "missing menu must abort, not pass");
   assert.match(src, /const readRaw = \(\) => composerOp\(\(\) => evaluateComposer\("read"\)\)/);
   assert.match(src, /const evaluateClearComposer = \(\) => evaluateComposer\("clear"\)/);
-  assert.match(src, /evaluateComposer\("insert", chunk\)/);
+  assert.match(src, /await page\.cdp\("Input\.insertText", \{ text: chunk \}\)/);
   assert.doesNotMatch(src, /document\.querySelector\(COMPOSER_SEL\)/);
   assert.match(src, /textfield "\(询问 ChatGPT\|Ask ChatGPT\)"/);
 });
@@ -178,16 +178,63 @@ test("agent-kit#7 root cause: account pin gate precedes ownership; missing/incom
   assert.match(src, /fetch\("\/api\/auth\/session", \{ credentials: "include" \}\)/);
 });
 
-test("r45 Gate 7.1: model_slug negative-only diagnostic sits after the level gate; token never logged", async () => {
+test("r45 Gate 7.1: historical model metadata is diagnostic only; live level gate is authoritative", async () => {
   const src = await template();
   const gate7 = src.indexOf('abort("LEVEL_GATE_FAIL_ABORT")');
-  const gate71 = src.indexOf("MODEL_HISTORY_MISMATCH");
+  const gate71 = src.indexOf('await appendEvent(MON, "MODEL_HISTORY_AUX"');
   const gate8 = src.indexOf("---- Gate 8");
   assert.ok(gate7 > 0 && gate71 > gate7 && gate71 < gate8, "Gate 7.1 must sit between the level gate and Gate 8");
-  assert.match(src, /MODEL_EVIDENCE_UNAVAILABLE_STOP/);
+  assert.doesNotMatch(src, /abort\("MODEL_EVIDENCE_UNAVAILABLE_STOP"\)/);
+  assert.doesNotMatch(src, /abort\("MODEL_HISTORY_MISMATCH"\)/);
+  assert.match(src, /MODEL_HISTORY_AUX_UNAVAILABLE/);
   assert.match(src, /MODEL_HISTORY_AUX/);
   assert.doesNotMatch(src, /console\.log\([^)]*token/);
   assert.doesNotMatch(src, /appendEvent\([^)]*token/);
+});
+
+test("#25: task takeover gates dispatch before any send or page recovery", async () => {
+  const src = await template();
+  assert.match(src, /const spaces = await listTaskSpaces\(\)/);
+  assert.match(src, /assertAgentOwnedTaskSpace\(targetSpace, SPACE\)/);
+  assert.match(src, /task = await taskSpace\(targetSpace\.id\)/);
+  assert.match(src, /isTaskSpaceTakeover\(error\) \? TASKSPACE_TAKEOVER_SIGNAL : "TASKSPACE_RECOVERY_FAILED"/);
+  assert.ok(src.indexOf("isTaskSpaceTakeover(error) ? TASKSPACE_TAKEOVER_SIGNAL") < src.indexOf("// ---- Gate 0"));
+});
+
+test("#26: every STOP is classified by the current dispatch identity and send state", async () => {
+  const src = await template();
+  const start = src.indexOf("const abort = (code) => {");
+  const end = src.indexOf("// Read the account pin", start);
+  assert.ok(start > 0 && end > start);
+  function simulate(status, code, matchesCurrent = true) {
+    const lines = [];
+    const abort = runInNewContext(src.slice(start, end) + "\nabort", {
+      MON: "unused", CONV: "conv-25", SPACE: "space-25", payloadHash: "abcdef1234567890",
+      dispatchStopSnapshot: () => ({ status, dispatchId: "round-25", shaPrefix: "abcdef123456", matchesCurrent }),
+      console: { log: (line) => lines.push(line) },
+      process: { exit: () => { throw new Error("EXIT"); } },
+    });
+    assert.throws(() => abort(code), /EXIT/);
+    return lines;
+  }
+  const accepted = simulate("ACCEPTED", "MODEL_EVIDENCE_UNAVAILABLE_STOP");
+  assert.ok(accepted.includes("RESULT=DISPATCH_ACCEPTED_WAKE_SUPERVISOR"));
+  assert.ok(accepted.includes("ACTION=ARM_MONITORS_NO_RESEND"));
+  assert.ok(accepted.includes("STOP_CAUSE=MODEL_EVIDENCE_UNAVAILABLE_STOP"));
+  assert.ok(accepted.some((line) => line.includes('"status":"ACCEPTED"') && line.includes('"dispatchId":"round-25"')));
+  const uncertain = simulate("SEND_STARTED", "MODEL_EVIDENCE_UNAVAILABLE_STOP");
+  assert.ok(uncertain.includes("RESULT=DISPATCH_ATTEMPTED_WAKE_SUPERVISOR"));
+  assert.ok(uncertain.includes("ACTION=RECONCILE_SEND_NO_RESEND"));
+  const unsent = simulate("PREPARED", "MODEL_EVIDENCE_UNAVAILABLE_STOP");
+  assert.ok(unsent.includes("RESULT=MODEL_EVIDENCE_UNAVAILABLE_STOP"));
+  assert.ok(unsent.some((line) => line.startsWith("DISPATCH_LEDGER=")));
+  const other = simulate("ACCEPTED", "DISPATCH_IN_FLIGHT_ACCEPTED");
+  assert.ok(other.includes("RESULT=DISPATCH_ACCEPTED_WAKE_SUPERVISOR"));
+  const differentPayload = simulate("ACCEPTED", "MODEL_EVIDENCE_UNAVAILABLE_STOP", false);
+  assert.ok(differentPayload.includes("RESULT=MODEL_EVIDENCE_UNAVAILABLE_STOP"));
+  assert.ok(!differentPayload.some((line) => line.startsWith("ACTION=")));
+  const otherFailure = simulate("ACCEPTED", "COMPOSER_RENDER_FREEZE");
+  assert.ok(otherFailure.includes("RESULT=DISPATCH_ACCEPTED_WAKE_SUPERVISOR"));
 });
 
 // Execute the template's actual browser-side callback against a minimal DOM, not a copy of its
@@ -209,6 +256,7 @@ async function composerHarness(nodes) {
   assert.ok(start > 0 && end > start, "expected browser composer implementation in template");
   let selected = null;
   const document = {
+    activeElement: null,
     querySelectorAll(selector) {
       assert.match(selector, /#prompt-textarea/);
       return nodes; // preserves order: code editor first
@@ -237,10 +285,24 @@ async function composerHarness(nodes) {
   const selStart = src.indexOf("const COMPOSER_SEL = ");
   const selEnd = src.indexOf(";", selStart) + 1;
   assert.ok(selStart > 0 && selEnd > selStart);
-  return runInNewContext(src.slice(selStart, selEnd) + "\n" +
-    src.slice(start, end) + "\nevaluateComposer", {
-      document, window, page: { evaluate: (fn, arg) => fn(arg) },
-    });
+  for (const node of nodes) node.focus = function () { this.focused = true; document.activeElement = this; };
+  const insertStart = src.indexOf("const insertChunk = async (chunk) => {");
+  const insertEnd = src.indexOf("// ---- Gate 0:", insertStart);
+  assert.ok(insertStart > end && insertEnd > insertStart);
+  const page = {
+    evaluate: (fn, arg) => fn(arg),
+    cdp: async (method, args) => {
+      if (method === "Input.insertText") {
+        assert.equal(document.activeElement?.getAttribute("aria-label"), "Ask ChatGPT");
+        document.activeElement.innerText += args.text;
+      }
+    },
+  };
+  const api = runInNewContext(src.slice(selStart, selEnd) + "\n" +
+    src.slice(start, end) + src.slice(insertStart, insertEnd) +
+    "\n({ evaluateComposer, insertChunk })", { document, window, page });
+  api.evaluateComposer.insertChunk = api.insertChunk;
+  return api.evaluateComposer;
 }
 
 test("agent-kit#14: Edit code before Composer cannot intercept read, clear or Gate 5 insert", async () => {
@@ -250,7 +312,7 @@ test("agent-kit#14: Edit code before Composer cannot intercept read, clear or Ga
   assert.equal(await evaluateComposer("read"), "old owned draft");
   assert.equal(await evaluateComposer("clear"), true);
   assert.equal(composer.innerText, "");
-  assert.equal(await evaluateComposer("insert", "new payload"), true);
+  await evaluateComposer.insertChunk("new payload");
   assert.equal(await evaluateComposer("read"), "new payload");
   assert.equal(editor.innerText, "editor source", "Edit code must never be modified");
   assert.equal(editor.focused, undefined, "Edit code must never receive focus");

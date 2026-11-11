@@ -3,7 +3,7 @@
 # Usage:  pwsh -File deploy.ps1                -> .agents\skills only
 #         pwsh -File deploy.ps1 -AlsoZCode     -> also .zcode\skills (only if some tool reads just that dir)
 # NOTE: keep this file ASCII-only; Windows PowerShell 5.1 misreads BOM-less UTF-8.
-param([switch]$AlsoZCode)
+param([switch]$AlsoZCode, [switch]$SkipZCodeGuard)
 $ErrorActionPreference = "Stop"
 $kit = Split-Path -Parent $MyInvocation.MyCommand.Path
 $targets = @("$env:USERPROFILE\.agents\skills")
@@ -12,5 +12,9 @@ foreach ($t in $targets) {
     New-Item -ItemType Directory -Force -Path $t | Out-Null
     Copy-Item -Path (Join-Path $kit 'skills\*') -Destination $t -Recurse -Force
     Write-Host "[agent-kit] deployed -> $t"
+}
+if (-not $SkipZCodeGuard) {
+    & node (Join-Path $kit 'monitor\install-zcode-guard.mjs')
+    if ($LASTEXITCODE -ne 0) { throw "ZCode guard install failed; see error above" }
 }
 Write-Host "[agent-kit] done (takes effect in new sessions)"

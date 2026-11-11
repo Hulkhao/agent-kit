@@ -11,10 +11,12 @@ import {
   markSendStarted,
   prepareDispatch,
   readDispatchState,
+  dispatchStopSnapshot,
   readComposerSurface,
   reconcileDispatch,
 } from "./dispatch-state.mjs";
-import { selectUniqueConversationPage } from "./page-recovery.mjs";
+import { isTaskSpaceTakeover, taskSpaceNeedsClaim, assertAgentOwnedTaskSpace, TASKSPACE_TAKEOVER_SIGNAL } from "./taskspace-takeover.mjs";
+import { selectUniqueConversationPage, isConversationUrl, conversationIdFromUrl } from "./page-recovery.mjs";
 import {
   CALIBRATION_INTERVAL_MS,
   chatSurfaceReady,
@@ -34,6 +36,53 @@ import {
   validateFastState,
 } from "./state-schema.mjs";
 
+test("#25: ego upgrade takeover is distinguished from an ordinary page failure", async () => {
+  assert.equal(isTaskSpaceTakeover(new Error("You now control this task space. Reply 'continue' when ready and I will resume.")), true);
+  assert.equal(isTaskSpaceTakeover({ code: TASKSPACE_TAKEOVER_SIGNAL }), true);
+  assert.equal(isTaskSpaceTakeover(new Error("Page was not ready after navigate")), false);
+  assert.equal(isTaskSpaceTakeover(new Error("PAGE_URL_INSPECTION_FAILED", {
+    cause: new Error("You now control this task space. Reply 'continue' when ready and I will resume."),
+  })), true);
+  assert.equal(taskSpaceNeedsClaim({ ownership: "user" }), true);
+  assert.equal(taskSpaceNeedsClaim({ ownership: null }), true);
+  assert.equal(taskSpaceNeedsClaim({ ownership: "agent" }), false);
+  assert.equal(assertAgentOwnedTaskSpace({ ownership: "agent", taskId: "space-1" }, "space-1").taskId, "space-1");
+  assert.throws(() => assertAgentOwnedTaskSpace({ ownership: null }, "space-1"), { code: TASKSPACE_TAKEOVER_SIGNAL });
+  assert.throws(() => assertAgentOwnedTaskSpace(null, "space-1"), { code: "TASKSPACE_NOT_FOUND" });
+  assert.throws(() => assertAgentOwnedTaskSpace({ ownership: "agent", taskId: "other" }, "space-1"), { code: "TASKSPACE_NOT_AGENT_OWNED" });
+  const probe = await readFile(new URL("./ego-fast-probe.mjs", import.meta.url), "utf8");
+  const poller = await readFile(new URL("./fast-poll.sh", import.meta.url), "utf8");
+  assert.match(probe, /assertAgentOwnedTaskSpace\(targetSpace, SPACE\)/);
+  assert.match(probe, /isTaskSpaceTakeover\(error\)/);
+  assert.match(poller, /EGO_TASKSPACE_TAKEOVER_REQUIRED/);
+});
+
+test("#26: STOP snapshot reads actual on-disk ledger without prompt data", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "dispatch-stop-"));
+  try {
+    const identity = { conversationUuid: "conv-25", taskSpace: "space-25", payloadSha256: "abcdef1234567890" };
+    assert.deepEqual(dispatchStopSnapshot(dir, identity), { status: "UNAVAILABLE", dispatchId: null, shaPrefix: null, matchesCurrent: false });
+    const record = {
+      schema: "ego-dispatch-state/v2", status: "ACCEPTED", dispatchId: "round-25",
+      conversationUuid: "conv-25", taskSpace: "space-25", pageLabel: "p1",
+      baselineTailRole: null, baselineTailKey: null, baselineComposerLength: 0,
+      attempt: 1, createdAt: 1, payload_sha256: "abcdef1234567890", payload_bytes: 24,
+    };
+    await (await import("node:fs/promises")).writeFile(join(dir, "a-dispatch-state.json"), JSON.stringify(record));
+    assert.deepEqual(dispatchStopSnapshot(dir, identity), { status: "ACCEPTED", dispatchId: "round-25", shaPrefix: "abcdef123456", matchesCurrent: true });
+    assert.equal(dispatchStopSnapshot(dir, { ...identity, payloadSha256: "different" }).matchesCurrent, false);
+    assert.equal(dispatchStopSnapshot(dir, { ...identity, taskSpace: "other" }).matchesCurrent, false);
+    record.status = "SEND_STARTED";
+    await (await import("node:fs/promises")).writeFile(join(dir, "a-dispatch-state.json"), JSON.stringify(record));
+    assert.equal(dispatchStopSnapshot(dir).status, "SEND_STARTED");
+    record.status = "NOT_A_VALID_STATUS";
+    await (await import("node:fs/promises")).writeFile(join(dir, "a-dispatch-state.json"), JSON.stringify(record));
+    assert.equal(dispatchStopSnapshot(dir).status, "UNAVAILABLE");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 
 test("safe error metadata cannot overwrite application error classifications", async () => {
   const source = await readFile(new URL("./ego-fast-probe.mjs", import.meta.url), "utf8");
@@ -41,31 +90,18 @@ test("safe error metadata cannot overwrite application error classifications", a
   assert.doesNotMatch(source, /errorCode:\s*String\(error\?\.code/);
   // Property, not a fixed count: every classified write keeps a specific code (never UNKNOWN).
   const classifiedWrites = source.match(/errorCode:\s*"([A-Z0-9_]+)",\s*\.\.\.safeError\(error\)/g) || [];
-  assert.ok(classifiedWrites.length >= 5, `expected at least 5 classified writes, got ${classifiedWrites.length}`);
+  assert.ok(classifiedWrites.length >= 4, `expected at least 4 classified writes, got ${classifiedWrites.length}`);
+  assert.equal((source.match(/errorCode:\s*code,\s*\.\.\.safeError\(error\)/g) || []).length, 2);
   const codes = classifiedWrites.map((m) => m.match(/errorCode:\s*"([A-Z0-9_]+)"/)[1]);
   assert.ok(codes.every((code) => code !== "UNKNOWN"), `unknown-clobbered site present: ${codes.join(",")}`);
 });
 
-test("watchdog REQUIRED set stays in lockstep with the probe state schema (issue #11)", async () => {
-  const schemaSource = await readFile(new URL("./state-schema.mjs", import.meta.url), "utf8");
-  const watchdogSource = await readFile(new URL("./watchdog.sh", import.meta.url), "utf8");
-  const defaultsBlock = schemaSource.match(/FAST_STATE_DEFAULTS = Object\.freeze\(\{([\s\S]*?)\}\);/);
-  assert.ok(defaultsBlock, "FAST_STATE_DEFAULTS block not found");
-  const schemaFields = [...defaultsBlock[1].matchAll(/^\s{2}([a-zA-Z]+):/gm)].map((m) => m[1]);
-  assert.ok(schemaFields.length >= 30, `unexpectedly few schema fields: ${schemaFields.length}`);
-  const requiredBlock = watchdogSource.match(/REQUIRED = \{([\s\S]*?)\}/);
-  assert.ok(requiredBlock, "watchdog REQUIRED block not found");
-  const watchdogFields = [...requiredBlock[1].matchAll(/"([a-zA-Z]+)"/g)].map((m) => m[1]);
-  assert.deepEqual(
-    watchdogFields.filter((field) => !schemaFields.includes(field)).sort(),
-    [],
-    `watchdog REQUIRED has fields the probe never writes: ${watchdogFields.filter((f) => !schemaFields.includes(f)).join(",")}`,
-  );
-  assert.deepEqual(
-    schemaFields.filter((field) => !watchdogFields.includes(field)).sort(),
-    [],
-    `probe writes fields watchdog REQUIRED does not accept (STATE_CORRUPT every window): ${schemaFields.filter((f) => !watchdogFields.includes(f)).join(",")}`,
-  );
+test("watchdog shares the probe's state validator, with no duplicated REQUIRED schema (issue #11)", async () => {
+  const policy = await readFile(new URL("./supervision-policy.mjs", import.meta.url), "utf8");
+  const watchdog = await readFile(new URL("./supervision-watchdog.mjs", import.meta.url), "utf8");
+  assert.match(policy, /import \{ validateFastState \} from "\.\/state-schema\.mjs"/);
+  assert.match(policy, /if \(!validateFastState\(state\)\) return "STATE_CORRUPT"/);
+  assert.match(watchdog, /classifySupervision\(state,/);
 });
 
 test("SPACE phase is a stable deterministic value in the 0-9min span", () => {
@@ -175,16 +211,26 @@ test("multiple Pages fail closed if any URL cannot be inspected", async () => {
   );
 });
 
+test("conversation URLs match both ordinary and project routes with exact UUID boundary", () => {
+  const id = "12345678-1234-1234-1234-123456789abc";
+  assert.equal(isConversationUrl(`https://chatgpt.com/c/${id}`, id), true);
+  assert.equal(isConversationUrl(`https://chatgpt.com/g/g-p-project/c/${id}`, id), true);
+  assert.equal(isConversationUrl(`https://chatgpt.com/c/${id}-suffix`, id), false);
+  assert.equal(isConversationUrl(`https://notchatgpt.com/c/${id}`, id), false);
+  assert.equal(isConversationUrl(`http://chatgpt.com/c/${id}`, id), false);
+  assert.equal(conversationIdFromUrl(`https://chatgpt.com/g/g-p-project/c/${id}`), id);
+});
+
 // Exercise the actual inline recovery block and navigate(reason) in an isolated VM.
 // The probe module itself is adapter-bound and cannot be imported into node --test.
-async function executeProbePageRecovery(task, { uuid = "12345678-1234-1234-1234-123456789abc", previousPageLabel = "p0", events = [] } = {}) {
+async function executeProbePageRecovery(task, { uuid = "12345678-1234-1234-1234-123456789abc", previousPageLabel = "p0", events = [], reservePage = async () => {} } = {}) {
   const source = await readFile(new URL("./ego-fast-probe.mjs", import.meta.url), "utf8");
   const begin = source.indexOf("  const previousPageLabel = previous.pageLabel;");
-  const end = source.indexOf("  pages = await task.pages();\n  await writeState(", begin);
+  const end = source.indexOf("\n} catch (error) {", begin);
   const navBegin = source.indexOf("async function navigate(reason) {");
   const navEnd = source.indexOf("// Any 429_RETRY failure", navBegin);
   assert.ok(begin >= 0 && end > begin && navBegin > end && navEnd > navBegin);
-  const recovery = source.slice(begin, end) + source.slice(end, source.indexOf("\n} catch (error) {", end));
+  const recovery = source.slice(begin, end);
   const navigateSource = source.slice(navBegin, navEnd);
   const code = `(async () => {
     let page; let pages = []; let roundKind = "RECOVER";
@@ -199,6 +245,8 @@ async function executeProbePageRecovery(task, { uuid = "12345678-1234-1234-1234-
     task, uuid, URL, MON: "test-monitor", SPACE: "test-space", spaceId: "space-1",
     previous: { pageLabel: previousPageLabel }, now: () => 1_000_000,
     selectUniqueConversationPage,
+    isConversationUrl,
+    claimAgentSpace: async () => {}, reserveAgentPage: reservePage, AGENT_ID: "test-agent",
     writeState: async (value) => { writes.push(value); },
     appendEvent: async (_dir, type, detail) => { events.push({ type, detail }); },
   });
@@ -260,9 +308,22 @@ test("probe recovery behavior: multiple nonmatching managed Pages fail closed wi
   const p1 = { label: "p1", url: async () => "about:blank" };
   const p2 = { label: "p2", url: async () => "https://chatgpt.com/c/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" };
   const fixture = managedRecoveryTask([p1, p2], []);
-  await assert.rejects(executeProbePageRecovery(fixture.task), { code: "PAGE_URL_MATCH_NOT_FOUND" });
+  await assert.rejects(executeProbePageRecovery(fixture.task, { reservePage: async () => {
+    throw Object.assign(new Error("CONVERSATION_PAGE_RECOVERY_REQUIRED"), { code: "CONVERSATION_PAGE_RECOVERY_REQUIRED" });
+  } }), { code: "CONVERSATION_PAGE_RECOVERY_REQUIRED" });
   assert.equal(fixture.newPages, 0);
   assert.equal(fixture.pages.length, 2);
+});
+
+test("probe recovery behavior: a new task reserves and adds one Page alongside existing tasks", async () => {
+  const p1 = { label: "p1", url: async () => "https://chatgpt.com/c/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" };
+  const fixture = managedRecoveryTask([p1], []);
+  let reserved = 0;
+  const selected = await executeProbePageRecovery(fixture.task, { reservePage: async () => { reserved++; } });
+  assert.equal(reserved, 1);
+  assert.equal(fixture.newPages, 1);
+  assert.equal(selected.page.label, "p2");
+  assert.equal(fixture.pages[0], p1);
 });
 
 test("probe recovery behavior: four failed navigation rounds do not consume Page budget", async () => {
@@ -948,6 +1009,82 @@ test("ledger reads: ENOENT is provably empty, real read errors throw (never fail
 });
 
 // r45 LIMITED GO (issue #6): probe bootstrap requires the account pin — bare taskSpace(SPACE) creation forbidden.
+test("supervision intervals are configurable and every investigated abnormal round observes a full interval", async () => {
+  const { parseSupervisionConfig, classifySupervision, nextSupervisionRound } = await import("./supervision-policy.mjs");
+  const { normalizeFastState } = await import("./state-schema.mjs");
+  assert.deepEqual(parseSupervisionConfig({ supervisionMinutes: 20, maxAbnormalRounds: 3 }), { supervisionMinutes: 20, maxAbnormalRounds: 3 });
+  assert.throws(() => parseSupervisionConfig({ supervisionMinutes: 0, maxAbnormalRounds: 3 }), /SUPERVISION_CONFIG_INVALID/);
+  const start = 1_800_000_000_000;
+  const state = normalizeFastState({}, { generationKey: "task-a", lastProgressAt: start, uiSchema: "CHATGPT_CHAT_KNOWN", dispatchStatus: "ACCEPTED" }, start);
+  assert.equal(classifySupervision(normalizeFastState(state, {}, start + 9 * 60_000), { now: start + 9 * 60_000, minutes: 10 }), null);
+  assert.equal(classifySupervision(normalizeFastState(state, {}, start + 10 * 60_000), { now: start + 10 * 60_000, minutes: 10 }), "NO_SUBSTANTIVE_PROGRESS");
+  const abnormal = normalizeFastState(state, { probeFailed: true }, start + 11 * 60_000);
+  assert.equal(classifySupervision(abnormal, { now: start + 11 * 60_000, minutes: 10 }), "MONITOR_STATE_ABNORMAL");
+  assert.equal(classifySupervision(abnormal, { now: start + 12 * 60_000, lastReviewAt: start + 11 * 60_000, minutes: 10 }), null);
+  assert.equal(classifySupervision(normalizeFastState(abnormal, {}, start + 21 * 60_000), { now: start + 21 * 60_000, lastReviewAt: start + 11 * 60_000, minutes: 10 }), "MONITOR_STATE_ABNORMAL");
+  const status = nextSupervisionRound({ generationKey: "task-a", progressAt: start, abnormalRounds: 2, lastReviewAt: start + 11 * 60_000 }, abnormal);
+  assert.equal(status.abnormalRounds, 2);
+  assert.equal(nextSupervisionRound(status, normalizeFastState(abnormal, { lastProgressAt: start + 22 * 60_000 }, start + 22 * 60_000)).abnormalRounds, 0);
+});
+
+test("agent TaskSpace registry keeps one space per agent, isolates owners, and releases last page once", async () => {
+  const { claimAgentSpace, releaseAgentConversation } = await import("./agent-space.mjs");
+  const dir = await mkdtemp(join(tmpdir(), "ego-agent-space-"));
+  const a = "11111111-1111-4111-8111-111111111111";
+  const b = "22222222-2222-4222-8222-222222222222";
+  let closed = 0;
+  let finished = 0;
+  try {
+    await Promise.all([
+      claimAgentSpace({ agentId: "agent-a", spaceName: "Agent甲·规划任务", conversationUuid: a, directory: dir }),
+      claimAgentSpace({ agentId: "agent-a", spaceName: "Agent甲·规划任务", conversationUuid: b, directory: dir }),
+    ]);
+    await assert.rejects(() => claimAgentSpace({ agentId: "agent-a", spaceName: "second", directory: dir }), /AGENT_ALREADY_HAS_SPACE/);
+    await assert.rejects(() => claimAgentSpace({ agentId: "agent-b", spaceName: "Agent甲·规划任务", directory: dir }), /SPACE_OWNED_BY_ANOTHER_AGENT/);
+    const callbacks = { closePage: async () => { closed++; }, finishSpace: async () => { finished++; } };
+    const first = await releaseAgentConversation({ agentId: "agent-a", spaceName: "Agent甲·规划任务", conversationUuid: a, directory: dir, ...callbacks });
+    assert.deepEqual(first, { finished: false, active: [b] });
+    assert.equal(closed, 1);
+    const last = await releaseAgentConversation({ agentId: "agent-a", spaceName: "Agent甲·规划任务", conversationUuid: b, directory: dir, ...callbacks });
+    assert.deepEqual(last, { finished: true, active: [] });
+    assert.equal(finished, 1);
+    assert.deepEqual(await releaseAgentConversation({ agentId: "agent-a", spaceName: "Agent甲·规划任务", conversationUuid: b, directory: dir, ...callbacks }), { finished: true, active: [] });
+    assert.equal(finished, 1, "replayed release must not finish the space twice");
+    await assert.rejects(() => claimAgentSpace({ agentId: "agent-b", spaceName: "Agent甲·规划任务", directory: dir }), /SPACE_OWNED_BY_ANOTHER_AGENT/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("pending Page release survives interrupted close and is reconciled without a second close", async () => {
+  const { claimAgentSpace, releaseAgentConversation, withAgentRegistry } = await import("./agent-space.mjs");
+  const dir = await mkdtemp(join(tmpdir(), "ego-release-pending-"));
+  const a = "11111111-1111-4111-8111-111111111111";
+  const b = "22222222-2222-4222-8222-222222222222";
+  let closed = 0;
+  try {
+    for (const conversationUuid of [a, b]) {
+      await claimAgentSpace({ agentId: "agent-a", spaceName: "执行甲·场地设计", conversationUuid, directory: dir });
+    }
+    await assert.rejects(releaseAgentConversation({
+      agentId: "agent-a", spaceName: "执行甲·场地设计", conversationUuid: a, directory: dir,
+      closePage: async () => { closed++; throw new Error("CLOSE_RETURN_LOST"); },
+      finishSpace: async () => assert.fail("other Page remains"),
+    }), /CLOSE_RETURN_LOST/);
+    const pending = await withAgentRegistry((registry) => ({ changed: false, value: registry.agents["agent-a"] }), dir);
+    assert.deepEqual(pending.releasePending, { conversationUuid: a, finished: false });
+    assert.deepEqual(pending.active, [a, b]);
+    await assert.rejects(claimAgentSpace({ agentId: "agent-a", spaceName: "执行甲·场地设计", directory: dir }), /AGENT_SPACE_RELEASE_PENDING/);
+    assert.deepEqual(await releaseAgentConversation({
+      agentId: "agent-a", spaceName: "执行甲·场地设计", conversationUuid: a, directory: dir,
+      alreadyReleased: async (entry) => entry.releasePending?.conversationUuid === a,
+      closePage: async () => { closed++; },
+      finishSpace: async () => assert.fail("other Page remains"),
+    }), { finished: false, active: [b] });
+    assert.equal(closed, 1);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
 test("probe bootstrap is pin-locked: explicit profileId creation + post-create verification + mismatch STOP", async () => {
   const src = await readFile(new URL("./ego-fast-probe.mjs", import.meta.url), "utf8");
   for (const marker of ["TASKSPACE_BOOTSTRAP_NO_PIN", "TASKSPACE_BOOTSTRAP_PROFILE_UNKNOWN", "TASKSPACE_BOOTSTRAP_VERIFY_FAILED", "TASKSPACE_PROFILE_MISMATCH_STOP", "SPACE_BOOTSTRAPPED"]) {

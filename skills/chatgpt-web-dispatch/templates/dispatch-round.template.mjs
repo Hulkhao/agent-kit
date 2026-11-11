@@ -8,41 +8,139 @@
 //    删除它 = 派单中断后 PREPARED 记录永久 ACTIVE_BLOCKS_SEND；
 // ② 派单账本文件名是 a-dispatch-state.json（带 a- 前缀，与 a-fast-state.json 同族），patch 时勿写错。
 //
-// Deployment adapters (edit only these four constants):
+// Deployment adapters:
 const MON = "REPLACE_WITH_DEPLOY_MONITOR_DIR"; // monitor dir with dispatch-state.mjs + state-schema.mjs
-const SPACE = "REPLACE_WITH_UNIQUE_TASKSPACE"; // unique per agent/monitor instance; account pinned via ~/.agents/ego-profile.json (Gate 1.5)
+const SPACE = "REPLACE_WITH_UNIQUE_TASKSPACE"; // stable Agent-owned space, Chinese display name allowed
+const AGENT_ID = "REPLACE_WITH_STABLE_AGENT_ID"; // fixed per Agent, shared by all its conversations
 const MSG_FILE = "REPLACE_WITH_MESSAGE_FILE_PATH"; // UTF-8 file holding the payload text
 const CONV = "REPLACE_WITH_CONVERSATION_UUID"; // page located by URL containing CONV, never by label
+const ATTACHMENTS = "REPLACE_WITH_ATTACHMENTS_JSON"; // managed JSON array of absolute file paths
+const NEW_CHAT = "REPLACE_WITH_NEW_CHAT_FLAG"; // true only for a durable send-new request
 
-if ([MON, SPACE, CONV].some((v) => v.startsWith("REPLACE_")) || MSG_FILE.startsWith("REPLACE_")) {
+if ([MON, SPACE, CONV, AGENT_ID].some((v) => v.startsWith("REPLACE_")) || MSG_FILE.startsWith("REPLACE_")) {
   console.log("RESULT=ADAPTATION_REQUIRED");
   process.exit(1);
 }
 
 import * as fs from "node:fs/promises";
 import { pathToFileURL } from "node:url";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
+import { unlinkSync, readFileSync } from "node:fs";
 
 const {
   appendEvent, prepareDispatch, markSendStarted, markAccepted, markUncertain,
+  writeJsonAtomic,
   readComposerSurface, readDispatchState,
+  dispatchStopSnapshot,
   chunkPayload, readbackMatches, readbackMode, classifyChunkReadback, verifyDraftOwnership,
   getFillCount, recordFillAttempt, resetFillCount,
   markComposerFreeze, findUnconsumedComposerFreeze,
+  dispatchStormGate,
+  verifyAttachmentEvidence,
 } = await import(pathToFileURL(MON + "/dispatch-state.mjs").href);
+const { isTaskSpaceTakeover, TASKSPACE_TAKEOVER_SIGNAL, assertAgentOwnedTaskSpace } =
+  await import(pathToFileURL(MON + "/taskspace-takeover.mjs").href);
+const { claimAgentSpace } = await import(pathToFileURL(MON + "/agent-space.mjs").href);
+const { isConversationUrl, conversationIdFromUrl } = await import(pathToFileURL(MON + "/page-recovery.mjs").href);
 
 const payload = await fs.readFile(MSG_FILE, "utf-8");
 const payloadHash = createHash("sha256").update(payload, "utf8").digest("hex");
+const abort = (code) => {
+  const ledger = dispatchStopSnapshot(MON, {
+    conversationUuid: CONV, taskSpace: SPACE, payloadSha256: payloadHash,
+  });
+  const delivered = ledger.matchesCurrent && ["ACCEPTED", "COMPLETED"].includes(ledger.status);
+  const attempted = ledger.matchesCurrent && ["SEND_STARTED", "UNCERTAIN"].includes(ledger.status);
+  const signal = delivered ? "DISPATCH_ACCEPTED_WAKE_SUPERVISOR" :
+    attempted ? "DISPATCH_ATTEMPTED_WAKE_SUPERVISOR" : code;
+  console.log("DISPATCH_LEDGER=" + JSON.stringify(ledger));
+  if (delivered || attempted) {
+    console.log("STOP_CAUSE=" + code);
+    console.log(delivered ? "ACTION=ARM_MONITORS_NO_RESEND" : "ACTION=RECONCILE_SEND_NO_RESEND");
+  }
+  console.log("RESULT=" + signal);
+  process.exit(1);
+};
 
-const task = await taskSpace(SPACE);
-let page = null;
-for (const p of (await task.pages())) {
-  try { if ((await p.url()).includes(CONV)) { page = p; break; } } catch {}
+// Read the account pin before creating any TaskSpace or Page.
+let profileCfg = null;
+try { profileCfg = JSON.parse(await fs.readFile(homedir() + "/.agents/ego-profile.json", "utf-8")); }
+catch { abort("ACCOUNT_CONFIG_MISSING_STOP"); }
+if (!profileCfg?.defaultProfileId || !((profileCfg.spaceExpect && profileCfg.spaceExpect[SPACE]) || profileCfg.defaultAccount)) {
+  abort("ACCOUNT_CONFIG_INCOMPLETE_STOP");
 }
-if (!page) { console.log("RESULT=CONVERSATION_PAGE_MISSING"); process.exit(1); }
 
-const abort = (code) => { console.log("RESULT=" + code); process.exit(1); };
+// The empty new-chat draft is shared across tabs of the same ChatGPT account.
+// A machine-wide exclusive lock covers the complete prepare/fill/send transaction.
+// Stale locks after a hard kill require supervisor reconciliation before removal.
+const LOCK = homedir() + "/.agents/ego-composer.lock";
+const lockOwner = randomUUID();
+let lockHandle = null;
+try {
+  lockHandle = await fs.open(LOCK, "wx", 0o600);
+  await lockHandle.writeFile(JSON.stringify({ owner: lockOwner, pid: process.pid, space: SPACE, since: Date.now() }));
+} catch (error) {
+  if (lockHandle) await lockHandle.close();
+  abort(error?.code === "EEXIST" ? "COMPOSER_LOCK_BUSY" : "COMPOSER_LOCK_UNAVAILABLE");
+}
+process.on("exit", () => {
+  try { if (JSON.parse(readFileSync(LOCK, "utf8")).owner === lockOwner) unlinkSync(LOCK); } catch {}
+});
+
+try {
+  await claimAgentSpace({ agentId: AGENT_ID, spaceName: SPACE });
+} catch (error) { abort(error.code || "AGENT_SPACE_REGISTRY_INVALID"); }
+
+// Run BEFORE any browser API; storm expiry alone does not grant dispatch permission.
+const checkStorm = async () => {
+  let pending;
+  try { pending = await dispatchStormGate(MON); }
+  catch { abort("STORM_STATE_UNREADABLE_STOP"); }
+  if (pending) abort(pending);
+};
+await checkStorm();
+
+let task;
+let page = null;
+try {
+  const spaces = await listTaskSpaces();
+  let targetSpace = spaces.find((space) => space.taskId === SPACE || space.name === SPACE);
+  if (!targetSpace && NEW_CHAT) {
+    // taskSpace(name, profileId) creates a pinned space on its first use.
+    task = await taskSpace(SPACE, { profileId: profileCfg.defaultProfileId });
+    targetSpace = (await listTaskSpaces()).find((space) => space.taskId === SPACE || space.name === SPACE);
+  }
+  assertAgentOwnedTaskSpace(targetSpace, SPACE);
+  if (!task) task = await taskSpace(targetSpace.id);
+  if (NEW_CHAT) {
+    const request = JSON.parse(await fs.readFile(MON + "/a-new-request.json", "utf8"));
+    if (request.requestId.toLowerCase() !== CONV.toLowerCase() || request.space !== SPACE ||
+        request.agentId !== AGENT_ID || request.payloadSha256 !== payloadHash) {
+      abort("NEW_CHAT_REQUEST_MISMATCH");
+    }
+    // Persist the allocation intent before creating a Page. A crash may leave
+    // an unknown Page, so resuming requires inspection rather than another newPage().
+    await writeJsonAtomic(MON + "/a-new-page.json", { requestId: CONV, status: "ALLOCATING" });
+    page = await task.newPage();
+    await writeJsonAtomic(MON + "/a-new-page.json", { requestId: CONV, status: "ALLOCATED", pageLabel: page.label });
+  } else {
+    const matches = [];
+    for (const p of (await task.pages())) {
+      if (isConversationUrl(await p.url(), CONV)) matches.push(p);
+    }
+    if (matches.length > 1) abort("CONVERSATION_PAGE_AMBIGUOUS");
+    page = matches[0] || null;
+  }
+} catch (error) {
+  abort(isTaskSpaceTakeover(error) ? TASKSPACE_TAKEOVER_SIGNAL : "TASKSPACE_RECOVERY_FAILED");
+}
+if (!page) abort("CONVERSATION_PAGE_MISSING");
+if (!NEW_CHAT) {
+  try {
+    await claimAgentSpace({ agentId: AGENT_ID, spaceName: SPACE, conversationUuid: CONV });
+  } catch (error) { abort(error.code || "AGENT_SPACE_REGISTRY_INVALID"); }
+}
 
 // Query all visible composer candidates; selector order does NOT express priority.
 // Resolve by aria-label, then id/testid, then non-code contenteditable (agent-kit#14).
@@ -59,11 +157,38 @@ const composerOp = async (fn) => {
   }
 };
 
+// Every navigation (including the first new-chat landing) uses one audited channel.
+const navigate = async (reason) => {
+  await checkStorm();
+  const gotoAt = Date.now(); // single timestamp per navigation (R2.4 unified entry contract)
+  await appendEvent(MON, "GOTO_ATTEMPT", { goto_reason: reason, at: gotoAt, agent_id: SPACE, space: SPACE, lastGotoAt: gotoAt });
+  await page.goto(NEW_CHAT ? "https://chatgpt.com" : "https://chatgpt.com/c/" + CONV, { timeout: 45000 });
+  await page.waitForLoadState("load", { timeout: 30000 });
+  let ready = false;
+  for (let i = 0; i < 20 && !ready; i++) {
+    if (NEW_CHAT) {
+      const surface = await composerOp(() => readComposerSurface(page));
+      ready = surface.hostOk && surface.composerPresent;
+    } else {
+      const len = await composerOp(() => page.evaluate(() => document.body.innerText.length));
+      ready = len > 600;
+    }
+    if (!ready) await page.waitForTimeout(2000);
+  }
+  if (!ready) abort("PAGE_NOT_READY_AFTER_NAVIGATE");
+  await page.waitForTimeout(1000);
+};
+
+if (NEW_CHAT) await navigate("NEW_CHAT_INITIAL");
+
 // Same tier order and visibility rule as monitor/dispatch-state.mjs readComposerSurface.
 // One page-evaluate implementation covers read, clear and fill; ambiguous tiers fail closed.
 const evaluateComposer = (action, text = "") => page.evaluate(({ sel, action, text }) => {
-  const visible = (element) => Boolean(element &&
-    (element.offsetParent !== null || element.getClientRects().length > 0));
+  const visible = (element) => {
+    const rect = element?.getBoundingClientRect?.();
+    return Boolean((rect && rect.width > 0 && rect.height > 0) ||
+      element?.getClientRects?.().length > 0);
+  };
   const composers = [...document.querySelectorAll(sel)].filter(visible);
   const composerLabels = new Set(["询问 ChatGPT", "Ask ChatGPT"]);
   const isCodeEditor = (element) => /code/i.test(element.getAttribute("aria-label") || "");
@@ -78,7 +203,7 @@ const evaluateComposer = (action, text = "") => page.evaluate(({ sel, action, te
   const el = tier?.length === 1 ? tier[0] : null; // multiple matches at the highest tier are unsafe
   if (!el) return action === "read" ? "" : false;
   if (action === "read") return el.tagName === "TEXTAREA" || el.tagName === "INPUT"
-    ? (el.value || "") : (el.innerText || "");
+    ? (el.value || "") : (document.activeElement === el ? el.innerText : null) || el.innerText || "";
   el.focus();
   const range = document.createRange();
   range.selectNodeContents(el);
@@ -89,16 +214,35 @@ const evaluateComposer = (action, text = "") => page.evaluate(({ sel, action, te
     sel2.deleteFromDocument();
     return true;
   }
-  if (action === "insert") {
-    range.collapse(false);
-    sel2.addRange(range);
-    document.execCommand("insertText", false, text);
-    return true;
-  }
   return false;
 }, { sel: COMPOSER_SEL, action, text });
 
 const readRaw = () => composerOp(() => evaluateComposer("read"));
+const ensureFocused = async () => {
+  await page.cdp("Page.bringToFront");
+  const focused = await composerOp(() => page.evaluate(() => document.hasFocus()));
+  if (!focused) abort("HASFOCUS_FALSE_AFTER_BRINGTOFRONT");
+};
+const activateComposer = async () => {
+  await ensureFocused();
+  const snap = await page.snapshot({ scope: "full_page" });
+  const line = snap.split("\n").reverse().find((l) => /textfield "(询问 ChatGPT|Ask ChatGPT)"/.test(l));
+  const ref = line && (line.match(/\[ref=(\d+)/) || [])[1];
+  if (!ref) abort("COMPOSER_ACTIVATION_REF_MISSING");
+  await page.click("@" + ref);
+  const active = await composerOp(() => page.evaluate(() =>
+    ["询问 ChatGPT", "Ask ChatGPT"].includes(document.activeElement?.getAttribute("aria-label"))));
+  if (!active) abort("COMPOSER_ACTIVATION_FAILED");
+};
+const insertChunk = async (chunk) => {
+  await page.cdp("Input.dispatchKeyEvent", {
+    type: "keyDown", key: "End", code: "End", windowsVirtualKeyCode: 35, modifiers: 2,
+  });
+  await page.cdp("Input.dispatchKeyEvent", {
+    type: "keyUp", key: "End", code: "End", windowsVirtualKeyCode: 35, modifiers: 2,
+  });
+  await page.cdp("Input.insertText", { text: chunk });
+};
 
 // ---- Gate 0: unprocessed composer freeze (R2.5-H) — the probe owns the storm backoff.
 // Fail-closed read (r44 P0-A1): a ledger read failure must never masquerade as "no freeze".
@@ -115,6 +259,7 @@ catch (error) {
   abort("COMPOSER_RENDER_FREEZE");
 }
 if (!surface0.hostOk || !surface0.composerPresent) abort("COMPOSER_SURFACE_UNAVAILABLE");
+if (surface0.surfaceMode !== "CHATGPT") abort("CHATGPT_MODE_REQUIRED");
 if (surface0.generating) abort("PREVIOUS_GENERATION_STILL_ACTIVE");
 
 let existing = null;
@@ -133,9 +278,6 @@ if (existing?.status === "PREPARED" && !resume) {
 // ---- Gate 1.5: account pin (PO 令 2026-11-08, issue #7 root cause) — profileId only applies at
 // space CREATION, so a resumed space keeps whatever account it was born with. Verify the account
 // actually logged in on this page against the machine-local pin BEFORE anything is filled or sent.
-let profileCfg = null;
-try { profileCfg = JSON.parse(await fs.readFile(homedir() + "/.agents/ego-profile.json", "utf-8")); }
-catch { abort("ACCOUNT_CONFIG_MISSING_STOP"); } // no pin on this machine: stop, never guess the account
 const expectedAccount = (profileCfg.spaceExpect && profileCfg.spaceExpect[SPACE]) || profileCfg.defaultAccount;
 if (!expectedAccount || !profileCfg.defaultProfileId) abort("ACCOUNT_CONFIG_INCOMPLETE_STOP");
 // In-page fetch (window.fetch + credentials): ego's page.fetch wrapper can return null on a freshly
@@ -152,17 +294,26 @@ if (accountEmail !== expectedAccount) abort("ACCOUNT_MISMATCH_STOP:" + SPACE);
 // ---- Gate 2 as a REUSABLE procedure: ownership + clear + verify-empty, re-run after EVERY goto —
 // a goto can resurrect an old draft (r44 P0-B2).
 const ensureOwnEmptyComposer = async () => {
-  const surface = await composerOp(() => readComposerSurface(page));
-  if (surface.composerEmpty) return;
-  const draft = await readRaw();
-  const ownership = verifyDraftOwnership({ draft, payload, record: existing });
-  if (!ownership.owned) abort(ownership.kind === "empty" ? "DRAFT_STATE_CONFLICT_STOP" : "FOREIGN_DRAFT_STOP:" + (ownership.reason || ownership.kind));
-  if (ownership.kind === "historical-identity" && !resume) abort("HISTORICAL_DRAFT_STOP");
-  const cleared = await composerOp(() => evaluateClearComposer());
-  if (!cleared) abort("DRAFT_CLEAR_FAILED");
-  await page.waitForTimeout(600);
-  const after = await composerOp(() => readComposerSurface(page));
-  if (!after.composerEmpty) abort("DRAFT_CLEAR_UNVERIFIED");
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const surface = await composerOp(() => readComposerSurface(page));
+    if (!surface.composerEmpty) {
+      const draft = await readRaw();
+      const ownership = verifyDraftOwnership({ draft, payload, record: existing });
+      if (!ownership.owned) abort(ownership.kind === "empty" ? "DRAFT_STATE_CONFLICT_STOP" : "FOREIGN_DRAFT_STOP:" + (ownership.reason || ownership.kind));
+      if (ownership.kind === "historical-identity" && !resume) abort("HISTORICAL_DRAFT_STOP");
+      const cleared = await composerOp(() => evaluateClearComposer());
+      if (!cleared) abort("DRAFT_CLEAR_FAILED");
+    }
+    // Hydration can refill a previously empty composer without navigation.
+    let resurrected = false;
+    for (const delay of [0, 700, 1100, 1500]) {
+      if (delay) await page.waitForTimeout(delay);
+      const after = await composerOp(() => readComposerSurface(page));
+      if (!after.composerEmpty) { resurrected = true; break; }
+    }
+    if (!resurrected) return;
+  }
+  abort("DRAFT_RESURRECTED_AFTER_CLEAR");
 };
 
 // ---- Gate 3: FRESHEN — 3 completed fill attempts since the last successful navigation.
@@ -171,24 +322,10 @@ const ensureOwnEmptyComposer = async () => {
 // draft-resurrection check re-runs (r44 P0-B2).
 const evaluateClearComposer = () => evaluateComposer("clear");
 
-const navigate = async (reason) => {
-  const gotoAt = Date.now(); // single timestamp per navigation (R2.4 unified entry contract)
-  await appendEvent(MON, "GOTO_ATTEMPT", { goto_reason: reason, at: gotoAt, agent_id: SPACE, space: SPACE, lastGotoAt: gotoAt });
-  await page.goto("https://chatgpt.com/c/" + CONV, { timeout: 45000 });
-  await page.waitForLoadState("load", { timeout: 30000 });
-  let ready = false;
-  for (let i = 0; i < 20 && !ready; i++) {
-    const len = await composerOp(() => page.evaluate(() => document.body.innerText.length));
-    if (len > 600) { ready = true; break; }
-    await page.waitForTimeout(2000);
-  }
-  if (!ready) abort("PAGE_NOT_READY_AFTER_NAVIGATE");
-  await page.waitForTimeout(1000);
-};
-
 await ensureOwnEmptyComposer(); // Gate 2 (initial)
 
 if (await getFillCount(MON, SPACE) >= 3) { // Gate 3 (FRESHEN)
+  await checkStorm();
   await navigate("FRESHEN");
   await resetFillCount(MON, SPACE);
   await ensureOwnEmptyComposer(); // resurrection check, never skipped
@@ -201,7 +338,25 @@ const dispatch = resume ? existing :
   await prepareDispatch({ monitorDir: MON, conversationUuid: CONV, taskSpace: SPACE, pageLabel: page.label, page, payload });
 
 // ---- Gate 5: adaptive fill with cumulative-prefix readback (R2.6-F) ----
+const attachmentSurface = () => page.evaluate(() => [...document.querySelectorAll("form")].map((form) => {
+    const send = form.querySelector("button[aria-label='发送'], button[data-testid='send-button']");
+    return {
+      text: form.innerText || "",
+      images: form.querySelectorAll("img").length,
+      sendEnabled: Boolean(send && !send.disabled && send.getAttribute("aria-disabled") !== "true"),
+    };
+  }));
+let attachmentBefore = null;
+let attachmentNames = [];
+if (ATTACHMENTS.length > 0) {
+  if (resume) abort("ATTACHMENT_RESUME_REQUIRES_RECONCILIATION");
+  attachmentBefore = await composerOp(attachmentSurface);
+  await page.waitForSelector('input[aria-label="附加文件"]', { state: "attached" });
+  await page.setInputFiles('input[aria-label="附加文件"] >> nth=-1', ATTACHMENTS);
+  attachmentNames = ATTACHMENTS.map((file) => file.replace(/\\/g, "/").split("/").at(-1));
+}
 await recordFillAttempt(MON, SPACE);
+if (payload.length > 0) await activateComposer(); // one real click, before all chunks
 const chunks = chunkPayload(payload, 1200, 600);
 const fillReadbackMode = readbackMode(payload);
 let expectedPrefix = "";
@@ -210,10 +365,7 @@ for (const chunk of chunks) {
   const nextPrefix = expectedPrefix + chunk;
   let verified = false;
   for (let attempt = 0; attempt < 2 && !verified; attempt++) {
-    // execCommand's boolean is not proof of insertion. The Composer's actual cumulative text
-    // is authoritative: accept a completed insert even if execCommand returned false.
-    const inserted = await composerOp(() => evaluateComposer("insert", chunk));
-    if (!inserted) abort("CHUNK_INSERT_NO_EFFECT");
+    await composerOp(() => insertChunk(chunk));
     await page.waitForTimeout(450);
     composerText = await readRaw();
 
@@ -248,8 +400,29 @@ if (chunks.length === 0) composerText = await readRaw();
 if (!readbackMatches(payload, composerText, fillReadbackMode)) {
   abort(fillReadbackMode === "strict" ? "SENSITIVE_FIDELITY_UNPROVEN" : "READBACK_NOT_VERIFIED_ABORT");
 }
+if (attachmentBefore) {
+  // Wait for thumbnails/chips to mount and for the actual send control to enable.
+  let mounted = false;
+  for (let attempt = 0; attempt < 4 && !mounted; attempt++) {
+    mounted = verifyAttachmentEvidence(attachmentBefore, await composerOp(attachmentSurface), attachmentNames);
+    if (!mounted) await page.waitForTimeout(800);
+  }
+  if (!mounted) abort("ATTACHMENT_NOT_VERIFIED");
+}
 
-// ---- Gate 7: thinking-level precheck — READ is locale-independent (aria attrs); ENTRY is bilingual.
+// ---- Gate 7: chat mode is mandatory before thinking-level precheck.
+const chatMode = await composerOp(() => page.evaluate(() => {
+  const modes = [...document.querySelectorAll('button[aria-pressed]')]
+    .filter((el) => el.getClientRects().length > 0)
+    .map((el) => ({ label: (el.textContent || "").trim(), pressed: el.getAttribute("aria-pressed") }))
+    .filter(({ label }) => /^(聊天|Chat|工作|Work)$/i.test(label));
+  const chat = modes.filter(({ label }) => /^(聊天|Chat)$/i.test(label));
+  const work = modes.filter(({ label }) => /^(工作|Work)$/i.test(label));
+  return chat.length === 1 && work.length === 1 && chat[0].pressed === "true" && work[0].pressed === "false";
+}));
+if (!chatMode) abort("CHAT_MODE_UNVERIFIED_STOP");
+
+// Thinking-level precheck — READ is locale-independent (aria attrs); ENTRY is bilingual.
 // The EN-UI variant may have NO model menu at all (agent-kit#7): a click failure or missing menu is
 // a fail-closed STOP, never a silent skip — a skipped gate is how a session ran unnoticed on mini.
 let menuInfo = null;
@@ -277,7 +450,7 @@ if (!menuInfo || !modelOk || !levelOk) abort("LEVEL_GATE_FAIL_ABORT");
 // It records which model produced PAST assistant turns; it cannot prove the next send's model or
 // effort level, so the live aria gate above stays primary. session+conversation = the 2-call
 // per-wake API budget exactly.
-const convEvidence = await composerOp(() => page.evaluate(async ({ uuid, token }) => {
+const convEvidence = NEW_CHAT ? { ok: false } : await composerOp(() => page.evaluate(async ({ uuid, token }) => {
   try {
     const r = await fetch("/backend-api/conversation/" + uuid, { credentials: "include", headers: token ? { Authorization: "Bearer " + token } : {} });
     if (!r.ok) return { ok: false };
@@ -290,9 +463,13 @@ const convEvidence = await composerOp(() => page.evaluate(async ({ uuid, token }
     return { ok: true, slug };
   } catch { return { ok: false }; }
 }, { uuid: CONV, token: sessionEvidence ? sessionEvidence.token : null }));
-if (!convEvidence.ok || !convEvidence.slug) abort("MODEL_EVIDENCE_UNAVAILABLE_STOP");
-if (/mini/i.test(convEvidence.slug)) abort("MODEL_HISTORY_MISMATCH"); // negative-only: historical mini = stop, supervisor decides
-await appendEvent(MON, "MODEL_HISTORY_AUX", { slug: String(convEvidence.slug).slice(0, 60) }); // compliant slug = auxiliary record only
+// Historical model metadata is best-effort. A 429/404 or a missing past slug
+// cannot override the verified live Chat + slider gate or block a new chat.
+if (convEvidence.ok && convEvidence.slug) {
+  await appendEvent(MON, "MODEL_HISTORY_AUX", { slug: String(convEvidence.slug).slice(0, 60) });
+} else {
+  await appendEvent(MON, "MODEL_HISTORY_AUX_UNAVAILABLE", {});
+}
 
 // ---- Gate 8: ref lifecycle (r44 P0-A2) — ONLY snapshot/ref/focus may retry. Once focus succeeds,
 // the send path runs exactly once: button-missing = STOP (fail-closed), final content recheck on the
@@ -313,6 +490,7 @@ for (let focusAttempt = 1; focusAttempt <= 3 && !sent; focusAttempt++) {
     continue;
   }
   // ---- focus succeeded: the send path below runs at most once, never re-entered ----
+  await ensureFocused();
   await page.waitForTimeout(800);
   const btn = await composerOp(() => page.evaluate(() => {
     const el = document.querySelector("button[aria-label='发送'], button[data-testid='send-button']");
@@ -347,5 +525,17 @@ for (let i = 0; i < 24 && !accepted; i++) {
   } catch {}
 }
 if (!accepted) await markUncertain(MON, dispatch.dispatchId, "SEND_ACK_MISSING").catch(() => {});
+if (accepted && NEW_CHAT) {
+  let actualUuid = null;
+  for (let i = 0; i < 12 && !actualUuid; i++) {
+    actualUuid = conversationIdFromUrl(await page.url(), true);
+    if (!actualUuid) await page.waitForTimeout(1500);
+  }
+  if (!actualUuid || actualUuid === CONV) abort("NEW_CHAT_UUID_NOT_OBSERVED");
+  try { await claimAgentSpace({ agentId: AGENT_ID, spaceName: SPACE, conversationUuid: actualUuid }); }
+  catch (error) { abort(error.code || "NEW_CHAT_REGISTRY_BIND_FAILED"); }
+  await writeJsonAtomic(MON + "/a-new-conversation.json",
+    { requestId: CONV, conversationUuid: actualUuid, pageLabel: page.label });
+}
 console.log({ dispatchId: dispatch.dispatchId, accepted: accepted?.status || null, acceptErr });
 console.log(accepted ? "RESULT=AUTO_ACCEPTED_DISPATCH_ACCEPTED" : "RESULT=NOT_AUTO_ACCEPTED_MARKED_UNCERTAIN");

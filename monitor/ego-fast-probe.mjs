@@ -1,12 +1,13 @@
 // Canonical read-only ChatGPT monitor. It never sends or retries a dispatch.
-// Deployment adapters: MON, SPACE, and a-watch-uuid.txt only.
+// Deployment adapters: MON, SPACE, AGENT_ID, and a-watch-uuid.txt.
 import { mkdir, readFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 import { homedir } from "node:os";
 
 const MON = "REPLACE_WITH_DEPLOY_MONITOR_DIR"; // adapter 1
 const SPACE = "REPLACE_WITH_UNIQUE_TASKSPACE"; // adapter 2
-if (MON.startsWith("REPLACE_") || SPACE.startsWith("REPLACE_")) {
+const AGENT_ID = "REPLACE_WITH_STABLE_AGENT_ID"; // stable across this Agent's tasks
+if ([MON, SPACE, AGENT_ID].some((value) => value.startsWith("REPLACE_"))) {
   console.error("ADAPTATION_REQUIRED");
   process.exit(1);
 }
@@ -42,7 +43,11 @@ const {
   stormRearmState,
   validateFastState,
 } = await import(pathToFileURL(MON + "/state-schema.mjs").href);
-const { selectUniqueConversationPage } = await import(pathToFileURL(MON + "/page-recovery.mjs").href);
+const { selectUniqueConversationPage, isConversationUrl } = await import(pathToFileURL(MON + "/page-recovery.mjs").href);
+const { TASKSPACE_TAKEOVER_SIGNAL, isTaskSpaceTakeover, assertAgentOwnedTaskSpace } =
+  await import(pathToFileURL(MON + "/taskspace-takeover.mjs").href);
+const { claimAgentSpace, reserveAgentPage } = await import(pathToFileURL(MON + "/agent-space.mjs").href);
+const { shouldReviewStartupIdle } = await import(pathToFileURL(MON + "/supervision-policy.mjs").href);
 
 const STATE = MON + "/a-fast-state.json";
 const UUID_FILE = MON + "/a-watch-uuid.txt";
@@ -113,6 +118,14 @@ try {
   process.exit(0);
 }
 
+try {
+  await claimAgentSpace({ agentId: AGENT_ID, spaceName: SPACE });
+} catch (error) {
+  await writeState({ probeFailed: true, recoveryFailed: true, errorCode: error.code || "AGENT_SPACE_REGISTRY_INVALID" });
+  console.log("RESULT=" + (error.code || "AGENT_SPACE_REGISTRY_INVALID"));
+  process.exit(0);
+}
+
 // R2.5-H: consume unprocessed composer-freeze events through the shared storm channel.
 // The ledger (dispatch-state) only records the event; this probe is the single writer that
 // turns it into a persisted storm backoff via the existing writeState() path.
@@ -173,9 +186,8 @@ try {
     await appendEvent(MON, "SPACE_BOOTSTRAPPED", { space: SPACE, profileId: pinnedProfileId });
     spaceId = created.id;
   } else {
-    if (targetSpace.ownership !== "agent" || (targetSpace.taskId && targetSpace.taskId !== SPACE)) {
-      throw new Error("TASKSPACE_NOT_AGENT_OWNED");
-    }
+    spaceId = targetSpace.id;
+    assertAgentOwnedTaskSpace(targetSpace, SPACE);
     // profile mismatch check fires only when BOTH sides expose the profile (fail-closed per r45)
     const pinnedProfileId = await readPinnedProfileId();
     if (targetSpace.profileId && pinnedProfileId && targetSpace.profileId !== pinnedProfileId) {
@@ -185,9 +197,10 @@ try {
     task = await taskSpace(spaceId);
   }
 } catch (error) {
-  await writeState({ spaceId, probeFailed: true, recoveryFailed: true, errorCode: "TASKSPACE_RECOVERY_FAILED", ...safeError(error) });
-  await appendEvent(MON, "TASKSPACE_RECOVERY_FAILED", safeError(error));
-  console.log("RESULT=TASKSPACE_RECOVERY_FAILED");
+  const code = isTaskSpaceTakeover(error) ? TASKSPACE_TAKEOVER_SIGNAL : "TASKSPACE_RECOVERY_FAILED";
+  await writeState({ spaceId, probeFailed: true, recoveryFailed: true, errorCode: code, ...safeError(error) });
+  await appendEvent(MON, code, { spaceId, ...safeError(error) });
+  console.log("RESULT=" + code);
   process.exit(0);
 }
 
@@ -199,14 +212,7 @@ try {
   pages = await task.pages();
   const tabs = await task.tabs();
   // Resolve managed Pages by conversation URL; never select by a stale page label.
-  const urlMatchesConversation = (rawUrl, exactHost = false) => {
-    let parsed;
-    try { parsed = new URL(rawUrl); } catch { return false; }
-    const hostOk = exactHost ? parsed.hostname === "chatgpt.com" :
-      parsed.hostname === "chatgpt.com" || parsed.hostname.endsWith(".chatgpt.com");
-    return hostOk && (!exactHost || parsed.protocol === "https:") &&
-      parsed.pathname.split("/").includes(uuid);
-  };
+  const urlMatchesConversation = (rawUrl, exactHost = false) => isConversationUrl(rawUrl, uuid, exactHost);
   // Blank-page reuse (agent-kit#18 R1): a fresh ego Page may sit on either URL.
   const isBlankPageUrl = (rawUrl) => rawUrl === "about:blank" || rawUrl === "chrome://new-tab-page/";
   let selectionEvidence = null;
@@ -261,18 +267,16 @@ try {
       // Reuse the same agent-owned blank Page; the existing RECOVER path navigates it.
       page = pages[0];
       selectionEvidence = "AGENT_OWNED_BLANK_PAGE";
-    } else if (pages.length > 0) {
-      // Never create p2/p3 while managed Pages already exist but do not match.
-      const error = new Error("PAGE_URL_MATCH_NOT_FOUND");
-      error.code = "PAGE_URL_MATCH_NOT_FOUND";
-      throw error;
     } else {
-      // Only an empty managed inventory without a matching adoptable tab may create a Page.
+      // Reserve a fresh UUID exactly once before allocating another managed Page.
+      // An existing UUID with a missing Page requires reconciliation, not a retry.
+      await reserveAgentPage({ agentId: AGENT_ID, spaceName: SPACE, conversationUuid: uuid });
       page = await task.newPage();
-      selectionEvidence = "NEW_PAGE";
+      selectionEvidence = "RESERVED_NEW_PAGE";
     }
   }
   pages = await task.pages();
+  await claimAgentSpace({ agentId: AGENT_ID, spaceName: SPACE, conversationUuid: uuid });
   await writeState({ spaceId, pageLabel: page.label, pageCount: pages.length, recoveryFailed: false, errorCode: null, errorName: null });
   if (previousPageLabel && previousPageLabel !== page.label) {
     await appendEvent(MON, "PAGE_LABEL_RECOVERED", {
@@ -280,9 +284,11 @@ try {
     });
   }
 } catch (error) {
-  await writeState({ spaceId, probeFailed: true, recoveryFailed: true, errorCode: "PAGE_RECOVERY_FAILED", ...safeError(error) });
-  await appendEvent(MON, "PAGE_RECOVERY_FAILED", safeError(error));
-  console.log("RESULT=TASKSPACE_RECOVERY_FAILED");
+  const takeover = isTaskSpaceTakeover(error);
+  const code = takeover ? TASKSPACE_TAKEOVER_SIGNAL : "PAGE_RECOVERY_FAILED";
+  await writeState({ spaceId, probeFailed: true, recoveryFailed: true, errorCode: code, ...safeError(error) });
+  await appendEvent(MON, code, { spaceId, ...safeError(error) });
+  console.log("RESULT=" + (takeover ? TASKSPACE_TAKEOVER_SIGNAL : "TASKSPACE_RECOVERY_FAILED"));
   process.exit(0);
 }
 
@@ -574,6 +580,10 @@ const completedDispatch = dispatchResult.record?.status === "COMPLETED";
 const everGenerating = completedDispatch ? false :
   (sameGeneration ? previous.everGenerating || probe.generating : probe.generating);
 const bodyChanged = previous.len !== probe.bodyLen;
+const substantiveProgress = (probe.lastMessageRole === "assistant" && (
+  (probe.lastMessageKey && probe.lastMessageKey !== previous.lastMessageKey) ||
+  (probe.lastMessageTextLength > previous.lastMessageTextLength)
+)) || (everGenerating && JSON.stringify(probe.activityMarkers) !== JSON.stringify(previousActivityMarkers || []));
 const recovered = startupNeedsReview;
 const state = await writeState({
   spaceId, pageLabel: page.label, pageCount: pages.length,
@@ -582,7 +592,7 @@ const state = await writeState({
   generationKey: dispatchId || "conversation",
   len: probe.bodyLen,
   bodyChanged,
-  lastProgressAt: bodyChanged ? now() : (previous.lastProgressAt || now()),
+  lastProgressAt: substantiveProgress || !sameGeneration ? now() : (previous.lastProgressAt ?? previous.ts ?? now()),
   startIdle: recovered && !probe.generating,
   doneCandidate: completedDispatch ? false : (sameGeneration ? previous.doneCandidate : false),
   probeFailed: false,
@@ -618,14 +628,13 @@ console.log("state=" + JSON.stringify({
   dispatchStatus: state.dispatchStatus, toolState: state.toolState,
 }));
 
-if (state.startIdle) {
+const responseTailAdvanced = dispatchResult.record?.status === "ACCEPTED" &&
+  probe.composerEmpty && hasResponseTailAdvanced(dispatchResult.record, probe);
+if (shouldReviewStartupIdle(state.startIdle, responseTailAdvanced)) {
   await appendEvent(MON, "START_IDLE_WAKE_SUPERVISOR", { pageLabel: page.label });
   console.log("RESULT=START_IDLE_WAKE_SUPERVISOR");
   process.exit(0);
 }
-
-const responseTailAdvanced = dispatchResult.record?.status === "ACCEPTED" &&
-  probe.composerEmpty && hasResponseTailAdvanced(dispatchResult.record, probe);
 if (responseTailAdvanced && !everGenerating) {
   await appendEvent(MON, "RESPONSE_TAIL_ADVANCED_WITHOUT_OBSERVED_GENERATING", {
     dispatchId, lastMessageRole: probe.lastMessageRole,

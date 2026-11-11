@@ -1,0 +1,5 @@
+{
+  "name": "chatgpt-dispatch-guard",
+  "version": "1.0.0",
+  "description": "Enforce the canonical ChatGPT web dispatch entry point"
+}

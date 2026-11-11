@@ -1,7 +1,9 @@
 // Durable dispatch ledger. Never stores prompt/response text or virtualized turn counts.
 import { appendFile, readFile, rename, writeFile } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
-import { spacePhaseMs, stormBackoffDeadline } from "./state-schema.mjs";
+import { spacePhaseMs, stormBackoffDeadline, validateFastState } from "./state-schema.mjs";
+import { verifiedReply } from "./reply-delivery.mjs";
 
 const ACTIVE = new Set(["PREPARED", "SEND_STARTED", "ACCEPTED", "UNCERTAIN", "RETRY_AUTHORIZED"]);
 const fileOf = (dir) => `${dir}/a-dispatch-state.json`;
@@ -15,8 +17,21 @@ async function readJson(path) {
   }
 }
 
+// Shared dispatch storm gate. A recorded structural failure remains blocked until the
+// probe writes a healthy state; expiry by itself is NOT evidence of recovery.
+export async function dispatchStormGate(dir, timestamp = Date.now()) {
+  const state = await readJson(`${dir}/a-fast-state.json`);
+  if (state === null) return null;
+  if (!validateFastState(state)) throw new Error("FAST_STATE_INVALID");
+  if ((state.backoffUntil !== null && state.backoffUntil > timestamp) ||
+      state.errorCode === "CHAT_SURFACE_STRUCTURALLY_UNAVAILABLE") {
+    return "STORM_BACKOFF_PENDING";
+  }
+  return null;
+}
+
 export async function writeJsonAtomic(path, value) {
-  const temp = `${path}.${process.pid}.${Date.now()}.tmp`;
+  const temp = `${path}.${randomUUID()}.tmp`;
   await writeFile(temp, JSON.stringify(value), "utf8");
   await rename(temp, path);
 }
@@ -28,8 +43,11 @@ export async function appendEvent(dir, event, fields = {}) {
 
 export async function readComposerSurface(page) {
   return page.evaluate(() => {
-    const visible = (element) => Boolean(element &&
-      (element.offsetParent !== null || element.getClientRects().length > 0));
+    const visible = (element) => {
+      const rect = element?.getBoundingClientRect?.();
+      return Boolean((rect && rect.width > 0 && rect.height > 0) ||
+        element?.getClientRects?.().length > 0);
+    };
     const composerSelector = '#prompt-textarea, [data-testid="prompt-textarea"], [contenteditable="true"][role="textbox"], textarea';
     const composers = [...document.querySelectorAll(composerSelector)].filter(visible);
     // Issue #9: align composer localization with the dispatch template's COMPOSER_SEL (aria-label
@@ -38,15 +56,22 @@ export async function readComposerSurface(page) {
     // phantom foreign draft (FOREIGN_DRAFT_STOP on an actually empty composer).
     const composerLabels = new Set(["询问 ChatGPT", "Ask ChatGPT"]);
     const isCodeEditor = (element) => /code/i.test(element.getAttribute("aria-label") || "");
-    const composer = composers.find((element) => composerLabels.has(element.getAttribute("aria-label"))) ||
-      composers.find((element) => element.id === "prompt-textarea" ||
-        element.getAttribute("data-testid") === "prompt-textarea") ||
-      composers.find((element) => element.matches('[contenteditable="true"][role="textbox"]') && !isCodeEditor(element)) ||
-      null;
+    const tiers = [
+      composers.filter((element) => composerLabels.has(element.getAttribute("aria-label"))),
+      composers.filter((element) => element.id === "prompt-textarea" ||
+        element.getAttribute("data-testid") === "prompt-textarea"),
+      composers.filter((element) => element.matches?.('[contenteditable="true"][role="textbox"]') &&
+        !isCodeEditor(element)),
+    ];
+    const tier = tiers.find((matches) => matches.length > 0);
+    const composer = tier?.length === 1 ? tier[0] : null;
     const composerText = !composer ? "" :
       (composer.tagName === "TEXTAREA" || composer.tagName === "INPUT"
         ? composer.value || ""
-        : composer.innerText || composer.textContent || "");
+        : (document.activeElement === composer ? composer.innerText : null) ||
+          composer.innerText || composer.textContent || "");
+    const codexComposer = [...document.querySelectorAll('[aria-label="随心输入"]')].some(visible);
+    const chatComposer = composers.some((element) => composerLabels.has(element.getAttribute("aria-label")));
 
     // Current ChatGPT DOM contract: the last content unit carries the role suffix.
     // Assistant identity comes from its DIL response UUID; user identity uses the unit key.
@@ -84,6 +109,7 @@ export async function readComposerSurface(page) {
 
     return {
       hostOk: location.hostname === "chatgpt.com" || location.hostname.endsWith(".chatgpt.com"),
+      surfaceMode: codexComposer && !chatComposer ? "CODEX" : chatComposer ? "CHATGPT" : "UNKNOWN",
       composerCount: composers.length,
       composerPresent: Boolean(composer),
       composerEmpty: Boolean(composer) && composerText.trim().length === 0,
@@ -124,6 +150,25 @@ export async function readDispatchState(dir) {
   return record;
 }
 
+// Only used when the dispatch script is stopping. Read the durable ledger anew
+// so a later evidence failure cannot be mistaken for a failed send. Never print
+// the payload, access token or complete SHA.
+export function dispatchStopSnapshot(dir, identity = null) {
+  try {
+    const record = JSON.parse(readFileSync(fileOf(dir), "utf8"));
+    if (!validateDispatchRecord(record)) throw new Error("DISPATCH_STATE_INVALID");
+    return {
+      status: record.status,
+      dispatchId: record.dispatchId,
+      shaPrefix: typeof record.payload_sha256 === "string" ? record.payload_sha256.slice(0, 12) : null,
+      matchesCurrent: identity ? record.conversationUuid === identity.conversationUuid &&
+        record.taskSpace === identity.taskSpace && record.payload_sha256 === identity.payloadSha256 : null,
+    };
+  } catch {
+    return { status: "UNAVAILABLE", dispatchId: null, shaPrefix: null, matchesCurrent: false };
+  }
+}
+
 export async function prepareDispatch({ monitorDir, conversationUuid, taskSpace, pageLabel, page, payload }) {
   const current = await readDispatchState(monitorDir);
   if (current && ACTIVE.has(current.status)) {
@@ -150,6 +195,8 @@ export async function prepareDispatch({ monitorDir, conversationUuid, taskSpace,
     baselineTailRole: surface.lastMessageRole,
     baselineComposerLength: surface.composerLength,
     payload_sha256: payloadText === null ? null : createHash("sha256").update(payloadText, "utf8").digest("hex"),
+    payload_display_sha256: payloadText === null ? null : createHash("sha256").update(
+      payloadText.replace(/\r\n?/g, "\n").replace(/\n{2,}/g, "\n").trim(), "utf8").digest("hex"),
     payload_bytes: payloadText === null ? null : Buffer.byteLength(payloadText, "utf8"),
     composer_baseline: payloadText === null ? null : JSON.stringify({
       composerLength: surface.composerLength,
@@ -227,9 +274,15 @@ export async function markUncertain(monitorDir, dispatchId, reasonCode = "SEND_A
 }
 
 export async function markCompleted(monitorDir, dispatchId) {
+  const current = await readDispatchState(monitorDir);
+  if (!current || current.dispatchId !== dispatchId || current.status !== "ACCEPTED") throw new Error("COMPLETION_REQUIRES_ACCEPTED_DISPATCH");
+  const receipt = await verifiedReply(monitorDir, current);
   return transition(monitorDir, dispatchId, ["ACCEPTED"], "COMPLETED", {
     completedAt: Date.now(),
-    finalVerification: "SUPERVISOR_API_CONFIRMED",
+    finalVerification: receipt.source,
+    replySha256: receipt.sha256,
+    replyBytes: receipt.bytes,
+    replyFile: receipt.file,
   });
 }
 
@@ -379,7 +432,11 @@ export function readbackMatches(payload, composerText, mode = readbackMode(paylo
       composerText.replace(/\r\n/g, "\n") === payload.replace(/\r\n/g, "\n");
   }
   if (mode !== "normalized") return false;
-  return collapseComposerArtifacts(composerText).trim() === collapseComposerArtifacts(payload).trim();
+  const collapsedText = collapseComposerArtifacts(composerText).trim();
+  const collapsedPayload = collapseComposerArtifacts(payload).trim();
+  return collapsedText === collapsedPayload ||
+    // ProseMirror can remove BOTH newlines at a pasted chunk boundary.
+    collapsedText.replace(/\s/g, "") === collapsedPayload.replace(/\s/g, "");
 }
 
 export function classifyChunkReadback(previousPrefix, nextPrefix, composerText, mode = "normalized") {
@@ -418,6 +475,13 @@ export function verifyDraftOwnership({ draft, payload = null, record = null } = 
     const normPayload = collapseComposerArtifacts(payload).trim();
     if (normDraft === normPayload) return { owned: true, kind: "full" };
     if (normPayload.startsWith(normDraft)) return { owned: true, kind: "prefix" };
+    // Allow whitespace-loss at chunk edges for plain prose only. Do not weaken
+    // ownership for URLs, shell commands, or code where whitespace is semantic.
+    if (!isSensitivePayload(payload)) {
+      const compact = (value) => value.replace(/\s/g, "");
+      if (compact(normDraft) === compact(normPayload)) return { owned: true, kind: "full" };
+      if (compact(normPayload).startsWith(compact(normDraft))) return { owned: true, kind: "prefix" };
+    }
     // exact raw identity is still acceptable even when collapsed forms diverge
     if (draftText.replace(/\r\n/g, "\n") === payload.replace(/\r\n/g, "\n")) {
       return { owned: true, kind: "full" };
@@ -527,4 +591,20 @@ export async function lastConsumedFreezeDeadline(dir) {
     }
   }
   return deadline;
+}
+
+// Attachment evidence is tied to the same composer form. Images often have
+// thumbnail chips without filename text, so compare them against the pre-upload
+// image baseline instead of requiring invisible filename labels.
+export function verifyAttachmentEvidence(before, after, filenames) {
+  if (!Array.isArray(before) || !Array.isArray(after) || !Array.isArray(filenames) || !filenames.length) return false;
+  const images = filenames.filter((name) => /\.(?:png|jpe?g|gif|webp|avif|bmp|heic|heif)$/i.test(name));
+  const files = filenames.filter((name) => !images.includes(name));
+  return after.some((form, index) => {
+    const prior = before[index];
+    return prior && form.sendEnabled === true &&
+      Number.isInteger(form.images) && Number.isInteger(prior.images) &&
+      form.images - prior.images >= images.length &&
+      files.every((filename) => typeof form.text === "string" && form.text.includes(filename));
+  });
 }
