@@ -106,8 +106,11 @@ let page = null;
 try {
   const spaces = await listTaskSpaces();
   let targetSpace = spaces.find((space) => space.taskId === SPACE || space.name === SPACE);
-  if (!targetSpace && NEW_CHAT) {
-    // taskSpace(name, profileId) creates a pinned space on its first use.
+  if (!targetSpace) {
+    // r48: ego restart clears the space registry. Bootstrap the pinned space for
+    // BOTH new chats and existing-conversation sends (same rule as ego-fast-probe),
+    // instead of failing send with TASKSPACE_NOT_FOUND until a new chat happens.
+    if (!profileCfg.defaultProfileId) abort("ACCOUNT_CONFIG_MISSING_STOP");
     task = await taskSpace(SPACE, { profileId: profileCfg.defaultProfileId });
     targetSpace = (await listTaskSpaces()).find((space) => space.taskId === SPACE || space.name === SPACE);
   }
@@ -133,6 +136,7 @@ try {
     page = matches[0] || null;
   }
 } catch (error) {
+  console.log("RECOVERY_DETAIL=" + String(error && error.message || error).slice(0, 220));
   abort(isTaskSpaceTakeover(error) ? TASKSPACE_TAKEOVER_SIGNAL : "TASKSPACE_RECOVERY_FAILED");
 }
 if (!page) abort("CONVERSATION_PAGE_MISSING");
@@ -412,31 +416,75 @@ if (attachmentBefore) {
 
 // ---- Gate 7: chat mode is mandatory before thinking-level precheck.
 const chatMode = await composerOp(() => page.evaluate(() => {
+  // r48.2: the mode state lives in the toggle's aria-label ("切换模式，当前模式：ChatGPT");
+  // aria-pressed mode buttons no longer exist on the current UI. Chat-family labels
+  // accepted: ChatGPT / 聊天 / Chat. Work-family: Codex / 工作 / Work.
+  const toggle = [...document.querySelectorAll('button')]
+    .find((el) => /切换模式|Switch mode|current mode/i.test(el.getAttribute('aria-label') || ''));
+  const current = toggle ? (toggle.getAttribute('aria-label').match(/(?:当前模式：|current mode:?\s*)([A-Za-z一-龥]+)/) || [])[1] || '' : '';
+  if (current) return /^(ChatGPT|聊天|Chat)$/i.test(current.trim());
+  // fallback: aria-pressed pair (older UIs)
   const modes = [...document.querySelectorAll('button[aria-pressed]')]
     .filter((el) => el.getClientRects().length > 0)
     .map((el) => ({ label: (el.textContent || "").trim(), pressed: el.getAttribute("aria-pressed") }))
-    .filter(({ label }) => /^(聊天|Chat|工作|Work)$/i.test(label));
-  const chat = modes.filter(({ label }) => /^(聊天|Chat)$/i.test(label));
-  const work = modes.filter(({ label }) => /^(工作|Work)$/i.test(label));
-  return chat.length === 1 && work.length === 1 && chat[0].pressed === "true" && work[0].pressed === "false";
+    .filter(({ label }) => /^(聊天|Chat|ChatGPT|工作|Work|Codex)$/i.test(label));
+  const chat = modes.filter(({ label }) => /^(聊天|Chat|ChatGPT)$/i.test(label));
+  const work = modes.filter(({ label }) => /^(工作|Work|Codex)$/i.test(label));
+  return chat.length >= 1 && chat.every((m) => m.pressed === "true") &&
+    (work.length === 0 || work.every((m) => m.pressed === "false"));
 }));
-if (!chatMode) abort("CHAT_MODE_UNVERIFIED_STOP");
+if (!chatMode) {
+  try {
+    const dump = await page.evaluate(() => [...document.querySelectorAll('button[aria-pressed]')]
+      .filter((el) => el.getClientRects().length > 0)
+      .map((el) => (el.textContent || "").trim().slice(0, 20) + "=" + el.getAttribute("aria-pressed")));
+    console.log("MODE_LABELS=" + JSON.stringify(dump).slice(0, 300));
+  } catch {}
+  abort("CHAT_MODE_UNVERIFIED_STOP");
+}
 
 // Thinking-level precheck — READ is locale-independent (aria attrs); ENTRY is bilingual.
 // The EN-UI variant may have NO model menu at all (agent-kit#7): a click failure or missing menu is
 // a fail-closed STOP, never a silent skip — a skipped gate is how a session ran unnoticed on mini.
 let menuInfo = null;
 try {
-  await page.click('button[aria-label="选择 ChatGPT 模型"], button[aria-label="Model selector"]', { label: "open model menu" });
-  await page.waitForTimeout(1500);
-  menuInfo = await page.evaluate(() => {
-    const m = document.querySelector("[role='menu']");
-    if (!m) return null;
-    return {
-      radios: [...m.querySelectorAll("[role='menuitemradio']")].map((el) => ({ label: (el.textContent || "").trim().slice(0, 30), checked: el.getAttribute("aria-checked") })),
-      sliders: [...m.querySelectorAll("[role='slider']")].map((el) => ({ now: el.getAttribute("aria-valuenow"), max: el.getAttribute("aria-valuemax") })),
-    };
-  });
+  // r48.3 hardening (2026-11-14 live): fresh page hydration needs retries; the radix
+  // menu renders into popper wrappers, not always [role=menu]. Same recipe as the
+  // field-proven hardened dispatcher: 3 attempts x (hydration wait + native click +
+  // multi-wrapper radios poll), Escape between attempts.
+  for (let attempt = 0; attempt < 3 && !menuInfo; attempt++) {
+    if (attempt > 0) {
+      try { await page.keyboard.press("Escape"); } catch {}
+      await page.waitForTimeout(2000);
+    }
+    for (let hw = 0; hw < 20; hw++) {
+      const bl = await page.evaluate(() => (document.body ? document.body.innerText.length : 0));
+      if (bl > 5000) break;
+      await page.waitForTimeout(1500);
+    }
+    let clicked = false;
+    try { await page.click('button[aria-label="选择 ChatGPT 模型"], button[aria-label="Model selector"]', { label: "open model menu", timeout: 8000 }); clicked = true; } catch {}
+    if (!clicked) {
+      await page.evaluate(() => {
+        const b = document.querySelector('button[aria-label="选择 ChatGPT 模型"], button[aria-label="Model selector"]');
+        if (b) b.click();
+      });
+    }
+    for (let poll = 0; poll < 8 && !menuInfo; poll++) {
+      await page.waitForTimeout(800);
+      menuInfo = await page.evaluate(() => {
+        const menus = [...document.querySelectorAll("[data-radix-popper-content-wrapper], [role='menu'], [role='dialog']")];
+        for (const m of menus) {
+          const radios = [...m.querySelectorAll("[role='menuitemradio']")].map((el) => ({ label: (el.textContent || "").trim().slice(0, 30), checked: el.getAttribute("aria-checked") }));
+          if (radios.length) return {
+            radios,
+            sliders: [...m.querySelectorAll("[role='slider']")].map((el) => ({ now: el.getAttribute("aria-valuenow"), max: el.getAttribute("aria-valuemax") })),
+          };
+        }
+        return null;
+      });
+    }
+  }
 } catch (error) {
   abort("LEVEL_GATE_MENU_UNAVAILABLE_STOP"); // dispatch surface unprovable here; do NOT send
 }

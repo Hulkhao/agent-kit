@@ -200,6 +200,7 @@ try {
   const code = isTaskSpaceTakeover(error) ? TASKSPACE_TAKEOVER_SIGNAL : "TASKSPACE_RECOVERY_FAILED";
   await writeState({ spaceId, probeFailed: true, recoveryFailed: true, errorCode: code, ...safeError(error) });
   await appendEvent(MON, code, { spaceId, ...safeError(error) });
+  console.log("RECOVERY_DETAIL=" + String(error && error.message || error).slice(0, 200));
   console.log("RESULT=" + code);
   process.exit(0);
 }
@@ -288,6 +289,7 @@ try {
   const code = takeover ? TASKSPACE_TAKEOVER_SIGNAL : "PAGE_RECOVERY_FAILED";
   await writeState({ spaceId, probeFailed: true, recoveryFailed: true, errorCode: code, ...safeError(error) });
   await appendEvent(MON, code, { spaceId, ...safeError(error) });
+  console.log("RECOVERY_DETAIL=" + String(error && error.message || error).slice(0, 200));
   console.log("RESULT=" + (takeover ? TASKSPACE_TAKEOVER_SIGNAL : "TASKSPACE_RECOVERY_FAILED"));
   process.exit(0);
 }
