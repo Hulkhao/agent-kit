@@ -1,5 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { mkdtemp, mkdir, rm, writeFile, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -287,15 +289,40 @@ test("watch and probe require a matching accepted ledger before touching browser
 
 test("ZCode hook blocks direct browser dispatch but preserves unrelated tools", () => {
   const ev = (tool_name, tool_input) => ({ hook_event_name: "PreToolUse", tool_name, tool_input });
+  const native = (toolName, toolInput) => ({ hookEventName: "PreToolUse", toolName, toolInput, toolCallId: "probe-1" });
+  assert.equal(checkDispatchTool(native("Bash", { command: "curl -X POST https://chatgpt.com/backend-api/conversation" })).hookSpecificOutput.permissionDecision, "deny");
+  assert.equal(checkDispatchTool(native("Bash", { command: "ego-browser nodejs -e run" })).hookSpecificOutput.permissionDecision, "deny");
+  assert.equal(checkDispatchTool(native("Read", { file_path: "allow.txt" })), null);
+  assert.equal(checkDispatchTool({ hookEventName: "PreToolUse", toolInput: { command: "curl -X POST https://chatgpt.com/backend-api/conversation" }, toolCallId: "probe-2" }).hookSpecificOutput.permissionDecision, "deny");
+  assert.equal(checkDispatchTool({ hookEventName: "PreToolUse", toolInput: { command: "ego-browser nodejs -e run" }, toolCallId: "probe-3" }).hookSpecificOutput.permissionDecision, "deny");
+  assert.equal(checkDispatchTool({ hookEventName: "PreToolUse", toolInput: { file_path: "allow.txt" }, toolCallId: "probe-4" }), null);
   assert.equal(checkDispatchTool(ev("Bash", { command: "ego-browser nodejs < rogue.mjs" })).hookSpecificOutput.permissionDecision, "deny");
   assert.equal(checkDispatchTool(ev("mcp__ego_browser", { url: "https://chatgpt.com/c/123" })).hookSpecificOutput.permissionDecision, "deny");
   assert.equal(checkDispatchTool(ev("Bash", { command: "node monitor/dispatch-manager.mjs send --monitor-dir .monitor" })), null);
+  assert.equal(checkDispatchTool(ev("Bash", { command: "node C:\\tmp\\ego-browser-bypass-probe.mjs open https://chatgpt.com" })).hookSpecificOutput.permissionDecision, "deny");
+  assert.equal(checkDispatchTool({ hookEventName: "PreToolUse", toolInput: { command: "node C:\\tmp\\ego-browser-bypass-probe.mjs open https://chatgpt.com" }, toolCallId: "probe-5" }).hookSpecificOutput.permissionDecision, "deny");
+  assert.equal(checkDispatchTool(ev("Bash", { command: "node monitor/dispatch-manager.mjs --help" })), null);
   assert.equal(checkDispatchTool(ev("Bash", { command: "ego-browser skill" })), null);
   assert.equal(checkDispatchTool(ev("mcp__ego_browser", { url: "https://example.com" })), null);
   assert.equal(checkDispatchTool(ev("Read", { file_path: "README.md" })), null);
   assert.equal(checkDispatchTool(ev("Bash", { command: "curl -X POST https://chatgpt.com/backend-api/conversation" })).hookSpecificOutput.permissionDecision, "deny");
   assert.equal(checkDispatchTool(ev("PowerShell", { command: "Invoke-RestMethod -Method Post -Uri https://chatgpt.com/backend-api/conversation" })).hookSpecificOutput.permissionDecision, "deny");
   assert.equal(checkDispatchTool(ev("Bash", { command: "curl https://chatgpt.com/backend-api/conversation" })), null);
+});
+
+test("ZCode PreToolUse process entry handles native camelCase hook events", () => {
+  const script = new URL("../plugins/chatgpt-dispatch-guard/hooks/pre-tool-use.mjs", import.meta.url);
+  const check = (toolName, command) => {
+    const event = { hookEventName: "PreToolUse", toolName, toolInput: { command }, toolCallId: "probe" };
+    const result = spawnSync(process.execPath, [fileURLToPath(script)], {
+      input: JSON.stringify(event), encoding: "utf8", windowsHide: true,
+    });
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout ? JSON.parse(result.stdout).hookSpecificOutput.permissionDecision : null;
+  };
+  assert.equal(check("Bash", "curl -X POST https://chatgpt.com/backend-api/conversation"), "deny");
+  assert.equal(check("Bash", "ego-browser nodejs -e run"), "deny");
+  assert.equal(check("Read", "allow.txt"), null);
 });
 
 test("user hook installer keeps existing hook rules, makes a backup and does not duplicate", async () => {

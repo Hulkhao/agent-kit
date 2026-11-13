@@ -5,14 +5,17 @@ const blocked = (reason) => ({ hookSpecificOutput: {
 } });
 
 export function checkDispatchTool(event) {
-  if (event?.hook_event_name !== "PreToolUse") return null;
-  const name = String(event.tool_name || "");
-  const input = event.tool_input || {};
+  if ((event?.hookEventName ?? event?.hook_event_name) !== "PreToolUse") return null;
+  const name = String(event.toolName ?? event.tool_name ?? "");
+  const input = event.toolInput ?? event.tool_input ?? {};
   const raw = JSON.stringify(input);
   const browserTool = /(?:ego.browser|browser|playwright|puppeteer)/i.test(name);
   const browserTarget = /chatgpt\.com|chat\.openai\.com|taskSpace\s*\(|listTaskSpaces\s*\(/i.test(raw);
   if (browserTool && browserTarget) return blocked("CHATGPT_DISPATCH_MANAGER_REQUIRED: use the managed web dispatch entry point");
-  const shellTool = /(?:bash|shell|terminal|exec|powershell|command)/i.test(name);
+  // ZCode's native PreToolUse payload can omit toolName. A command-shaped
+  // toolInput still identifies shell execution without guessing from content.
+  const shellTool = /(?:bash|shell|terminal|exec|powershell|command)/i.test(name)
+    || typeof input.command === "string" || typeof input.cmd === "string";
   if (!shellTool) return null;
   // Shell-driven HTTP writes bypass the visual composer, readback and ledger.
   // Restrict this guard to commands that explicitly target ChatGPT backend APIs.
@@ -22,8 +25,12 @@ export function checkDispatchTool(event) {
     return blocked("CHATGPT_DISPATCH_MANAGER_REQUIRED: direct ChatGPT backend API write denied");
   }
   // Protect both direct calls and generated one-off scripts whose command line
-  // explicitly launches the browser automation runtime.
-  if (/\bego-browser\s+(?:nodejs|run|eval)\b/i.test(raw)) return blocked("CHATGPT_DISPATCH_MANAGER_REQUIRED: direct ego-browser invocation denied");
+  // explicitly launches the browser automation runtime. Beyond the bare CLI
+  // subcommands, `node <…ego-browser…>.mjs` script launches must also deny.
+  if (/\bego-browser\s+(?:nodejs|run|eval)\b/i.test(raw) ||
+      /\b(?:node|npx)\b[^|;&>]*ego[-_]?browser[^|;&>]*\.(?:mjs|cjs|js)\b/i.test(raw)) {
+    return blocked("CHATGPT_DISPATCH_MANAGER_REQUIRED: direct ego-browser invocation denied");
+  }
   if (browserTarget && /(?:nodejs\s+-e|eval\s*\(|page\.goto\s*\(|page\.evaluate\s*\(|cdp\s*\()/i.test(raw)) {
     return blocked("CHATGPT_DISPATCH_MANAGER_REQUIRED: ad-hoc ChatGPT browser script denied");
   }

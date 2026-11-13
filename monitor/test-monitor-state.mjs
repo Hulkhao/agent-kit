@@ -591,16 +591,21 @@ test("restart reconciliation refuses to accept a composer draft that survived go
 
 // ---- R2.4.1 regression: unified structural readiness, 429 single-retry, timeOrigin failure ----
 
-test("chatSurfaceReady: STAY passes on short body; navigated rounds need body > 600", () => {
+test("chatSurfaceReady: STAY passes on short body; navigated rounds need body > 600 or a real message tail", () => {
   const ok = { hostOk: true, composerCount: 1 };
   // STAY + bodyLen 43 / 500 with intact structure: pass (planner acceptance rows 1-2)
   assert.equal(chatSurfaceReady({ ...ok, bodyLen: 43, navigatedThisRound: false }), true);
   assert.equal(chatSurfaceReady({ ...ok, bodyLen: 500, navigatedThisRound: false }), true);
-  // STAY round that recovered via navigation + bodyLen 500: fail (row 3)
+  // navigated + bodyLen 500 without any conversation tail: fail (empty shell / 429 page)
   assert.equal(chatSurfaceReady({ ...ok, bodyLen: 500, navigatedThisRound: true }), false);
-  // RECOVER + bodyLen 500: fail (row 4)
-  assert.equal(chatSurfaceReady({ ...ok, bodyLen: 500, navigatedThisRound: true }), false);
-  // navigated + bodyLen > 600: pass
+  assert.equal(chatSurfaceReady({ ...ok, bodyLen: 500, navigatedThisRound: true, lastMessageRole: null }), false);
+  // round-8 repro: short conversation (bodyLen=482) with a real assistant tail is ready
+  assert.equal(chatSurfaceReady({ ...ok, bodyLen: 482, navigatedThisRound: true, lastMessageRole: "assistant" }), true);
+  assert.equal(chatSurfaceReady({ ...ok, bodyLen: 300, navigatedThisRound: true, lastMessageRole: "user" }), true);
+  // non-conversation roles never qualify as message evidence
+  assert.equal(chatSurfaceReady({ ...ok, bodyLen: 500, navigatedThisRound: true, lastMessageRole: "system" }), false);
+  assert.equal(chatSurfaceReady({ ...ok, bodyLen: 500, navigatedThisRound: true, lastMessageRole: "" }), false);
+  // navigated + bodyLen > 600: pass regardless of tail (long conversations unchanged)
   assert.equal(chatSurfaceReady({ ...ok, bodyLen: 601, navigatedThisRound: true }), true);
   // structure missing is never ready regardless of body length
   assert.equal(chatSurfaceReady({ hostOk: true, composerCount: 0, bodyLen: 5000, navigatedThisRound: false }), false);

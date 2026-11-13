@@ -35,6 +35,12 @@ node monitor/dispatch-manager.mjs watch --monitor-dir <项目监控目录> --age
 
 退出码和 `WAKE_SUPERVISOR` 输出需要宿主实际转交给 Agent 才构成唤醒。未验证宿主退出通知时，不能声称已完成自动接棒。
 
+## ZCode 文件回执按需接棒
+
+需要等待 ZCode 文件回执时，手动运行 `monitor/start-zcode-reply-watcher.ps1`。监听 `D:\Downloads\zcode-codex交流\replies\` 中完整的 `<请求名>.reply.md`，延迟约两分钟后，通过 Codex CLI 请求原会话接棒。**默认不运行、不随 Windows 登录启动**。启动命令、状态与日志位置、已有测试及尚未通过的真实唤醒验收见 [`monitor/ZCODE-REPLY-WATCHER.md`](monitor/ZCODE-REPLY-WATCHER.md)。
+
+ZCode 接单后先原子写入 `replies/<请求名>.ack.md`（末行 `ACK`），再执行实际任务。Codex 监听器收到 ACK 后立即记录 `ACK_RECEIVED`，完成回执仍独立使用 `.reply.md`（末行 `DONE`），延迟两分钟后才触发接棒。
+
 ## ChatGPT 网页派单治理目标与复核表
 
 以下六项是本 Skill 的**长期验收合同**。Skill 维护 Agent 在修改派单逻辑、处理相关 Issue、准备发布时逐项复核；使用本 Skill 的 Agent 在实际运行中发现偏差时按表取证并上报。每项只按**可复现的行为与证据**判定，不以代码存在、测试用例通过或 Agent 自述代替端到端结果。

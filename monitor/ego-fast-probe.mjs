@@ -462,7 +462,7 @@ async function readPage() {
 async function waitForKnownUi(rounds = 10) {
   for (let i = 0; i < rounds; i++) {
     const sample = await readPage();
-    if (sample.hostOk && sample.bodyLen > 600 && sample.composerCount > 0) return sample;
+    if (isChatSurfaceReady(sample)) return sample;
     if (i + 1 < rounds) await page.waitForTimeout(4000);
   }
   return await readPage();

@@ -159,8 +159,15 @@ export function decideRoundKind({ urlMatches, navRefAt = null, now = Date.now(),
 
 // Unified structural readiness (R2.4.1): any navigation this round (fresh load) must also pass
 // the body-readiness gate; stay-on-page reads only need the chat structure.
-export function chatSurfaceReady({ hostOk, composerCount, bodyLen = 0, navigatedThisRound = false } = {}) {
-  return Boolean(hostOk === true && composerCount > 0 && (!navigatedThisRound || bodyLen > 600));
+// A freshly navigated short conversation has a small body but a real conversation tail
+// (lastMessageRole from the data-content-search-unit-key contract). Absolute byte floors
+// misclassify such sessions as structurally unavailable (round-8 repro: bodyLen=482,
+// hostOk, composer, main all intact). A real message tail is equivalent evidence of a
+// live chat surface; empty shells and 429 pages have neither composer nor message tail.
+const CONVERSATION_ROLES = new Set(["user", "assistant"]);
+export function chatSurfaceReady({ hostOk, composerCount, bodyLen = 0, navigatedThisRound = false, lastMessageRole = null } = {}) {
+  return Boolean(hostOk === true && composerCount > 0 &&
+    (!navigatedThisRound || bodyLen > 600 || CONVERSATION_ROLES.has(lastMessageRole)));
 }
 
 // 429/load-storm single-recovery scheduler (R2.4.1.1): a fresh probe process consults this
