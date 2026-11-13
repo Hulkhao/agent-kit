@@ -8,7 +8,7 @@ import { dirname, join, resolve, isAbsolute } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
 import { tick, acknowledge } from "./supervision-watchdog.mjs";
-import { readDispatchState, markCompleted, writeJsonAtomic } from "./dispatch-state.mjs";
+import { readDispatchState, markCompleted, writeJsonAtomic, validateDispatchRecord } from "./dispatch-state.mjs";
 import { verifiedReply, acknowledgeReply, verifiedConsumption, sha256 } from "./reply-delivery.mjs";
 
 const sourceDir = dirname(fileURLToPath(import.meta.url));
@@ -22,6 +22,7 @@ const adapter = {
   "REPLACE_WITH_MESSAGE_FILE_PATH": "message",
   "REPLACE_WITH_ATTACHMENTS_JSON": "attachments",
   "REPLACE_WITH_NEW_CHAT_FLAG": "newChat",
+  "REPLACE_WITH_RECOVER_ONLY": "recoverOnly",
 };
 const templates = {
   send: join(kitDir, "skills/chatgpt-web-dispatch/templates/dispatch-round.template.mjs"),
@@ -30,7 +31,7 @@ const templates = {
   collect: join(sourceDir, "collect-reply.template.mjs"),
 };
 const modules = ["agent-space.mjs", "dispatch-state.mjs", "reply-delivery.mjs", "page-recovery.mjs", "state-schema.mjs", "taskspace-takeover.mjs", "supervision-policy.mjs"];
-const allowed = new Set(["send", "send-new", "probe", "watch", "collect", "consume", "release", "ack"]);
+const allowed = new Set(["send", "send-new", "recover-draft", "probe", "watch", "collect", "consume", "release", "ack"]);
 const uuid = /^[a-f\d]{8}-[a-f\d]{4}-[1-8][a-f\d]{3}-[89ab][a-f\d]{3}-[a-f\d]{12}$/i;
 
 export function parseArgs(args) {
@@ -40,7 +41,7 @@ export function parseArgs(args) {
   const params = { action };
   for (let i = 0; i < rest.length; i += 2) {
     const key = rest[i];
-    if (!/^--(?:agent-id|space|conversation|request-id|message|attachments-file|monitor-dir|wake-id|ack-action|reply-sha256)$/.test(key) || !rest[i + 1] ||
+    if (!/^--(?:agent-id|space|conversation|request-id|message|attachments-file|monitor-dir|wake-id|ack-action|reply-sha256|archived-record)$/.test(key) || !rest[i + 1] ||
         Object.hasOwn(params, key.slice(2))) throw new Error("MANAGER_ARG_INVALID");
     const normalized = key.replace(/^--/, "").replace(/-([a-z])/g, (_, c) => c.toUpperCase());
     params[normalized] = rest[i + 1];
@@ -48,6 +49,7 @@ export function parseArgs(args) {
   if (!params.monitorDir) throw new Error("MONITOR_DIR_REQUIRED");
   params.monitorDir = resolve(params.monitorDir);
   params.newChat = action === "send-new";
+  params.recoverOnly = action === "recover-draft";
   if (params.newChat && !params.conversation && uuid.test(params.requestId || "")) params.conversation = params.requestId;
   if (!params.agentId || !/^[a-z0-9][a-z0-9_.-]{1,63}$/i.test(params.agentId) ||
     !params.space || params.space.length > 120 || !uuid.test(params.conversation) ||
@@ -55,8 +57,9 @@ export function parseArgs(args) {
     (!params.newChat && params.requestId)) throw new Error("MANAGER_IDENTITY_INVALID");
   if (action === "ack" && (!params.wakeId || !["investigated", "resolved"].includes(params.ackAction))) throw new Error("ACK_ARGS_INVALID");
   if (action === "consume" && !/^[\da-f]{64}$/i.test(params.replySha256 || "")) throw new Error("REPLY_SHA256_REQUIRED");
-  if (["send", "send-new"].includes(action) && !params.message) throw new Error("MESSAGE_REQUIRED");
+  if (["send", "send-new", "recover-draft"].includes(action) && !params.message) throw new Error("MESSAGE_REQUIRED");
   if (params.attachmentsFile && !["send", "send-new"].includes(action)) throw new Error("ATTACHMENTS_SEND_ONLY");
+  if (params.archivedRecord && !params.recoverOnly) throw new Error("ARCHIVED_RECORD_RECOVERY_ONLY");
   return params;
 }
 
@@ -64,8 +67,8 @@ export function adaptTemplate(source, params) {
   let result = source;
   for (const [token, key] of Object.entries(adapter)) {
     if (result.includes(token)) {
-      if (key === "newChat") {
-        result = result.replaceAll('"' + token + '"', params.newChat ? "true" : "false");
+      if (key === "newChat" || key === "recoverOnly") {
+        result = result.replaceAll('"' + token + '"', params[key] ? "true" : "false");
       } else if (key === "attachments") {
         if (!Array.isArray(params.attachments)) throw new Error("ADAPTER_ATTACHMENTS_INVALID");
         result = result.replaceAll('"' + token + '"', JSON.stringify(params.attachments));
@@ -345,6 +348,20 @@ export async function main(args = process.argv.slice(2)) {
     ? await requireArmedDispatch(dir, p, p.action) : null;
   await ensureMonitor(dir);
   p.monitorDir = dir;
+  if (p.recoverOnly && p.archivedRecord) {
+    const originalPayload = await readFile(resolve(p.message), "utf8");
+    const archived = JSON.parse(await readFile(resolve(p.archivedRecord), "utf8"));
+    if (!validateDispatchRecord(archived) || archived.status !== "PREPARED" ||
+        archived.conversationUuid.toLowerCase() !== p.conversation.toLowerCase() ||
+        archived.taskSpace !== p.space || archived.payload_sha256 !== sha256(originalPayload)) {
+      throw new Error("ARCHIVED_PREPARED_IDENTITY_MISMATCH");
+    }
+    // Exclusive creation prevents replacing another dispatch's ledger.
+    const handle = await open(join(dir, "a-dispatch-state.json"), "wx", 0o600);
+    try { await handle.writeFile(JSON.stringify(archived)); }
+    finally { await handle.close(); }
+    await readDispatchState(dir);
+  }
   if (p.action === "collect") return collectCompleted(p, dir);
   if (p.action === "release") {
     const record = await readDispatchState(dir);
@@ -388,14 +405,19 @@ export async function main(args = process.argv.slice(2)) {
       await new Promise((res) => setTimeout(res, 60_000));
     }
   }
-  const file = p.newChat ? templates.send : templates[p.action];
+  const file = p.newChat || p.recoverOnly ? templates.send : templates[p.action];
   const template = await readFile(file, "utf8");
-  if (["send", "send-new"].includes(p.action)) {
+  if (["send", "send-new", "recover-draft"].includes(p.action)) {
     p.message = resolve(p.message);
     p.attachments = await loadAttachments(p.attachmentsFile);
   }
   if (p.action === "probe") await writeFile(join(dir, "a-watch-uuid.txt"), p.conversation + "\n", "utf8");
   const observation = await runEgo(adaptTemplate(template, p), dir, p.action);
+  if (p.recoverOnly) {
+    const recovered = await readDispatchState(dir);
+    return observation.code === 0 && observation.result === "OWNED_DRAFT_CLEARED" &&
+      recovered?.status === "ABORTED" && recovered.payload_sha256 === sha256(await readFile(p.message, "utf8")) ? 0 : 2;
+  }
   if (p.newChat) {
     // Bind only after the standard template has persisted acceptance and a
     // browser-derived conversation UUID. Failures retain the pending ledger.

@@ -30,7 +30,7 @@ metadata:
 
 **行为口径**：本机没有该配置文件或字段缺失 → `ACCOUNT_CONFIG_MISSING_STOP` / `ACCOUNT_CONFIG_INCOMPLETE_STOP`，**立即停止报人，不猜测账号**；页面实测账号与钉扎不符 → `ACCOUNT_MISMATCH_STOP`。**新建空间**一律 `taskSpace(名字, { profileId })` 带上钉扎的 profile；**旧空间无法换账号**——核对不符只能换空间名重建或人工登录正确账号。
 
-**TaskSpace 归属**：一个 Agent 固定一个空间，任务各占一个 Page；空间显示名可用中文（如 `GDC-本地执行A`），技术归属使用跨任务稳定的 `AGENT_ID`。派单、探测、监管、回复提取和释放统一通过 `monitor/dispatch-manager.mjs` 的 `send/send-new/probe/watch/collect/consume/release/ack` 执行；新会话 `send-new` 必须带稳定的 `--request-id`，返回真实会话 UUID 后使用该 UUID 监控。完成候选唤醒后，Agent `collect` 并读取完整回执，再 `consume --reply-sha256`，最后 `release`。同一 Agent 创建第二空间或抢用别人的空间直接 STOP。旧空间照原名复用，不擅自迁移。
+**TaskSpace 归属**：一个 Agent 固定一个空间，任务各占一个 Page；空间显示名可用中文（如 `GDC-本地执行A`），技术归属使用跨任务稳定的 `AGENT_ID`。派单、探测、监管、回复提取和释放统一通过 `monitor/dispatch-manager.mjs` 的 `send/send-new/recover-draft/probe/watch/collect/consume/release/ack` 执行；中断的 PREPARED 草稿仅按手册 §3.1 用 `recover-draft` 验证归属后清理。新会话 `send-new` 必须带稳定的 `--request-id`，返回真实会话 UUID 后使用该 UUID 监控。完成候选唤醒后，Agent `collect` 并读取完整回执，再 `consume --reply-sha256`，最后 `release`。同一 Agent 创建第二空间或抢用别人的空间直接 STOP。旧空间照原名复用，不擅自迁移。
 
 校验工具：本仓库 `monitor/ego-profile-check.mjs`（`ego-browser nodejs < ego-profile-check.mjs`，MODE=list/init/verify，详见文件头注释）。
 

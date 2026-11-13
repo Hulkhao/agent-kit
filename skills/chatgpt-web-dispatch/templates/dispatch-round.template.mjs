@@ -16,6 +16,7 @@ const MSG_FILE = "REPLACE_WITH_MESSAGE_FILE_PATH"; // UTF-8 file holding the pay
 const CONV = "REPLACE_WITH_CONVERSATION_UUID"; // page located by URL containing CONV, never by label
 const ATTACHMENTS = "REPLACE_WITH_ATTACHMENTS_JSON"; // managed JSON array of absolute file paths
 const NEW_CHAT = "REPLACE_WITH_NEW_CHAT_FLAG"; // true only for a durable send-new request
+const RECOVER_ONLY = "REPLACE_WITH_RECOVER_ONLY"; // clear only a verified PREPARED draft
 
 if ([MON, SPACE, CONV, AGENT_ID].some((v) => v.startsWith("REPLACE_")) || MSG_FILE.startsWith("REPLACE_")) {
   console.log("RESULT=ADAPTATION_REQUIRED");
@@ -29,11 +30,11 @@ import { homedir } from "node:os";
 import { unlinkSync, readFileSync } from "node:fs";
 
 const {
-  appendEvent, prepareDispatch, markSendStarted, markAccepted, markUncertain,
+  appendEvent, prepareDispatch, markSendStarted, markAccepted, markUncertain, abortPreparedDispatch,
   writeJsonAtomic,
   readComposerSurface, readDispatchState,
   dispatchStopSnapshot,
-  chunkPayload, readbackMatches, readbackMode, classifyChunkReadback, verifyDraftOwnership,
+  chunkPayload, readbackMatches, readbackMode, classifyChunkReadback, verifyDraftOwnership, composerReadbackText,
   getFillCount, recordFillAttempt, resetFillCount,
   markComposerFreeze, findUnconsumedComposerFreeze,
   dispatchStormGate,
@@ -206,8 +207,16 @@ const evaluateComposer = (action, text = "") => page.evaluate(({ sel, action, te
   const tier = tiers.find((matches) => matches.length > 0);
   const el = tier?.length === 1 ? tier[0] : null; // multiple matches at the highest tier are unsafe
   if (!el) return action === "read" ? "" : false;
-  if (action === "read") return el.tagName === "TEXTAREA" || el.tagName === "INPUT"
-    ? (el.value || "") : (document.activeElement === el ? el.innerText : null) || el.innerText || "";
+  if (action === "read") {
+    if (el.tagName === "TEXTAREA" || el.tagName === "INPUT") return el.value || "";
+    const nodes = [...(el.childNodes || [])];
+    const paragraphs = nodes.length && nodes.every((node) =>
+      (node.nodeType === 1 && node.tagName === "P") ||
+      (node.nodeType === 3 && !(node.textContent || "").trim()))
+      ? nodes.filter((node) => node.nodeType === 1).map((node) => node.innerText ?? node.textContent ?? "")
+      : null;
+    return { raw: el.innerText || "", paragraphs };
+  }
   el.focus();
   const range = document.createRange();
   range.selectNodeContents(el);
@@ -221,7 +230,7 @@ const evaluateComposer = (action, text = "") => page.evaluate(({ sel, action, te
   return false;
 }, { sel: COMPOSER_SEL, action, text });
 
-const readRaw = () => composerOp(() => evaluateComposer("read"));
+const readRaw = async () => composerReadbackText(await composerOp(() => evaluateComposer("read")));
 const ensureFocused = async () => {
   await page.cdp("Page.bringToFront");
   const focused = await composerOp(() => page.evaluate(() => document.hasFocus()));
@@ -272,6 +281,7 @@ catch (error) { abort("DISPATCH_LEDGER_READ_FAILED"); }
 
 // Resume only a PREPARED record of THIS exact payload (interrupted dispatch of the same message).
 const resume = existing?.status === "PREPARED" && existing.payload_sha256 === payloadHash;
+if (RECOVER_ONLY && (!resume || NEW_CHAT || ATTACHMENTS.length)) abort("RECOVERY_REQUIRES_MATCHING_PREPARED");
 if (existing && ["SEND_STARTED", "ACCEPTED", "UNCERTAIN", "RETRY_AUTHORIZED"].includes(existing.status)) {
   abort("DISPATCH_IN_FLIGHT_" + existing.status); // already sent: acceptance reconciliation only
 }
@@ -327,6 +337,12 @@ const ensureOwnEmptyComposer = async () => {
 const evaluateClearComposer = () => evaluateComposer("clear");
 
 await ensureOwnEmptyComposer(); // Gate 2 (initial)
+
+if (RECOVER_ONLY) {
+  await abortPreparedDispatch(MON, existing.dispatchId);
+  console.log("RESULT=OWNED_DRAFT_CLEARED");
+  process.exit(0);
+}
 
 if (await getFillCount(MON, SPACE) >= 3) { // Gate 3 (FRESHEN)
   await checkStorm();

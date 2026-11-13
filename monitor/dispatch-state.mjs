@@ -123,8 +123,8 @@ export async function readComposerSurface(page) {
   });
 }
 
-function validateDispatchRecord(record) {
-  const statuses = new Set(["PREPARED", "SEND_STARTED", "ACCEPTED", "UNCERTAIN", "COMPLETED", "RETRY_AUTHORIZED"]);
+export function validateDispatchRecord(record) {
+  const statuses = new Set(["PREPARED", "SEND_STARTED", "ACCEPTED", "UNCERTAIN", "COMPLETED", "RETRY_AUTHORIZED", "ABORTED"]);
   return Boolean(record && typeof record === "object" && !Array.isArray(record) &&
     record.schema === "ego-dispatch-state/v2" &&
     typeof record.dispatchId === "string" && typeof record.conversationUuid === "string" &&
@@ -234,6 +234,14 @@ async function transition(monitorDir, dispatchId, allowed, status, fields = {}) 
 export async function markSendStarted(monitorDir, dispatchId) {
   return transition(monitorDir, dispatchId, ["PREPARED", "RETRY_AUTHORIZED"], "SEND_STARTED", {
     sendStartedAt: Date.now(),
+  });
+}
+
+// A proved, unsent PREPARED draft can be cancelled after the browser has
+// cleared it and verified that it stayed empty. Preserve the ledger identity.
+export async function abortPreparedDispatch(monitorDir, dispatchId) {
+  return transition(monitorDir, dispatchId, ["PREPARED"], "ABORTED", {
+    abortedAt: Date.now(), reasonCode: "OWNED_DRAFT_RECOVERED",
   });
 }
 
@@ -409,6 +417,18 @@ export function chunkPayload(text, byteLimit = 1200, targetChars = 600) {
 export function collapseComposerArtifacts(text) {
   if (typeof text !== "string") return "";
   return text.replace(/\s+/g, " ");
+}
+
+// ProseMirror represents line breaks as sibling <p> nodes. Reading the whole
+// contenteditable with innerText can add a *second* newline at those boundaries.
+// Only reconstruct from a verified top-level paragraph structure. Unknown DOM
+// shapes retain their raw readback and still fail the strict fidelity gate.
+export function composerReadbackText(snapshot) {
+  if (typeof snapshot === "string") return snapshot;
+  if (Array.isArray(snapshot?.paragraphs) && snapshot.paragraphs.every((p) => typeof p === "string")) {
+    return snapshot.paragraphs.join("\n");
+  }
+  return typeof snapshot?.raw === "string" ? snapshot.raw : "";
 }
 
 // R2.5-F sensitive-content gate: URLs, fenced code, and command lines cannot tolerate any

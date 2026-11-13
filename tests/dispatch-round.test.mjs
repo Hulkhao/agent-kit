@@ -91,6 +91,18 @@ test("two-level readback: strict for sensitive payloads, normalized only for pla
   assert.match(src, /classifyChunkReadback\(expectedPrefix, nextPrefix, composerText, fillReadbackMode\)/);
 });
 
+test("#30: URL strict readback reconstructs paragraph text and recover-only stops before fill", async () => {
+  const src = await template();
+  assert.match(src, /const paragraphs = nodes\.length && nodes\.every/);
+  assert.match(src, /composerReadbackText\(await composerOp\(\(\) => evaluateComposer\("read"\)\)\)/);
+  const clearAt = src.indexOf("await ensureOwnEmptyComposer(); // Gate 2 (initial)");
+  const cancelAt = src.indexOf("abortPreparedDispatch(MON, existing.dispatchId)");
+  const fillAt = src.indexOf("recordFillAttempt(MON, SPACE)");
+  assert.ok(clearAt > 0 && cancelAt > clearAt && fillAt > cancelAt);
+  assert.match(src, /if \(RECOVER_ONLY && \(!resume \|\| NEW_CHAT \|\| ATTACHMENTS\.length\)\) abort\("RECOVERY_REQUIRES_MATCHING_PREPARED"\)/);
+  assert.match(src, /console\.log\("RESULT=OWNED_DRAFT_CLEARED"\)/);
+});
+
 test("r44 P0-B1: exactly ONE navigation channel — page.goto appears only inside navigate(reason)", async () => {
   const src = await template();
   const gotos = [...src.matchAll(/await page\.goto\(/g)].map((m) => m.index);
@@ -150,7 +162,7 @@ test("agent-kit#7: level-gate entry is fail-closed (no silent skip) and bilingua
   assert.match(src, /abort\("LEVEL_GATE_MENU_UNAVAILABLE_STOP"\)/);
   const gate7 = src.slice(src.indexOf("Gate 7"), src.indexOf("Gate 8"));
   assert.match(gate7, /!menuInfo \|\| !modelOk \|\| !levelOk/, "missing menu must abort, not pass");
-  assert.match(src, /const readRaw = \(\) => composerOp\(\(\) => evaluateComposer\("read"\)\)/);
+  assert.match(src, /const readRaw = async \(\) => composerReadbackText\(await composerOp\(\(\) => evaluateComposer\("read"\)\)\)/);
   assert.match(src, /const evaluateClearComposer = \(\) => evaluateComposer\("clear"\)/);
   assert.match(src, /await page\.cdp\("Input\.insertText", \{ text: chunk \}\)/);
   assert.doesNotMatch(src, /document\.querySelector\(COMPOSER_SEL\)/);
@@ -239,9 +251,9 @@ test("#26: every STOP is classified by the current dispatch identity and send st
 
 // Execute the template's actual browser-side callback against a minimal DOM, not a copy of its
 // selector rules. querySelectorAll returns document order (Edit code precedes the real Composer).
-function composerNode({ label = null, id = "", testid = null, visible = true, text = "", tagName = "DIV" } = {}) {
+function composerNode({ label = null, id = "", testid = null, visible = true, text = "", tagName = "DIV", childNodes } = {}) {
   return {
-    id, tagName, innerText: text, value: text, offsetParent: visible ? {} : null,
+    id, tagName, innerText: text, value: text, childNodes, offsetParent: visible ? {} : null,
     getClientRects: () => visible ? [{}] : [],
     getAttribute: (key) => ({ "aria-label": label, "data-testid": testid })[key] ?? null,
     matches: (selector) => selector === '[contenteditable="true"][role="textbox"]' && tagName === "DIV",
@@ -252,7 +264,7 @@ function composerNode({ label = null, id = "", testid = null, visible = true, te
 async function composerHarness(nodes) {
   const src = await template();
   const start = src.indexOf('const evaluateComposer = (action, text = "") => page.evaluate(');
-  const end = src.indexOf('const readRaw = () =>', start);
+  const end = src.indexOf('const readRaw = async () =>', start);
   assert.ok(start > 0 && end > start, "expected browser composer implementation in template");
   let selected = null;
   const document = {
@@ -309,11 +321,11 @@ test("agent-kit#14: Edit code before Composer cannot intercept read, clear or Ga
   const editor = composerNode({ label: "Edit code", text: "editor source" });
   const composer = composerNode({ label: "Ask ChatGPT", text: "old owned draft" });
   const evaluateComposer = await composerHarness([editor, composer]);
-  assert.equal(await evaluateComposer("read"), "old owned draft");
+  assert.equal((await evaluateComposer("read")).raw, "old owned draft");
   assert.equal(await evaluateComposer("clear"), true);
   assert.equal(composer.innerText, "");
   await evaluateComposer.insertChunk("new payload");
-  assert.equal(await evaluateComposer("read"), "new payload");
+  assert.equal((await evaluateComposer("read")).raw, "new payload");
   assert.equal(editor.innerText, "editor source", "Edit code must never be modified");
   assert.equal(editor.focused, undefined, "Edit code must never receive focus");
 });
@@ -323,14 +335,14 @@ test("agent-kit#14: id/testid, visibility, generic fallback, and ambiguity fail-
   const hidden = composerNode({ label: "Ask ChatGPT", visible: false });
   const byId = composerNode({ id: "prompt-textarea", text: "id target" });
   const idTier = await composerHarness([editor, hidden, byId]);
-  assert.equal(await idTier("read"), "id target", "hidden aria-label must not beat visible id");
+  assert.equal((await idTier("read")).raw, "id target", "hidden aria-label must not beat visible id");
 
   const byTestid = composerNode({ testid: "prompt-textarea", text: "testid target" });
-  assert.equal(await (await composerHarness([editor, byTestid]))("read"), "testid target");
+  assert.equal((await (await composerHarness([editor, byTestid]))("read")).raw, "testid target");
 
   const fallback = composerNode({ text: "generic target" });
   const genericTier = await composerHarness([editor, fallback]);
-  assert.equal(await genericTier("read"), "generic target");
+  assert.equal((await genericTier("read")).raw, "generic target");
 
   const unsafe = await composerHarness([editor]);
   assert.equal(await unsafe("read"), "");
@@ -345,4 +357,22 @@ test("agent-kit#14: id/testid, visibility, generic fallback, and ambiguity fail-
   assert.equal(await ambiguous("clear"), false, "two labeled Composers cannot be resolved uniquely");
   assert.equal(await ambiguous("insert", "MUST NOT INSERT"), false);
   assert.equal(another.innerText, "other");
+});
+
+test("#30: real composer callback extracts top-level paragraphs for strict URL readback", async () => {
+  const { composerReadbackText, readbackMatches } = await import("../monitor/dispatch-state.mjs");
+  const original = "中文 http://example.com/a\n第二行";
+  const composer = composerNode({
+    label: "Ask ChatGPT", text: "中文 http://example.com/a\n\n第二行",
+    childNodes: [
+      { nodeType: 1, tagName: "P", innerText: "中文 http://example.com/a" },
+      { nodeType: 1, tagName: "P", innerText: "第二行" },
+    ],
+  });
+  const evaluate = await composerHarness([composer]);
+  assert.equal(readbackMatches(original, composerReadbackText(await evaluate("read"))), true);
+  composer.childNodes[1].innerText = "篡改第二行";
+  assert.equal(readbackMatches(original, composerReadbackText(await evaluate("read"))), false);
+  composer.childNodes = [{ nodeType: 1, tagName: "DIV", innerText: original }];
+  assert.equal(readbackMatches(original, composerReadbackText(await evaluate("read"))), false);
 });

@@ -898,6 +898,50 @@ test("composer artifact normalization is collapse-to-one-space and chunk readbac
   assert.equal(m.readbackMatches("$deploy --flag\nsecond line", "$deploy  --flag\nsecond line"), false);
 });
 
+test("#30: strict URL/CJK readback uses exact ProseMirror paragraph boundaries", async () => {
+  const m = await import("./dispatch-state.mjs");
+  const original = "第一段 http://example.com/a?x=1&y=2\n第二段内容\n第三段";
+  const innerText = "第一段 http://example.com/a?x=1&y=2\n\n第二段内容\n\n第三段";
+  const snapshot = { raw: innerText, paragraphs: ["第一段 http://example.com/a?x=1&y=2", "第二段内容", "第三段"] };
+  assert.equal(m.readbackMode(original), "strict");
+  assert.equal(m.classifyChunkReadback("", original, innerText, "strict"), "MISMATCH");
+  assert.equal(m.classifyChunkReadback("", original, m.composerReadbackText(snapshot), "strict"), "INSERTED");
+  assert.equal(m.composerReadbackText({ raw: innerText, paragraphs: null }), innerText);
+  assert.equal(m.readbackMatches(original, m.composerReadbackText({ ...snapshot,
+    paragraphs: ["第一段 http://example.com/a?x=1&y=3", "第二段内容", "第三段"] }), "strict"), false);
+  assert.equal(m.readbackMatches("$deploy --flag\nsecond", m.composerReadbackText({
+    raw: "$deploy --flag\n\nsecond", paragraphs: ["$deploy --flag", "second"],
+  }), "strict"), true);
+  assert.equal(m.readbackMatches("$deploy --flag\nsecond", m.composerReadbackText({
+    raw: "$deploy  --flag\n\nsecond", paragraphs: ["$deploy  --flag", "second"],
+  }), "strict"), false);
+});
+
+test("#30: only a PREPARED dispatch can be cancelled after owned draft recovery", async () => {
+  const m = await import("./dispatch-state.mjs");
+  const dir = await mkdtemp(join(tmpdir(), "ego-draft-recovery-"));
+  try {
+    const payload = "原始派单 http://example.com\n第二段";
+    const page = fakePage(makeSurface({ composerText: "" }));
+    const prepared = await m.prepareDispatch({ monitorDir: dir,
+      conversationUuid: "12345678-1234-1234-1234-123456789abc", taskSpace: "中文空间", pageLabel: "p1", page, payload });
+    const owned = m.verifyDraftOwnership({ draft: "原始派单 http://example.com", payload, record: prepared });
+    assert.equal(owned.owned, true);
+    assert.equal(m.verifyDraftOwnership({ draft: "其他人的文字", payload, record: prepared }).owned, false);
+    await assert.rejects(m.abortPreparedDispatch(dir, "other-dispatch"), /DISPATCH_ID_MISMATCH/);
+    const cancelled = await m.abortPreparedDispatch(dir, prepared.dispatchId);
+    assert.equal(cancelled.status, "ABORTED");
+    assert.equal(cancelled.payload_sha256, prepared.payload_sha256);
+    assert.equal((await m.readDispatchState(dir)).status, "ABORTED");
+    await assert.rejects(m.abortPreparedDispatch(dir, prepared.dispatchId), /DISPATCH_TRANSITION_REJECTED/);
+    assert.equal(m.verifyDraftOwnership({ draft: "原始派单", payload, record: { ...prepared, status: "SEND_STARTED" } }).owned, false);
+    const next = await m.prepareDispatch({ monitorDir: dir,
+      conversationUuid: prepared.conversationUuid, taskSpace: prepared.taskSpace,
+      pageLabel: "p1", page, payload: "第二版派单" });
+    assert.equal(next.status, "PREPARED");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
 test("verifyDraftOwnership: full/prefix for current dispatch, hash identity for historical, never substrings", async () => {
   const m = await import("./dispatch-state.mjs");
   const payload = "first paragraph of the dispatch\nsecond paragraph with more words here\nthird";

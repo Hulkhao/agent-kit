@@ -190,6 +190,43 @@ test("manager requires both browser success and matching accepted ledger", () =>
   assert.equal(classifyManagerResult("release", { code: 0, result: "AGENT_SPACE_RELEASED" }, null, params), 0);
 });
 
+test("#30: managed recovery needs original payload and a matching archived PREPARED identity", async () => {
+  const base = ["--monitor-dir", ".monitor", "--agent-id", "gdc-a", "--space", "GDC-执行A", "--conversation", uuid];
+  assert.throws(() => parseArgs(["recover-draft", ...base]), /MESSAGE_REQUIRED/);
+  assert.throws(() => parseArgs(["send", ...base, "--message", "v2.txt", "--archived-record", "old.json"]), /ARCHIVED_RECORD_RECOVERY_ONLY/);
+  assert.throws(() => parseArgs(["recover-draft", ...base, "--message", "v1.txt", "--attachments-file", "files.json"]), /ATTACHMENTS_SEND_ONLY/);
+  const p = parseArgs(["recover-draft", ...base, "--message", "v1.txt", "--archived-record", "old.json"]);
+  assert.equal(p.recoverOnly, true);
+  assert.equal(adaptTemplate('const RECOVER_ONLY = "REPLACE_WITH_RECOVER_ONLY";', p), "const RECOVER_ONLY = true;");
+});
+
+test("#30: malformed archived PREPARED cannot replace a live dispatch ledger", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ego-archived-guard-"));
+  const messageFile = join(root, "original.txt");
+  const archiveFile = join(root, "archived.json");
+  const payload = "发送 http://example.com/\n第二行";
+  const args = ["recover-draft", "--monitor-dir", root, "--agent-id", "gdc-a",
+    "--space", "GDC-执行A", "--conversation", uuid, "--message", messageFile,
+    "--archived-record", archiveFile];
+  const dir = join(root, "conversations", uuid);
+  const liveRecord = join(dir, "a-dispatch-state.json");
+  const valid = { schema: "ego-dispatch-state/v2", status: "PREPARED", dispatchId: uuid,
+    conversationUuid: uuid, taskSpace: "GDC-执行A", pageLabel: "p1",
+    baselineTailKey: null, baselineTailRole: null, baselineComposerLength: 0,
+    attempt: 1, createdAt: Date.now(), payload_sha256: sha256(payload) };
+  try {
+    await writeFile(messageFile, payload);
+    await writeFile(archiveFile, JSON.stringify({ ...valid, pageLabel: null }));
+    await assert.rejects(main(args), /ARCHIVED_PREPARED_IDENTITY_MISMATCH/);
+    await assert.rejects(readFile(liveRecord), { code: "ENOENT" });
+    await writeFile(archiveFile, JSON.stringify(valid));
+    await mkdir(dir, { recursive: true });
+    await writeFile(liveRecord, JSON.stringify({ ...valid, status: "ACCEPTED" }));
+    await assert.rejects(main(args), { code: "EEXIST" });
+    assert.equal((await readDispatchState(dir)).status, "ACCEPTED");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test("new chat binding verifies request identity before committing mapping and survives a replay", async () => {
   const root = await mkdtemp(join(tmpdir(), "ego-new-chat-"));
   const requestId = uuid;
