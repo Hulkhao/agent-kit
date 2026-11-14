@@ -281,11 +281,18 @@ export async function ensureMonitor(dir) {
 
 export function readEgoOutcome(child, emitOutput) {
   let tail = "";
-  child.stdout.on("data", (chunk) => {
-    const output = chunk.toString("utf8");
-    emitOutput(output);
-    tail = (tail + output).slice(-65536);
-  });
+  // ego-browser wrappers may relay the inner script's console.log through
+  // stderr (observed 2026-11-14: probe stdout reached the terminal but never
+  // the piped stream, so every RESULT= parse returned null and the watch loop
+  // exited on its first GENERATING poll — agent-kit#31 item 1). Capture both
+  // streams into the outcome tail; RESULT= parsing is line-anchored.
+  for (const stream of [child.stdout, child.stderr]) {
+    stream?.on("data", (chunk) => {
+      const output = chunk.toString("utf8");
+      emitOutput(output);
+      tail = (tail + output).slice(-65536);
+    });
+  }
   return new Promise((res, rej) => {
     child.once("error", rej);
     // 'exit' precedes the final stdout data on some hosts. 'close' drains it.
@@ -304,7 +311,7 @@ async function runEgo(source, dir, name) {
   await writeFile(outputPath, source, "utf8");
   try {
     const expression = "await import(" + JSON.stringify(pathToFileURL(outputPath).href) + ")";
-    const child = spawn("ego-browser", ["nodejs", "-e", expression], { stdio: ["ignore", "pipe", "inherit"], windowsHide: true });
+    const child = spawn("ego-browser", ["nodejs", "-e", expression], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
     return await readEgoOutcome(child, (output) => process.stdout.write(output));
   } finally {
     await unlink(outputPath).catch(() => {});
