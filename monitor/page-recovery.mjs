@@ -52,6 +52,35 @@ export async function selectUniqueConversationPage(pages, conversationUuid) {
 const recoveryError = (code) => Object.assign(new Error(code), { code });
 const blankPageUrl = (url) => url === "about:blank" || url === "chrome://new-tab-page/";
 
+// A TaskSpace release may finish only its own registered conversations and
+// managed blank Pages left by a browser restart.
+export async function assertManagedReleasePages(pages, tabs, known) {
+  const knownIds = new Set(known.map((id) => id.toLowerCase()));
+  const pageUrls = await Promise.all(pages.map(async (page) => ({ page, url: await page.url() })));
+  for (const { page, url } of pageUrls) {
+    const id = conversationIdFromUrl(url, true);
+    if (id && knownIds.has(id)) continue;
+    if (!blankPageUrl(url)) throw recoveryError("SPACE_HAS_UNREGISTERED_PAGE_STOP");
+    const matchingTabs = tabs.filter((tab) => tab.label === page.label ||
+      (page.targetId && tab.targetId === page.targetId));
+    if (matchingTabs.some((tab) => tab.openedBy !== "agent" ||
+        tab.label !== page.label ||
+        (tab.targetId && page.targetId && tab.targetId !== page.targetId))) {
+      throw recoveryError("SPACE_HAS_UNOWNED_TAB_STOP");
+    }
+  }
+  for (const tab of tabs) {
+    if (tab.openedBy !== "agent") throw recoveryError("SPACE_HAS_UNOWNED_TAB_STOP");
+    const id = conversationIdFromUrl(tab.url, true);
+    if (id && knownIds.has(id)) continue;
+    if (!blankPageUrl(tab.url) || !pageUrls.some(({ page, url }) =>
+      blankPageUrl(url) && page.label === tab.label &&
+      (!tab.targetId || !page.targetId || tab.targetId === page.targetId))) {
+      throw recoveryError("SPACE_HAS_UNREGISTERED_PAGE_STOP");
+    }
+  }
+}
+
 // Existing-conversation sends can restore an agent-owned Page without operator intervention.
 // The caller must verify the TaskSpace owner and account pin before invoking this function.
 export async function recoverConversationPage(task, conversationUuid) {
@@ -90,11 +119,19 @@ export async function recoverConversationPage(task, conversationUuid) {
   if (blanks.length > 1) throw recoveryError("BLANK_PAGE_AMBIGUOUS");
   if (blanks.length === 1) {
     const { page, url } = blanks[0];
+    // The caller has verified ownership of this TaskSpace. A Page returned by
+    // task.pages() remains managed even if restart lost its tab metadata.
+    // Contradictory user ownership still blocks reuse.
+    const contradictory = tabs.some((tab) =>
+      (tab.label === page.label || (page.targetId && tab.targetId === page.targetId)) &&
+      (tab.openedBy !== "agent" || tab.label !== page.label ||
+        (page.targetId && tab.targetId && tab.targetId !== page.targetId)));
+    if (contradictory) throw recoveryError("BLANK_PAGE_OWNERSHIP_UNPROVEN");
     const proof = tabs.filter((tab) => tab.label === page.label && tab.url === url &&
       tab.openedBy === "agent" && typeof tab.targetId === "string" && tab.targetId &&
       (!page.targetId || tab.targetId === page.targetId));
-    if (proof.length !== 1) throw recoveryError("BLANK_PAGE_OWNERSHIP_UNPROVEN");
-    return { page, needsNavigation: true, selectionEvidence: "AGENT_OWNED_BLANK_PAGE" };
+    if (proof.length > 1) throw recoveryError("BLANK_PAGE_AMBIGUOUS");
+    return { page, needsNavigation: true, selectionEvidence: proof.length ? "AGENT_OWNED_BLANK_PAGE" : "MANAGED_BLANK_PAGE_RESTORED" };
   }
 
   // All remaining managed Pages belong to other, identified conversations.

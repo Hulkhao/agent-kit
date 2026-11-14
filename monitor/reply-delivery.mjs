@@ -1,6 +1,6 @@
 // Final reply evidence. Text stays in the per-conversation local directory.
 import { createHash } from "node:crypto";
-import { readFile, writeFile, rename } from "node:fs/promises";
+import { readFile, writeFile, rename, mkdir, unlink } from "node:fs/promises";
 import { join } from "node:path";
 
 export const sha256 = (text) => createHash("sha256").update(text, "utf8").digest("hex");
@@ -59,6 +59,46 @@ export function replyPath(dir, dispatchId) {
   return join(dir, `reply-${dispatchId}.txt`);
 }
 
+async function archiveConsumedPreviousReply(dir, record, previous) {
+  if (record?.status !== "ACCEPTED" || !isUuid(previous?.dispatchId) ||
+      previous.dispatchId === record.dispatchId ||
+      previous.conversationUuid !== record.conversationUuid ||
+      previous.file !== `reply-${previous.dispatchId}.txt` ||
+      !["DOM_BOUNDARY_VISIBLE", "API_FINAL_VERIFIED"].includes(previous.source) ||
+      !isUuid(previous.tailMessageKey)) throw new Error("REPLY_RECEIPT_MISMATCH");
+
+  const consumed = JSON.parse(await readFile(join(dir, "a-reply-consumed.json"), "utf8").catch((error) => {
+    if (error.code === "ENOENT") throw new Error("REPLY_RECEIPT_MISMATCH");
+    throw error;
+  }));
+  const contents = await readFile(replyPath(dir, previous.dispatchId), "utf8");
+  if (consumed?.dispatchId !== previous.dispatchId || consumed.sha256 !== previous.sha256 ||
+      !Number.isFinite(consumed.consumedAt) || !contents.trim() ||
+      sha256(contents) !== previous.sha256 || Buffer.byteLength(contents, "utf8") !== previous.bytes) {
+    throw new Error("REPLY_RECEIPT_MISMATCH");
+  }
+
+  const archiveDir = join(dir, ".archive");
+  await mkdir(archiveDir, { recursive: true });
+  const archivePath = join(archiveDir, `reply-consumed-${previous.dispatchId}.json`);
+  const archived = JSON.stringify({ receipt: previous, consumed });
+  try {
+    await writeFile(archivePath, archived, { flag: "wx" });
+  } catch (error) {
+    if (error.code !== "EEXIST" || await readFile(archivePath, "utf8") !== archived) throw error;
+  }
+  // The archive and original reply text now both preserve the evidence.
+  // Remove only the stale receipt so the current dispatch can publish its own.
+  await unlink(join(dir, "a-reply-delivery.json"));
+}
+
+async function clearPreviousReceipt(dir, record) {
+  let previous;
+  try { previous = JSON.parse(await readFile(join(dir, "a-reply-delivery.json"), "utf8")); }
+  catch (error) { if (error.code === "ENOENT") return; throw error; }
+  if (previous.dispatchId !== record.dispatchId) await archiveConsumedPreviousReply(dir, record, previous);
+}
+
 export async function saveReply(dir, record, extracted, tailMessageKey) {
   if (!record?.dispatchId || !record.conversationUuid || !extracted?.text?.trim() ||
       !["DOM_BOUNDARY_VISIBLE", "API_FINAL_VERIFIED"].includes(extracted.source) || !isUuid(tailMessageKey)) {
@@ -75,6 +115,7 @@ export async function saveReply(dir, record, extracted, tailMessageKey) {
     sha256: sha256(text),
     bytes: Buffer.byteLength(text, "utf8"),
   };
+  await clearPreviousReceipt(dir, record);
   // A crash before publishing the receipt leaves an uncommitted reply file.
   // A crash afterwards can be reconciled by checking its bytes.
   await writeFile(filename + ".tmp", text, "utf8");
@@ -88,6 +129,10 @@ export async function verifiedReply(dir, record) {
   let receipt;
   try { receipt = JSON.parse(await readFile(join(dir, "a-reply-delivery.json"), "utf8")); }
   catch (error) { if (error.code === "ENOENT") throw new Error("REPLY_DELIVERY_REQUIRED"); throw error; }
+  if (receipt?.dispatchId !== record?.dispatchId) {
+    await archiveConsumedPreviousReply(dir, record, receipt);
+    throw new Error("REPLY_DELIVERY_REQUIRED");
+  }
   if (!receipt || receipt.dispatchId !== record?.dispatchId || receipt.conversationUuid !== record.conversationUuid ||
       receipt.file !== `reply-${record.dispatchId}.txt` || !["DOM_BOUNDARY_VISIBLE", "API_FINAL_VERIFIED"].includes(receipt.source) ||
       !isUuid(receipt.tailMessageKey)) throw new Error("REPLY_RECEIPT_MISMATCH");

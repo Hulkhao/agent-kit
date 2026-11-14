@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { recoverConversationPage } from "../monitor/page-recovery.mjs";
+import { recoverConversationPage, assertManagedReleasePages } from "../monitor/page-recovery.mjs";
 
 const target = "12345678-1234-1234-1234-123456789abc";
 const other = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
@@ -92,7 +92,7 @@ test("ambiguous matches and unknown managed Pages stop without allocation", asyn
   assert.equal(unknown.allocations, 0);
 });
 
-test("untrusted tabs and unverifiable blanks cannot be adopted or reused", async () => {
+test("untrusted tabs cannot be adopted and managed blanks survive missing tab metadata", async () => {
   const page = { targetId: "tab1" };
   const userTab = fixture([], [
     { url: conversation(target), openedBy: "user", targetId: "tab1", page },
@@ -101,8 +101,40 @@ test("untrusted tabs and unverifiable blanks cannot be adopted or reused", async
   assert.equal(userTab.allocations, 0);
 
   const blank = fixture([managed("p1", "about:blank")], []);
-  await assert.rejects(recoverConversationPage(blank.task, target), { code: "BLANK_PAGE_OWNERSHIP_UNPROVEN" });
+  assert.equal((await recoverConversationPage(blank.task, target)).page, blank.pages[0]);
   assert.equal(blank.allocations, 0);
+
+  const contradicted = fixture([managed("p1", "about:blank")], [
+    { label: "p1", url: "about:blank", openedBy: "user", targetId: "p1" },
+  ]);
+  await assert.rejects(recoverConversationPage(contradicted.task, target), { code: "BLANK_PAGE_OWNERSHIP_UNPROVEN" });
+
+  const disguised = fixture([managed("p1", "about:blank")], [
+    { label: "unknown", url: "about:blank", openedBy: "user", targetId: "p1" },
+  ]);
+  await assert.rejects(recoverConversationPage(disguised.task, target), { code: "BLANK_PAGE_OWNERSHIP_UNPROVEN" });
+});
+
+test("#31: release accepts managed restart blanks and registered conversation Pages", async () => {
+  const pages = [managed("p1", conversation(target)), managed("p2", "chrome://new-tab-page/")];
+  const tabs = [
+    { label: "p1", url: conversation(target), openedBy: "agent", targetId: "p1" },
+    { label: "p2", url: "chrome://new-tab-page/", openedBy: "agent", targetId: "p2" },
+  ];
+  await assertManagedReleasePages(pages, tabs, [target]);
+  await assertManagedReleasePages([pages[1]], [], [target]);
+  await assert.rejects(assertManagedReleasePages(pages, [
+    tabs[0], { ...tabs[1], openedBy: "user" },
+  ], [target]), { code: "SPACE_HAS_UNOWNED_TAB_STOP" });
+  await assert.rejects(assertManagedReleasePages(pages, [
+    tabs[0], { ...tabs[1], targetId: "another-target" },
+  ], [target]), { code: "SPACE_HAS_UNOWNED_TAB_STOP" });
+  await assert.rejects(assertManagedReleasePages([
+    managed("p3", "https://example.org/"),
+  ], [], [target]), { code: "SPACE_HAS_UNREGISTERED_PAGE_STOP" });
+  await assert.rejects(assertManagedReleasePages(pages, [
+    ...tabs, { label: "p3", url: "about:blank", openedBy: "agent", targetId: "p3" },
+  ], [target]), { code: "SPACE_HAS_UNREGISTERED_PAGE_STOP" });
 });
 
 test("unreadable URLs and multiple blank Pages retain fail-closed behavior", async () => {

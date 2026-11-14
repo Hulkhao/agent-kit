@@ -1134,6 +1134,33 @@ test("pending Page release survives interrupted close and is reconciled without 
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
+test("#31: restart releasePending can reconcile managed blank and unlock the Agent", async () => {
+  const { claimAgentSpace, releaseAgentConversation, withAgentRegistry } = await import("./agent-space.mjs");
+  const { assertManagedReleasePages } = await import("./page-recovery.mjs");
+  const dir = await mkdtemp(join(tmpdir(), "ego-release-blank-"));
+  const a = "11111111-1111-4111-8111-111111111111";
+  const agent = { agentId: "agent-a", spaceName: "执行甲·规划", conversationUuid: a, directory: dir };
+  let finished = 0;
+  try {
+    await claimAgentSpace(agent);
+    await assert.rejects(releaseAgentConversation({ ...agent,
+      closePage: async () => assert.fail("last active Page must finish space"),
+      finishSpace: async () => { throw new Error("SPACE_HAS_UNREGISTERED_PAGE_STOP"); },
+    }), /SPACE_HAS_UNREGISTERED_PAGE_STOP/);
+    await assert.rejects(claimAgentSpace(agent), /AGENT_SPACE_RELEASE_PENDING/);
+    const blank = { label: "p1", targetId: "p1", url: async () => "chrome://new-tab-page/" };
+    await assertManagedReleasePages([blank], [{ label: "p1", targetId: "p1", openedBy: "agent", url: "chrome://new-tab-page/" }], [a]);
+    assert.deepEqual(await releaseAgentConversation({ ...agent,
+      closePage: async () => assert.fail("no Page to close"),
+      finishSpace: async () => { finished++; },
+    }), { finished: true, active: [] });
+    assert.equal(finished, 1);
+    const released = await withAgentRegistry((registry) => ({ changed: false, value: registry.agents[agent.agentId] }), dir);
+    assert.equal(released.releasePending, undefined);
+    await claimAgentSpace(agent);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
 test("probe bootstrap is pin-locked: explicit profileId creation + post-create verification + mismatch STOP", async () => {
   const src = await readFile(new URL("./ego-fast-probe.mjs", import.meta.url), "utf8");
   for (const marker of ["TASKSPACE_BOOTSTRAP_NO_PIN", "TASKSPACE_BOOTSTRAP_PROFILE_UNKNOWN", "TASKSPACE_BOOTSTRAP_VERIFY_FAILED", "TASKSPACE_PROFILE_MISMATCH_STOP", "SPACE_BOOTSTRAPPED"]) {

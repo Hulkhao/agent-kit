@@ -9,7 +9,7 @@ if ([MON, AGENT_ID, SPACE, CONV].some((v) => v.startsWith("REPLACE_"))) throw ne
 import { pathToFileURL } from "node:url";
 const { releaseAgentConversation, withAgentRegistry } = await import(pathToFileURL(MON + "/agent-space.mjs").href);
 const { assertAgentOwnedTaskSpace } = await import(pathToFileURL(MON + "/taskspace-takeover.mjs").href);
-const { isConversationUrl, conversationIdFromUrl } = await import(pathToFileURL(MON + "/page-recovery.mjs").href);
+const { isConversationUrl, assertManagedReleasePages } = await import(pathToFileURL(MON + "/page-recovery.mjs").href);
 const assigned = await withAgentRegistry((registry) => ({ changed: false, value: registry.agents[AGENT_ID] }));
 if (assigned?.spaceName !== SPACE || !assigned.known?.includes(CONV)) throw new Error("CONVERSATION_NOT_REGISTERED");
 if (!assigned.active.includes(CONV) && !assigned.releasePending) {
@@ -23,15 +23,17 @@ if (!owned && !(assigned.releasePending?.conversationUuid === CONV && assigned.r
 }
 const task = owned ? await taskSpace(owned.id) : null;
 const tabs = task ? await task.tabs() : [];
-if (task && (!tabs.length || tabs.some((tab) => tab.openedBy !== "agent"))) throw new Error("SPACE_HAS_UNOWNED_TAB_STOP");
 const pages = task ? await task.pages() : [];
+// Preflight before writing releasePending. Restart blanks require verified
+// TaskSpace ownership, managed Page evidence, and no contradictory user tab.
+if (task) await assertManagedReleasePages(pages, tabs, assigned.known);
 const matches = [];
 for (const page of pages) {
   if (isConversationUrl(await page.url(), CONV, true)) matches.push(page);
 }
 if (matches.length > 1 ||
     (matches.length === 0 && !(assigned.releasePending?.conversationUuid === CONV &&
-      (assigned.releasePending.finished ? !task : Boolean(task))))) {
+      (assigned.releasePending.finished || Boolean(task))))) {
   throw new Error("COMPLETED_PAGE_NOT_UNIQUE_STOP");
 }
 const target = matches[0] || null;
@@ -42,11 +44,7 @@ const result = await releaseAgentConversation({
     (entry.releasePending.finished ? !task : target === null),
   closePage: async () => { if (!target) throw new Error("COMPLETED_PAGE_NOT_FOUND"); await target.close(); },
   finishSpace: async (entry) => {
-    if (!task || !target) throw new Error("COMPLETED_SPACE_NOT_FOUND");
-    for (const tab of tabs) {
-      const id = conversationIdFromUrl(tab.url, true);
-      if (!id || !entry.known.some((known) => known.toLowerCase() === id)) throw new Error("SPACE_HAS_UNREGISTERED_PAGE_STOP");
-    }
+    if (!task || (!target && !entry.releasePending?.finished)) throw new Error("COMPLETED_SPACE_NOT_FOUND");
     await task.finish({ keep: [] });
   },
 });

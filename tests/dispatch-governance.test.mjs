@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { fileURLToPath } from "node:url";
 import { mkdtemp, mkdir, rm, writeFile, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -8,7 +9,7 @@ import { join } from "node:path";
 import { normalizeFastState } from "../monitor/state-schema.mjs";
 import { tick, acknowledge } from "../monitor/supervision-watchdog.mjs";
 import { shouldReviewStartupIdle } from "../monitor/supervision-policy.mjs";
-import { parseArgs, adaptTemplate, bindNewConversation, classifyManagerResult, loadAttachments, requireArmedDispatch, main } from "../monitor/dispatch-manager.mjs";
+import { parseArgs, adaptTemplate, bindNewConversation, classifyManagerResult, loadAttachments, requireArmedDispatch, main, readEgoOutcome, ensureMonitor } from "../monitor/dispatch-manager.mjs";
 import { checkDispatchTool } from "../plugins/chatgpt-dispatch-guard/hooks/policy.mjs";
 import { installConfig, install } from "../monitor/install-zcode-guard.mjs";
 import { extractDomReply, extractApiReply, saveReply, verifiedReply, acknowledgeReply, verifiedConsumption, sha256, visibleTextHash } from "../monitor/reply-delivery.mjs";
@@ -23,6 +24,62 @@ test("managed watch probes every 30 seconds from the previous probe start", asyn
   assert.match(watch, /const pollStartedAt = Date\.now\(\);/);
   assert.match(watch, /setTimeout\(res, Math\.max\(0, pollIntervalMs - \(Date\.now\(\) - pollStartedAt\)\)\)/);
   assert.doesNotMatch(watch, /setTimeout\(res, 60_000\)|sleep 300/);
+});
+
+test("#31: ego result parsing waits for stdout to drain after process exit", async () => {
+  const child = new EventEmitter();
+  child.stdout = new EventEmitter();
+  const reading = readEgoOutcome(child, () => {});
+  child.emit("exit", 0);
+  child.stdout.emit("data", Buffer.from("RESULT=GEN"));
+  child.stdout.emit("data", Buffer.from("ERATING\n"));
+  child.emit("close", 0);
+  assert.deepEqual(await reading, { code: 0, result: "GENERATING" });
+});
+
+test("#31: managed module copies refresh without replacing runtime state", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ego-module-refresh-"));
+  try {
+    await writeFile(join(dir, "agent-space.mjs"), "// stale copy\n");
+    await writeFile(join(dir, "a-fast-state.json"), "runtime-evidence");
+    await ensureMonitor(dir);
+    assert.equal(await readFile(join(dir, "agent-space.mjs"), "utf8"),
+      await readFile(new URL("../monitor/agent-space.mjs", import.meta.url), "utf8"));
+    assert.equal(await readFile(join(dir, "a-fast-state.json"), "utf8"), "runtime-evidence");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("#31: an old consumed reply is archived and cannot block next collection", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ego-reply-next-"));
+  const previous = { dispatchId: uuid, conversationUuid: uuid, status: "COMPLETED" };
+  const next = { dispatchId: "22222222-2222-4222-8222-222222222222", conversationUuid: uuid, status: "ACCEPTED" };
+  try {
+    const oldReceipt = await saveReply(dir, previous, { text: "旧回复", source: "API_FINAL_VERIFIED" }, uuid);
+    await acknowledgeReply(dir, previous, oldReceipt.sha256);
+    await assert.rejects(verifiedReply(dir, next), /REPLY_DELIVERY_REQUIRED/);
+    const archived = JSON.parse(await readFile(join(dir, ".archive", `reply-consumed-${uuid}.json`), "utf8"));
+    assert.equal(archived.receipt.sha256, oldReceipt.sha256);
+    assert.equal(archived.consumed.sha256, oldReceipt.sha256);
+    const newReceipt = await saveReply(dir, next, { text: "新回复", source: "API_FINAL_VERIFIED" }, uuid);
+    assert.equal((await verifiedReply(dir, next)).sha256, newReceipt.sha256);
+    assert.equal(await readFile(join(dir, `reply-${uuid}.txt`), "utf8"), "旧回复");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("#31: an unconsumed or tampered old receipt cannot be archived or replaced", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ego-reply-unconsumed-"));
+  const old = { dispatchId: uuid, conversationUuid: uuid, status: "COMPLETED" };
+  const next = { dispatchId: "22222222-2222-4222-8222-222222222222", conversationUuid: uuid, status: "ACCEPTED" };
+  try {
+    const receipt = await saveReply(dir, old, { text: "原始交付", source: "API_FINAL_VERIFIED" }, uuid);
+    await assert.rejects(verifiedReply(dir, next), /REPLY_RECEIPT_MISMATCH/);
+    await assert.rejects(saveReply(dir, next, { text: "新回复", source: "API_FINAL_VERIFIED" }, uuid), /REPLY_RECEIPT_MISMATCH/);
+    assert.equal((await verifiedReply(dir, old)).sha256, receipt.sha256);
+    await acknowledgeReply(dir, old, receipt.sha256);
+    await writeFile(join(dir, receipt.file), "遭篡改");
+    await assert.rejects(verifiedReply(dir, next), /REPLY_RECEIPT_MISMATCH/);
+    assert.equal(JSON.parse(await readFile(join(dir, "a-reply-delivery.json"), "utf8")).dispatchId, uuid);
+  } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
 test("#24: dispatch waits for probe-confirmed recovery after storm deadline", async () => {

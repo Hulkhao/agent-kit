@@ -253,16 +253,23 @@ async function releaseDelivered(params, dir) {
   return 0;
 }
 
-async function ensureMonitor(dir) {
+export async function ensureMonitor(dir) {
   await mkdir(dir, { recursive: true });
   for (const name of modules) {
     const target = join(dir, name);
     const source = await readFile(join(sourceDir, name));
     try {
-      if (!(await readFile(target)).equals(source)) throw new Error("MONITOR_CODE_VERSION_MISMATCH: " + name);
+      if ((await readFile(target)).equals(source)) continue;
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
-      await copyFile(join(sourceDir, name), target);
+    }
+    // Replace only managed code copies, preserving conversation ledgers and runtime state.
+    const temporary = target + "." + randomUUID() + ".tmp";
+    try {
+      await writeFile(temporary, source);
+      await rename(temporary, target);
+    } finally {
+      await unlink(temporary).catch(() => {});
     }
   }
   try { await readFile(join(dir, "supervision.config.json")); }
@@ -270,6 +277,24 @@ async function ensureMonitor(dir) {
     if (error.code !== "ENOENT") throw error;
     await copyFile(join(sourceDir, "supervision.config.json"), join(dir, "supervision.config.json"));
   }
+}
+
+export function readEgoOutcome(child, emitOutput) {
+  let tail = "";
+  child.stdout.on("data", (chunk) => {
+    const output = chunk.toString("utf8");
+    emitOutput(output);
+    tail = (tail + output).slice(-65536);
+  });
+  return new Promise((res, rej) => {
+    child.once("error", rej);
+    // 'exit' precedes the final stdout data on some hosts. 'close' drains it.
+    child.once("close", (exitCode) => {
+      let result = null;
+      for (const match of tail.matchAll(/^RESULT=([A-Z0-9_]+)(?:\s|$)/gm)) result = match[1];
+      res({ code: exitCode ?? 2, result });
+    });
+  });
 }
 
 // Official Windows CLI contract is nodejs -e with an imported UTF-8 script.
@@ -280,19 +305,7 @@ async function runEgo(source, dir, name) {
   try {
     const expression = "await import(" + JSON.stringify(pathToFileURL(outputPath).href) + ")";
     const child = spawn("ego-browser", ["nodejs", "-e", expression], { stdio: ["ignore", "pipe", "inherit"], windowsHide: true });
-    let result = null;
-    let tail = "";
-    child.stdout.on("data", (chunk) => {
-      const output = chunk.toString("utf8");
-      process.stdout.write(output);
-      tail = (tail + output).slice(-65536);
-    });
-    const code = await new Promise((res, rej) => {
-      child.once("error", rej);
-      child.once("exit", (exitCode) => res(exitCode ?? 2));
-    });
-    for (const match of tail.matchAll(/^RESULT=([A-Z0-9_]+)(?:\s|$)/gm)) result = match[1];
-    return { code, result };
+    return await readEgoOutcome(child, (output) => process.stdout.write(output));
   } finally {
     await unlink(outputPath).catch(() => {});
   }
