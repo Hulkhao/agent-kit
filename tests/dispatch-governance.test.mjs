@@ -16,6 +16,15 @@ import { dispatchStormGate, markCompleted, readDispatchState, verifyAttachmentEv
 
 const uuid = "11111111-1111-4111-8111-111111111111";
 
+test("managed watch probes every 30 seconds from the previous probe start", async () => {
+  const source = await readFile(new URL("../monitor/dispatch-manager.mjs", import.meta.url), "utf8");
+  const watch = source.slice(source.indexOf('if (p.action === "watch")'), source.indexOf('if (p.action === "probe") await writeFile'));
+  assert.match(watch, /const pollIntervalMs = 30_000;/);
+  assert.match(watch, /const pollStartedAt = Date\.now\(\);/);
+  assert.match(watch, /setTimeout\(res, Math\.max\(0, pollIntervalMs - \(Date\.now\(\) - pollStartedAt\)\)\)/);
+  assert.doesNotMatch(watch, /setTimeout\(res, 60_000\)|sleep 300/);
+});
+
 test("#24: dispatch waits for probe-confirmed recovery after storm deadline", async () => {
   const dir = await mkdtemp(join(tmpdir(), "ego-storm-gate-"));
   const start = 1_800_000_000_000;

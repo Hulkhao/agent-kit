@@ -385,8 +385,10 @@ export async function main(args = process.argv.slice(2)) {
     }
     // One managed job owns BOTH the fast probe and the slow supervisor. No idle
     // model calls; only the terminal return code wakes a compatible host.
+    const pollIntervalMs = 30_000;
     let benignStreak = 0;
     while (true) {
+      const pollStartedAt = Date.now();
       const template = await readFile(templates.probe, "utf8");
       const observation = await runEgo(adaptTemplate(template, p), dir, "probe");
       if (observation.code === 0 && observation.result === "DONE_CANDIDATE") {
@@ -402,7 +404,7 @@ export async function main(args = process.argv.slice(2)) {
         return 2;
       }
       if (await tick(Date.now(), dir)) return 2;
-      await new Promise((res) => setTimeout(res, 60_000));
+      await new Promise((res) => setTimeout(res, Math.max(0, pollIntervalMs - (Date.now() - pollStartedAt))));
     }
   }
   const file = p.newChat || p.recoverOnly ? templates.send : templates[p.action];

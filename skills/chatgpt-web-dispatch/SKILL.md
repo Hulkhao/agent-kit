@@ -30,7 +30,7 @@ metadata:
 
 **行为口径**：本机没有该配置文件或字段缺失 → `ACCOUNT_CONFIG_MISSING_STOP` / `ACCOUNT_CONFIG_INCOMPLETE_STOP`，**立即停止报人，不猜测账号**；页面实测账号与钉扎不符 → `ACCOUNT_MISMATCH_STOP`。**新建空间**一律 `taskSpace(名字, { profileId })` 带上钉扎的 profile；**旧空间无法换账号**——核对不符只能换空间名重建或人工登录正确账号。
 
-**TaskSpace 归属**：一个 Agent 固定一个空间，任务各占一个 Page；空间显示名可用中文（如 `GDC-本地执行A`），技术归属使用跨任务稳定的 `AGENT_ID`。派单、探测、监管、回复提取和释放统一通过 `monitor/dispatch-manager.mjs` 的 `send/send-new/recover-draft/probe/watch/collect/consume/release/ack` 执行；中断的 PREPARED 草稿仅按手册 §3.1 用 `recover-draft` 验证归属后清理。新会话 `send-new` 必须带稳定的 `--request-id`，返回真实会话 UUID 后使用该 UUID 监控。完成候选唤醒后，Agent `collect` 并读取完整回执，再 `consume --reply-sha256`，最后 `release`。同一 Agent 创建第二空间或抢用别人的空间直接 STOP。旧空间照原名复用，不擅自迁移。
+**TaskSpace 归属**：一个 Agent 固定一个空间，任务各占一个 Page；空间显示名可用中文（如 `GDC-本地执行A`），技术归属使用跨任务稳定的 `AGENT_ID`。派单、探测、监管、回复提取和释放统一通过 `monitor/dispatch-manager.mjs` 的 `send/send-new/recover-draft/probe/watch/collect/consume/release/ack` 执行；`send` 遇到自有空间内原会话 Page 丢失时自动恢复原 UUID 并继续闸门，无需请 PO 重开标签。中断的 PREPARED 草稿仅按手册 §3.1 用 `recover-draft` 验证归属后清理。新会话 `send-new` 必须带稳定的 `--request-id`，返回真实会话 UUID 后使用该 UUID 监控。完成候选唤醒后，Agent `collect` 并读取完整回执，再 `consume --reply-sha256`，最后 `release`。同一 Agent 创建第二空间或抢用别人的空间直接 STOP。旧空间照原名复用，不擅自迁移。
 
 校验工具：本仓库 `monitor/ego-profile-check.mjs`（`ego-browser nodejs < ego-profile-check.mjs`，MODE=list/init/verify，详见文件头注释）。
 
@@ -41,7 +41,7 @@ metadata:
 1. 脚本一律 UTF-8 `.mjs` 文件（`ego-browser nodejs < round-N.mjs`），中文不进 `-e` 参数，每轮新写完整文件。
 2. UI 状态只由结构化证据判定（可见停止按钮、尾部 `data-content-search-unit-key` / assistant DIL UUID），不从会话正文提取状态标志；完成判定=「可见停止按钮」消失的状态翻转 + 75 秒确认窗 + 尾部 assistant DIL UUID 稳定；禁文本匹配「正在思考」、禁用回复完成后采集的内容哈希/计数当基线；监视器启动即提取比对派单基线。
 3. 快轮询纯 DOM 零 API 配额；API 仅唤醒后单次提取（每唤醒最多 2 调用）；`page.fetch` 的 conversation API 返回 404 `conversation_inaccessible` ≠ 会话死亡（授权上下文缺 token，见手册 §4），以页面 DOM 结构化证据为准；429 期停一切 API 与密集导航，页面重试 ≥9 分钟。
-4. 双循环监控统一运行一个受管 `dispatch-manager.mjs watch` 任务，内含 1 分钟快轮询和默认 10 分钟监管判定；修改各会话监控目录 `conversations/<UUID>/supervision.config.json` 的 `supervisionMinutes`，可动态设为 15/20/30 等分钟。**启动时确认受管任务退出能实际通知并唤醒本地 Agent**；收到唤醒、完成诊断后通过管理器 `ack` 确认 `wakeId`，未确认不得宣称已接棒。连续 3 轮无进展要求联系 PO（即时聊天/邮件接入暂缓）；消息数接近 2000 提前迁移。
+4. 双循环监控统一运行一个受管 `dispatch-manager.mjs watch` 任务，内含 30 秒快轮询（以每轮起始时刻计时）和默认 10 分钟监管判定；不得用 `sleep 300 && probe` 代替长驻 `watch`；修改各会话监控目录 `conversations/<UUID>/supervision.config.json` 的 `supervisionMinutes`，可动态设为 15/20/30 等分钟。**启动时确认受管任务退出能实际通知并唤醒本地 Agent**；收到唤醒、完成诊断后通过管理器 `ack` 确认 `wakeId`，未确认不得宣称已接棒。连续 3 轮无进展要求联系 PO（即时聊天/邮件接入暂缓）；消息数接近 2000 提前迁移。
 5. 发送前确认「发送」按钮可用，再执行一次 focus+Enter；进入 `SEND_STARTED` 后无论 Enter 的返回结果如何，都先按账本与 DOM 双验对账，无法证明未发送即标 `UNCERTAIN` 并 STOP，禁止补点 click 或盲目重发。按钮 `disabled=true` 时先按页面恢复契约处理。填充用 600 grapheme 目标 / 1200 UTF-8 byte 硬上限；每块 CDP `Input.insertText` 后回读累计前缀，只有确认内容未变化才重试当前块一次，错位立即 STOP；fill/原生 paste/单次长文本不作为可靠通道；Composer 空态是 innerText=`"\n"`（长度 1），勿用 `length===0` 判空；向外发送前查敏感信息。
 6. 任务状态分离：浏览器存活、轮次生成、工具调用、最终完成是不同状态；超时或 stream reconnect 不等于任务失败。
 7. 崩溃恢复采用有上限的重启与安全诊断；失败后立即保留状态证据，禁止记录 Cookie、Token、提示词正文和工具参数。

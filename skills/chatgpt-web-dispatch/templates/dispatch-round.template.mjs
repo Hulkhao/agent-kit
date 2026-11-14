@@ -43,7 +43,7 @@ const {
 const { isTaskSpaceTakeover, TASKSPACE_TAKEOVER_SIGNAL, assertAgentOwnedTaskSpace } =
   await import(pathToFileURL(MON + "/taskspace-takeover.mjs").href);
 const { claimAgentSpace } = await import(pathToFileURL(MON + "/agent-space.mjs").href);
-const { isConversationUrl, conversationIdFromUrl } = await import(pathToFileURL(MON + "/page-recovery.mjs").href);
+const { recoverConversationPage, conversationIdFromUrl } = await import(pathToFileURL(MON + "/page-recovery.mjs").href);
 
 const payload = await fs.readFile(MSG_FILE, "utf-8");
 const payloadHash = createHash("sha256").update(payload, "utf8").digest("hex");
@@ -104,6 +104,7 @@ await checkStorm();
 
 let task;
 let page = null;
+let pageNeedsNavigation = false;
 try {
   const spaces = await listTaskSpaces();
   let targetSpace = spaces.find((space) => space.taskId === SPACE || space.name === SPACE);
@@ -129,12 +130,14 @@ try {
     page = await task.newPage();
     await writeJsonAtomic(MON + "/a-new-page.json", { requestId: CONV, status: "ALLOCATED", pageLabel: page.label });
   } else {
-    const matches = [];
-    for (const p of (await task.pages())) {
-      if (isConversationUrl(await p.url(), CONV)) matches.push(p);
+    const recovered = await recoverConversationPage(task, CONV);
+    page = recovered.page;
+    pageNeedsNavigation = recovered.needsNavigation;
+    if (pageNeedsNavigation || recovered.selectionEvidence === "AGENT_OWNED_TAB_ADOPTED") {
+      await appendEvent(MON, "CONVERSATION_PAGE_RECOVERED", {
+        conversationUuid: CONV, pageLabel: page.label, selectionEvidence: recovered.selectionEvidence,
+      });
     }
-    if (matches.length > 1) abort("CONVERSATION_PAGE_AMBIGUOUS");
-    page = matches[0] || null;
   }
 } catch (error) {
   console.log("RECOVERY_DETAIL=" + String(error && error.message || error).slice(0, 220));
@@ -185,6 +188,7 @@ const navigate = async (reason) => {
 };
 
 if (NEW_CHAT) await navigate("NEW_CHAT_INITIAL");
+else if (pageNeedsNavigation) await navigate("CONVERSATION_PAGE_RECOVERY");
 
 // Same tier order and visibility rule as monitor/dispatch-state.mjs readComposerSurface.
 // One page-evaluate implementation covers read, clear and fill; ambiguous tiers fail closed.

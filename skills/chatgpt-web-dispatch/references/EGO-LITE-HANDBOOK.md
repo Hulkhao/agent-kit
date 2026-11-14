@@ -2,7 +2,7 @@
 
 > 2026-11-07 由 GDC V5 任务一天内实战全链路验证整理（派单/监控/提取/迁移/429 应对全部真浏览器跑通）。
 > **2026-11-08 定为唯一真源**：已并入《ego-lite工作流交接文档》全部增量；交接文档及旧版手册副本已删除，不再维护。
-> **2026-11-11 节奏修订（PO 令）**：快轮询 **1 分钟**；看门狗在无实质进展默认 **10 分钟**后唤醒 Agent，间隔可由 `monitor/supervision.config.json` 动态修改；3 轮无进展升级 PO，详见 §6。
+> **2026-11-14 节奏修订（PO 令）**：快轮询 **30 秒**；看门狗在无实质进展默认 **10 分钟**后唤醒 Agent，间隔可由 `monitor/supervision.config.json` 动态修改；3 轮无进展升级 PO，详见 §6。
 > **规范监控脚本唯一存放点：agent-kit 官方仓库 `monitor/` 目录（PO 令 2026-11-08 并入，原独立 ego-tools 本地仓库停用为历史归档）**；本手册不贴脚本源码，只指向。
 > 适用：Windows + ChatGPT 网页多 Agent 派单场景。目标读者：接管派单与监控的执行 Agent。
 
@@ -157,7 +157,7 @@ const r = await page.fetch("/backend-api/conversation/" + uuid,
 **规范脚本唯一存放点：agent-kit 官方仓库 `monitor/` 目录（PO 令 2026-11-08 并入）**——`dispatch-manager.mjs` 为统一入口，内部复用 `ego-fast-probe.mjs`、`supervision-watchdog.mjs`、`dispatch-state.mjs`、`collect-reply.template.mjs` 和 `release-agent-space.template.mjs`。`fast-poll.sh` 与 `watchdog.sh` 仅保留用于旧部署迁移。**要改脚本只改 agent-kit 仓库 monitor/ 这一份**。
 > 历史说明（2026-11-08）：原 ego-tools 内容已并入 `agent-kit/monitor/`。新机以当前 `agent-kit/monitor/` 为来源部署监控脚本，无需再克隆已归档的 ego-tools。
 
-架构（PO 2026-11-11 修订）：一个受管 `watch` 任务运行两条逻辑循环。每 1 分钟快探测 DOM，并读取配置与结构化状态，默认连续 **10 分钟无实质进展**才退出要求 Agent 智能审查。完成候选触发 `REPLY_READY_WAKE_SUPERVISOR`，由接棒 Agent 调用 `collect` 提取全文并保存回执、`consume` 确认交付、`release` 回收 Page；提取失败立即要求审查。正常长任务有真实进展时无需唤醒。三轮都无进展升级 PO，外部消息通知后续另接。
+架构（PO 2026-11-11 修订）：一个受管 `watch` 任务运行两条逻辑循环。每约 30 秒快探测 DOM，并读取配置与结构化状态，默认连续 **10 分钟无实质进展**才退出要求 Agent 智能审查。完成候选触发 `REPLY_READY_WAKE_SUPERVISOR`，由接棒 Agent 调用 `collect` 提取全文并保存回执、`consume` 确认交付、`release` 回收 Page；提取失败立即要求审查。正常长任务有真实进展时无需唤醒。三轮都无进展升级 PO，外部消息通知后续另接。
 
 ### 6.1 部署（新项目接入）
 
@@ -169,14 +169,14 @@ const r = await page.fetch("/backend-api/conversation/" + uuid,
 
 ### 6.2 设计要点（每条都是实测事故换来的）
 
-- 快轮询 **DOM 为主要状态证据**，不在正常每分钟轮询中调用 conversation API（R2.4 起驻页探测约 6 次 goto/小时，见 §7）。判定=「可见停止按钮」的生成→空闲翻转 + 75 秒确认窗（滤工具链间隙假阳性）。完成候选由管理器优先 DOM 提取，必要时一次 API 辅助验证；无法确认本次派单边界就停止释放并交给 Agent。
+- 快轮询 **DOM 为主要状态证据**，不在正常每 30 秒轮询中调用 conversation API（R2.4 起驻页探测约 6 次 goto/小时，见 §7）。判定=「可见停止按钮」的生成→空闲翻转 + 75 秒确认窗（滤工具链间隙假阳性）。完成候选由管理器优先 DOM 提取，必要时一次 API 辅助验证；无法确认本次派单边界就停止释放并交给 Agent。
 - 监督模块 `supervision-watchdog.mjs` 在每轮快探测之后执行，重读会话目录配置。`supervisionMinutes` 允许 1–60（默认 10），`maxAbnormalRounds` 默认 3。无真实进展超过间隔才唤醒；接棒 Agent 完成实际检查后使用管理器 `ack`，`investigated` 重新计时，已解决用 `resolved` 重置异常轮次。未确认的唤醒再次运行只输出 `MONITOR_WAKE_UNACKNOWLEDGED`，禁止假装已处理。第三轮仍无进展输出 `USER_ESCALATION_REQUIRED`，由主管联系 PO；IM/邮件暂不自动发送。
 - **退出后必须有实际接棒**：任何告警后先确认本地 Agent 收到任务退出通知并处理；未证明通知链路时不得宣称“已唤醒”或“有人值守”（实测 7 小时空转事故的根因）。
 - **良性信号自愈（issue #8，2026-11-09 起）**：fast-poll.sh wrapper 对 `START_IDLE_WAKE_SUPERVISOR` 类「重启即自愈」良性信号自动重启 probe 并留痕（`BENIGN_SIGNAL_SELFHEAL=… streak=n/20`），连续超过 20 轮仍良性才真退出唤醒——消除「wrapper 退出后接棒单点」的 50 分钟空窗形态（实测 2026-11-08）。`REPLY_ARRIVED`（DONE_CANDIDATE）/`CONVERSATION_DEAD` 等需主管裁决的信号维持真退出。
 - **长任务巡检纪律（issue #8）**：主管处于长任务链（派单/执行/多任务并行）时，值守健康巡检（`a-fast-state.json` 时间戳、fast-history.log 尾部）纳入任务步骤前后的检查点；发现 `STATE_MISSING` 或 wrapper 已退出（日志尾部 `fast-poller exit`）立即接力重启，不允许把唤醒留给「之后有空再说」。
 - probe 内置硬化（规范版已含，勿删）：**R2.4 起快轮询三分支驻页探测（FINAL PASS 65c78e4）**——STAY 轮（页面就绪）0 goto 零加载；CALIBRATE 轮（距 navRef ≥10 分钟）1 次 goto 校准；RECOVER 轮（页面失就绪/timeOrigin 读取失败）走恢复。navRef = max(lastGotoAt, performance.timeOrigin)；goto 全部收敛到统一 `navigate(reason)` 入口（单一 `gotoAt` 时间戳 + GOTO_ATTEMPT 事件）。就绪等待只认**正文 >600 字符**（上限 40s——空壳也带「发送」按钮，按按钮判就绪会假阳性）；**例外：NEW_CONV 类导航（新聊天落地页，无会话体可渲染，#12-1 实测 bodyLen 455-467）**就绪改认结构化证据——composer（aria-label 口径）与模型菜单按钮同时存在且 bodyLen>300，空壳防线不放宽（会话页仍按 >600）。goto/渲染失败 → **8 分钟退避**（退避期只刷状态文件时间戳）；**死页梯子**：见死标 → 刷 2 次 → 仍死记 1 strike → **8 分钟后再试** → 连续 3 strikes 才判会话真死并唤醒主管；恢复渲染后 strike 清零。dispatch 侧 `PAGE_NOT_READY_AFTER_NAVIGATE` / `COMPOSER_SURFACE_UNAVAILABLE` abort 后**不自行重试导航**，转交既有 probe 恢复流程（含本梯子），避免双责任方写同一梯子状态（规划师裁决 2026-11-10）；会话页 `bodyLen≈305-308`（侧栏完整、主区空）是实测可恢复形态（#21/#23），梯子轮次内不判死。429/加载风暴与 Composer 冻结走共享风暴通道（`CHAT_SURFACE_STRUCTURALLY_UNAVAILABLE` + `stormBackoffDeadline` = max(8min, 9min+SPACE相位)，单次重试由 planStormRecovery 把关，失败重新武装，详见 §3.1）。
 - **恢复首轮若为空闲态 → startIdle=true → 强制走「启动即提取」复核**（防吞退避期间已到达的回复）。
-- **Page 恢复顺序（#18 R1）**：先盘点 `task.pages()` 受管 Page 与 `task.tabs()`（含 unmanaged）。受管 Page 按目标 conversation UUID 的 URL 完整路径段判定：唯一匹配即复用；多匹配 `PAGE_URL_MATCH_AMBIGUOUS` 立即 STOP，绝不按历史 `pageLabel` 消歧。受管零匹配时，先查 unmanaged：仅有一条目标 UUID 匹配、host 严格为 `chatgpt.com`（HTTPS）且 `openedBy=agent`、`targetId`/Page 身份证据齐全才 `adopt`，记录 `PAGE_ADOPTED`；多条匹配熔断，证据不全 `PAGE_ADOPTION_EVIDENCE_INCOMPLETE` STOP，不接管用户来源页。无可收养目标时，若唯一受管 Page 为已确认 Agent-owned 空白页（`about:blank` 或 `chrome://new-tab-page/`，匹配 tabs 的 label/targetId），复用原 Page，由既有 `navigate(reason)` 恢复；若仍有任何受管 Page（尤其多页无 UUID 匹配），`PAGE_URL_MATCH_NOT_FOUND` STOP，不得新建。仅无受管 Page 且无可收养目标时由 probe `newPage()`；URL 读取失败 `PAGE_URL_INSPECTION_FAILED` STOP。dispatch 不自行建页。
+- **Page 恢复顺序（#18 R1，send 自动恢复补充）**：先盘点 `task.pages()` 受管 Page 与 `task.tabs()`（含 unmanaged）。受管 Page 按目标 conversation UUID 的 URL 完整路径段判定：唯一匹配即复用；多匹配 `PAGE_URL_MATCH_AMBIGUOUS` 立即 STOP，绝不按历史 `pageLabel` 消歧。受管零匹配时，先查 unmanaged：仅有一条目标 UUID 匹配、host 严格为 `chatgpt.com`（HTTPS）且 `openedBy=agent`、`targetId`/Page 身份证据齐全才 `adopt`；多条匹配熔断，证据不全 `PAGE_ADOPTION_EVIDENCE_INCOMPLETE` STOP，不接管用户来源页。无可收养目标时，`send` 可复用唯一已确认 Agent-owned 空白 Page（`about:blank` 或 `chrome://new-tab-page/`，匹配 tabs 的 label/targetId），或在其它受管 Page 全部为已识别会话、没有空白页时为目标会话 `newPage()`；零 Page 时同样新建。新建和空白页复用均走 `navigate("CONVERSATION_PAGE_RECOVERY")` 恢复原 UUID，再通过原派单闸门。此类自动恢复无需向 PO 申请重开页。未知 URL、URL 读取失败、多空白页或所有权不明时按证据报错并停止，避免占用其它任务 Page。probe 维持自身已有的恢复与 reservation 契约。
 - **自写 round 脚本常见踩坑（issue #12 实测 2026-11-09）**：①`taskSpace(SPACE, {profileId})` 只允许出现在**创建分支**——对已存在空间带 profileId 调用会报错；复用路径必须先 `listTaskSpaces()` 找到已有空间后按 id 裸调用（规范 probe 自举即此写法，照抄）；②**ref 跨进程不复用**：旧 ego-browser 进程快照里的 ref 在新进程中一律失效（比「跨尝试不复用」更严），跨进程只信任结构化重定位（aria-label/URL/UUID）；③派单账本文件名是 `a-dispatch-state.json`（带 `a-` 前缀），自定义脚本 patch 时易写错。
 - **当前 ChatGPT 尾部消息 DOM 契约（实测 2026-11-08，R2.2 落地于 `dispatch-state.mjs`）**：
   - 读取最后一个可见 `[data-content-search-unit-key]`，取 key 最后一个冒号后的 `user` / `assistant` 作为 `lastMessageRole`。
@@ -210,7 +210,7 @@ const r = await page.fetch("/backend-api/conversation/" + uuid,
 
 ### 6.4 异常接棒、监控健康与重新布防
 
-**双轨职责**：统一管理器每分钟执行低成本 DOM 快探测，并用监督模块根据配置和实际进展判断，快探测状态陈旧（≥7 分钟）则报错。脚本**不会自行启动或唤醒大模型推理**；真正的接棒方是本地 Agent 的受管任务通知/回调。每轮 `wakeId` 必须由接棒 Agent 检查后通过管理器执行 `ack`，不能把打印日志当已唤醒。
+**双轨职责**：统一管理器约每 30 秒执行低成本 DOM 快探测，并用监督模块根据配置和实际进展判断，快探测状态陈旧（≥7 分钟）则报错。脚本**不会自行启动或唤醒大模型推理**；真正的接棒方是本地 Agent 的受管任务通知/回调。每轮 `wakeId` 必须由接棒 Agent 检查后通过管理器执行 `ack`，不能把打印日志当已唤醒。
 
 **派单后核对**：`watch` 受管任务有可追踪 ID，任务的结束/异常退出能进入当前本地 Agent 的可处理通知或回调。在现有运行平台上拿不到此保障，就报告“监控接棒能力缺失”，说明缺的是哪条通知链路，不宣称闭环。无需特意制造网页卡死来验收。
 
@@ -222,9 +222,9 @@ const r = await page.fetch("/backend-api/conversation/" + uuid,
 
 | 参数 | 值 | 适用场景 | 备注 |
 |---|---|---|---|
-| 快轮询间隔 | **1 分钟**（sleep 60s + 探测耗时，有效 ~65~100s/轮） | ego 双循环脚本1 | PO 2026-11-08 令（原 3 分钟）；**旧 16 铁律的「90~100 秒」是 chrome-use/chatgpt-use 路由口径，不适用于 ego 纯 DOM 双循环** |
+| 快轮询间隔 | **30 秒**（从探测开始计时，耗时超过 30 秒则直接进入下一轮） | ego 双循环脚本1 | PO 2026-11-14 调整（原 1 分钟）；**旧 16 铁律的「90~100 秒」是 chrome-use/chatgpt-use 路由口径，不适用于 ego 纯 DOM 双循环** |
 | 快轮询页面加载频次 | **约 6 次 goto/小时/Agent**（R2.4 起实测口径） | 配额观察项 | **R2.4 FINAL PASS（65c78e4）修订**：快轮询改驻页 STAY 轮 0 goto，仅 CALIBRATE（距上次导航 ≥10 分钟）1 次 goto + 异常 RECOVER，收敛到约 6 次/小时；旧「60 次 goto/小时」是 pre-R2.4 每轮 goto 口径，已作废。异常恢复与 429/冻结走共享风暴通道（≥9 分钟 + SPACE 相位错峰）。若观察到 429/加载变慢征兆仍按 §5 处置并回调节奏 |
-| 智能监督间隔 | `supervision.config.json` 默认 10 分钟（1–60 可改） | 脚本2 | 仅无实质进展才唤醒；配置运行时每分钟生效；第 3 个未改善异常轮升级 PO |
+| 智能监督间隔 | `supervision.config.json` 默认 10 分钟（1–60 可改） | 脚本2 | 仅无实质进展才唤醒；配置运行时每轮生效；第 3 个未改善异常轮升级 PO |
 | 翻转确认窗 | 75 秒 | 生成→空闲翻转后 | 滤工具链间隙假完成 |
 | 状态陈旧阈值 | ≥7 分钟 | 看门狗判快轮询死 | 快轮询死亡信号 |
 | 死页梯子 | 刷 2 次 → strike → **8 分钟退避** → 3 strikes 判死 | monitor probe 内 | 恢复渲染 strike 清零；恢复首轮空闲强制启动即提取 |
@@ -237,7 +237,7 @@ const r = await page.fetch("/backend-api/conversation/" + uuid,
 | 分块大小 | ≤6KB base64 | 补丁类交付 | 必经代码解释器 tool 输出打印（§4） |
 | API 用量 | 每次唤醒最多 2 个调用 | 验证/提取 | 禁轮询；429 期停一切 API 轮询 |
 
-**冻结参数边界（2026-11-08 R2.2 裁决）**：上表全部保持原值；DOM 选择器属于 §6.2 的运行时 UI 契约，不属于 §7 冻结参数。DOM 改版不构成变更任何计时、轮询或退避参数的理由。
+**冻结参数边界（2026-11-08 R2.2 裁决）**：除 2026-11-14 调整快轮询为 30 秒外，上表其余参数保持原值；DOM 选择器属于 §6.2 的运行时 UI 契约，不属于 §7 冻结参数。DOM 改版不构成变更任何计时、轮询或退避参数的理由。
 
 ## 8. Windows / Git Bash 环境坑（与 ego 无关但同场实测）
 
@@ -282,7 +282,7 @@ const r = await page.fetch("/backend-api/conversation/" + uuid,
 
 本节将上游项目 [miuuyy/codex-chatgpt-web](https://github.com/miuuyy/codex-chatgpt-web) 的运行经验抽象到 ego-browser 工作流。参考了其 v6.1.17 README、架构说明、安全模型、故障排除和发布验证文档。这里吸收的是状态管理与故障处置方法，不是把 Electron、Responses API 或 MCP 代码搬进 ego-browser。
 
-**优先级：** 本节补充现有手册，不覆盖 §2–§7 已经实测冻结的 ego-browser 规则。尤其 1 分钟快轮询、可配置默认 10 分钟主管监督、75 秒翻转确认、8 分钟死页退避、429 页面重试至少 9 分钟、每次唤醒最多 2 次 API 调用，仍以本手册现行值为准。
+**优先级：** 本节补充现有手册，不覆盖 §2–§7 已经实测冻结的 ego-browser 规则。尤其 30 秒快轮询、可配置默认 10 分钟主管监督、75 秒翻转确认、8 分钟死页退避、429 页面重试至少 9 分钟、每次唤醒最多 2 次 API 调用，仍以本手册现行值为准。
 
 ### 11.1 把页面、轮次、工具调用拆成独立状态
 

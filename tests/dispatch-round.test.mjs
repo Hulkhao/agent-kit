@@ -113,6 +113,14 @@ test("r44 P0-B1: exactly ONE navigation channel — page.goto appears only insid
   assert.match(src, /const gotoAt = Date\.now\(\); \/\/ single timestamp per navigation/);
 });
 
+test("existing conversation send automatically recovers a missing Page through the audited navigation channel", async () => {
+  const src = await template();
+  assert.match(src, /await recoverConversationPage\(task, CONV\)/);
+  assert.match(src, /else if \(pageNeedsNavigation\) await navigate\("CONVERSATION_PAGE_RECOVERY"\)/);
+  assert.ok(src.indexOf("assertAgentOwnedTaskSpace(targetSpace, SPACE)") < src.indexOf("await recoverConversationPage(task, CONV)"));
+  assert.ok(src.indexOf("await recoverConversationPage(task, CONV)") < src.indexOf("// ---- Gate 0"));
+});
+
 test("r44 P0-B2: ownership+clear+verify is a reusable procedure re-run after FRESHEN", async () => {
   const src = await template();
   assert.match(src, /const ensureOwnEmptyComposer = async \(\)/);

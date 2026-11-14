@@ -31,7 +31,7 @@ git push -u origin master
 node monitor/dispatch-manager.mjs watch --monitor-dir <项目监控目录> --agent-id gdc-exec-a --space GDC-本地执行A --conversation <会话UUID>
 ```
 
-以受管任务启动 `watch`，内置每分钟 DOM 快探测与监督判定。监控目录的 `conversations/<UUID>/supervision.config.json` 可设置 `supervisionMinutes`（默认 10）和 `maxAbnormalRounds`（默认 3）。收到 `REPLY_READY_WAKE_SUPERVISOR` 后，Agent 执行 `collect`，读取并交付完整回执，再用 `consume --reply-sha256 <回执SHA256>` 确认，最后执行 `release` 关闭任务 Page。接棒者完成异常复核后用 `ack --wake-id <ID> --ack-action investigated` 确认，问题已解决则用 `resolved`。ZCode 强制入口由 `deploy.ps1` 安装 PreToolUse Hook，`-SkipZCodeGuard` 可跳过。
+以受管任务启动 `watch`，内置约每 30 秒一次的 DOM 快探测与监督判定（每轮起始时刻计时）。监控目录的 `conversations/<UUID>/supervision.config.json` 可设置 `supervisionMinutes`（默认 10）和 `maxAbnormalRounds`（默认 3）。收到 `REPLY_READY_WAKE_SUPERVISOR` 后，Agent 执行 `collect`，读取并交付完整回执，再用 `consume --reply-sha256 <回执SHA256>` 确认，最后执行 `release` 关闭任务 Page。接棒者完成异常复核后用 `ack --wake-id <ID> --ack-action investigated` 确认，问题已解决则用 `resolved`。ZCode 强制入口由 `deploy.ps1` 安装 PreToolUse Hook，`-SkipZCodeGuard` 可跳过。
 
 退出码和 `WAKE_SUPERVISOR` 输出需要宿主实际转交给 Agent 才构成唤醒。未验证宿主退出通知时，不能声称已完成自动接棒。
 
@@ -50,7 +50,7 @@ ZCode 接单后先原子写入 `replies/<请求名>.ack.md`（末行 `ACK`），
 | **1. 空间管理** | 同一 `AGENT_ID` 始终认领一个归属明确、中文可读的 TaskSpace；多个任务使用独立 Page；完成后只释放该任务 Page，最后一个任务结束才回收空间。核查所有权登记和实际 Page 列表。 | 发现重复空间、错领空间或残留 Page，停止自动回收，记录归属与现场并报 Issue。 |
 | **2. 强制执行** | ZCode 实机验证 PreToolUse Hook 能拦截绕过统一入口的 ChatGPT 网页操作，允许管理器合法操作，且原有 Hook 正常工作；核查工具权限与部署配置。 | 拦截失效或误拦截，保留复现命令和 Hook 判定，报 Issue 并阻止将强制入口标记为通过。 |
 | **3. 可靠派单** | 通过统一管理器验证发送前后回读、持久账本、恢复、完整回复提取、交付确认和释放；发送状态不确定时不重复发送，也不覆盖用户草稿。核查每轮日志、会话 UUID 和回复哈希。 | 任一环节缺乏确认，保留现场、停止该轮后续写操作，先判定根因再恢复。 |
-| **4. 自动监控** | 受管 `watch` 每分钟轻量探测页面；正常观察期间无模型调用和 Token 消耗；页面刷新、任务切换后仍能关联正确会话。核查轮询记录及模型调用记录。 | 轮询漏检、串会话或额外消耗 Token，记录发生时间及监控状态并报 Issue。 |
+| **4. 自动监控** | 受管 `watch` 约每 30 秒轻量探测页面；正常观察期间无模型调用和 Token 消耗；页面刷新、任务切换后仍能关联正确会话。核查轮询记录及模型调用记录。 | 轮询漏检、串会话或额外消耗 Token，记录发生时间及监控状态并报 Issue。 |
 | **5. 智能介入** | 默认观察窗口 10 分钟，可通过 `supervisionMinutes` 调整；只在停滞、证据矛盾或无法判断时触发 Agent 复核，正常持续产出的长任务保持运行。核查进展时间戳、告警原因和宿主实际接棒记录。 | 误唤醒、漏唤醒或无法证实接棒，留存监控事件与宿主记录并报 Issue。 |
 | **6. 异常升级** | 每轮复核后重新观察；连续三轮无有效进展才标记需通知 PO；有新进展即重置计数，正常长任务持续监控。核查三轮时间线与升级标记。**外部聊天/邮件通知仍为后续事项。** | 提前升级、漏升级或错误重置时，保留连续轮次记录并报 Issue。 |
 
