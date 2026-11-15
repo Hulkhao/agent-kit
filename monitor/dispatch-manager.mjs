@@ -211,6 +211,64 @@ export function classifyProbeResult({ code, result }, benignStreak = 0) {
   return { wake: true, streak: 0 };
 }
 
+// Frozen ledger schema for the durable watch-exit event (agent-kit#25 plan C).
+// The marker is the wake event a ZCode host hook can discover after the watch
+// process is gone; it never carries task or reply content.
+const WATCH_EXIT_SCHEMA = "ego-watch-exit/v1";
+
+// Unified watch exit, in contract order: generate wakeId -> atomically write
+// <conversationDir>/a-watch-exit.json -> announce the wake reason -> exit 2.
+// A failed marker write must never upgrade the wake into a success: the exit
+// code stays 2 and stderr records the loss so plan A's stale detection can
+// take over. SIGKILL, power loss and similar abrupt terminations never reach
+// this function at all, so no exit-code promise is made for those cases.
+export async function exitWatching(dir, reason, { wakeId = randomUUID(), detail = "", announce = true } = {}) {
+  const marker = {
+    schema: WATCH_EXIT_SCHEMA,
+    wakeId,
+    reason,
+    issuedAt: Date.now(),
+    exitCode: 2,
+    acknowledgedAt: null,
+    ackAction: null,
+  };
+  try {
+    await writeJsonAtomic(join(dir, "a-watch-exit.json"), marker);
+  } catch (error) {
+    console.error("RESULT=WATCH_EXIT_MARKER_WRITE_FAILED wakeId=" + wakeId + " reason=" + reason +
+      " code=" + ((error && (error.code || error.message)) || "UNKNOWN"));
+  }
+  if (announce) console.log("RESULT=" + reason + (detail ? " " + detail : "") + " wakeId=" + wakeId);
+  return 2;
+}
+
+// Plan C ack extension (agent-kit#25): one ack may have to clear both durable
+// ledgers that share a wakeId — the supervision pending alarm and the
+// watch-exit marker. An unknown id still fails closed; an already
+// acknowledged marker is rejected instead of silently succeeding, and the
+// acknowledged record is retained as historical evidence.
+export async function acknowledgeWake(id, action, dir, now = Date.now()) {
+  if (!id || !["investigated", "resolved"].includes(action)) throw new Error("ACK_ARGS_INVALID");
+  const exitFile = join(dir, "a-watch-exit.json");
+  let marker = null;
+  try { marker = JSON.parse(await readFile(exitFile, "utf8")); }
+  catch (error) { if (error.code !== "ENOENT") throw error; }
+  const markerMatches = marker && marker.schema === WATCH_EXIT_SCHEMA && marker.wakeId === id;
+  let supervisionMatched = false;
+  try {
+    await acknowledge(id, action, dir, now);
+    supervisionMatched = true;
+  } catch (error) {
+    if (error.message !== "WAKE_ID_NOT_PENDING") throw error;
+  }
+  if (markerMatches && marker.acknowledgedAt === null) {
+    await writeJsonAtomic(exitFile, { ...marker, acknowledgedAt: now, ackAction: action });
+    console.log("WATCH_EXIT_ACKNOWLEDGED=" + action);
+  }
+  if (!supervisionMatched && !markerMatches) throw new Error("WAKE_ID_NOT_PENDING");
+  if (!supervisionMatched && markerMatches && marker.acknowledgedAt !== null) throw new Error("WAKE_ID_ALREADY_ACKNOWLEDGED");
+}
+
 export function classifyManagerResult(action, observation, record, params) {
   if (action === "release") return observation.code === 0 && observation.result === "AGENT_SPACE_RELEASED" ? 0 : 2;
   if (action !== "send") return 2;
@@ -447,7 +505,7 @@ export async function main(args = process.argv.slice(2)) {
       await handle?.close();
     }
   }
-  if (p.action === "ack") { await acknowledge(p.wakeId, p.ackAction, dir); return 0; }
+  if (p.action === "ack") { await acknowledgeWake(p.wakeId, p.ackAction, dir); return 0; }
   if (p.action === "consume") {
     const record = await readDispatchState(dir);
     if (!record || record.conversationUuid.toLowerCase() !== p.conversation.toLowerCase() || record.taskSpace !== p.space) {
@@ -493,34 +551,55 @@ export async function main(args = process.argv.slice(2)) {
       try { await verifiedConsumption(dir, armed); }
       catch (error) {
         if (error.message !== "REPLY_NOT_CONSUMED") throw error;
-        console.log("RESULT=REPLY_STAGED_WAKE_SUPERVISOR action=consume");
-        return 2;
+        return await exitWatching(dir, "REPLY_STAGED_WAKE_SUPERVISOR", { detail: "action=consume" });
       }
       return releaseDelivered(p, dir);
     }
     // One managed job owns BOTH the fast probe and the slow supervisor. No idle
-    // model calls; only the terminal return code wakes a compatible host.
+    // model calls; only the terminal return code wakes a compatible host, and
+    // every wake path first persists the ego-watch-exit ledger (agent-kit#25).
     const pollIntervalMs = 30_000;
     let benignStreak = 0;
-    while (true) {
-      const pollStartedAt = Date.now();
-      const template = await readFile(templates.probe, "utf8");
-      const observation = await runEgo(adaptTemplate(template, p), dir, "probe");
-      if (observation.code === 0 && observation.result === "DONE_CANDIDATE") {
-        // A completed turn needs the owning Agent to inspect and consume the
-        // reply before page release. A process exit is only a wake request.
-        console.log("RESULT=REPLY_READY_WAKE_SUPERVISOR action=collect");
-        return 2;
+    try {
+      while (true) {
+        const pollStartedAt = Date.now();
+        const template = await readFile(templates.probe, "utf8");
+        const observation = await runEgo(adaptTemplate(template, p), dir, "probe");
+        if (observation.code === 0 && observation.result === "DONE_CANDIDATE") {
+          // A completed turn needs the owning Agent to inspect and consume the
+          // reply before page release. A process exit is only a wake request.
+          return await exitWatching(dir, "REPLY_READY_WAKE_SUPERVISOR", { detail: "action=collect" });
+        }
+        const verdict = classifyProbeResult(observation, benignStreak);
+        benignStreak = verdict.streak;
+        if (verdict.wake) {
+          return await exitWatching(dir, "FAST_PROBE_WAKE_SUPERVISOR", {
+            detail: "signal=" + (observation.result || "MISSING") + " exit=" + observation.code +
+              (observation.detail ? " detail=" + observation.detail : ""),
+          });
+        }
+        if (await tick(Date.now(), dir)) {
+          // Reuse the supervision pending id so both ledgers share one wakeId
+          // and one ack clears both. tick() already announced its wake line
+          // with that id, so no second RESULT line is printed here.
+          let pending = null;
+          try { pending = JSON.parse(await readFile(join(dir, "a-supervision-status.json"), "utf8")).pending ?? null; }
+          catch { pending = null; }
+          const supervisionReason = pending && typeof pending.reason === "string" && pending.reason
+            ? pending.reason : "MONITOR_WAKE_UNACKNOWLEDGED";
+          return await exitWatching(dir, supervisionReason, {
+            wakeId: pending && typeof pending.id === "string" ? pending.id : undefined,
+            announce: false,
+          });
+        }
+        await new Promise((res) => setTimeout(res, Math.max(0, pollIntervalMs - (Date.now() - pollStartedAt))));
       }
-      const verdict = classifyProbeResult(observation, benignStreak);
-      benignStreak = verdict.streak;
-      if (verdict.wake) {
-        console.log("RESULT=FAST_PROBE_WAKE_SUPERVISOR signal=" + (observation.result || "MISSING") + " exit=" + observation.code +
-          (observation.detail ? " detail=" + observation.detail : ""));
-        return 2;
-      }
-      if (await tick(Date.now(), dir)) return 2;
-      await new Promise((res) => setTimeout(res, Math.max(0, pollIntervalMs - (Date.now() - pollStartedAt))));
+    } catch (error) {
+      // A loop crash still leaves the durable wake ledger behind; exit code 2
+      // is preserved instead of turning the failure into a clean exit.
+      return await exitWatching(dir, "WATCH_EXCEPTION", {
+        detail: "code=" + ((error && (error.code || error.message)) || "UNKNOWN"),
+      });
     }
   }
   const file = p.newChat || p.recoverOnly ? templates.send : templates[p.action];

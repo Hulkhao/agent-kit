@@ -209,6 +209,9 @@ const r = await page.fetch("/backend-api/conversation/" + uuid,
 | `CONVERSATION_UNAVAILABLE_PERSISTENT` | 死页梯子 3 strikes | 只报「持续不可用」，深查/重派/迁移；不声称会话永久死亡 |
 | `START_IDLE_WAKE_SUPERVISOR` | 恢复首轮空闲，存在基线时序风险（issue #8 起属良性：wrapper 自动重启自愈并留痕，连续 >20 轮才升级唤醒） | 单次出现无需处置；wrapper 日志见 `BENIGN_SIGNAL_SELFHEAL` 留痕可审计 |
 | `FAST_PROBE_WAKE_SUPERVISOR signal=MISSING exit=<code> [detail=<行>]` | watch 子进程异常退出且无 RESULT 行（2026-11-16 起 detail=末条非 RESULT 输出行，≤200 字符，#31） | 三段判定：detail 含 `command not found`=命令缺失（修 ego-browser PATH/环境后全套重启）；detail 为 JS 堆栈行（`at …`/`Error: …`）=脚本崩溃（留 tail 证据上报 §9.1）；无 detail=零输出静默退出（查托管宿主/进程被杀，非脚本逻辑）。exit=127 通常是命令缺失 |
+| `WATCH_EXCEPTION code=<…> wakeId=<uuid>`（#25③） | watch 循环可捕获异常（2026-11-16 起 watch 所有 exit 2 路径统一先落盘 `a-watch-exit.json` 再退出） | 读 stderr 定位异常；按 wakeId 处置后 `ack`（§6.6，与监督账本同 id 时一次 ack 双清）；再重新布防 |
+
+2026-11-16 起，watch 的全部 exit 2 唤醒行（REPLY_READY/REPLY_STAGED/FAST_PROBE/WATCH_EXCEPTION）末尾统一追加 `wakeId=<uuid>`，处置后按该 id ack（§6.6）；tick 监督路径复用监督 pending id（双账本同 id）。
 
 ### 6.4 异常接棒、监控健康与重新布防
 
@@ -216,7 +219,7 @@ const r = await page.fetch("/backend-api/conversation/" + uuid,
 
 **派单后核对**：`watch` 受管任务有可追踪 ID，任务的结束/异常退出能进入当前本地 Agent 的可处理通知或回调。在现有运行平台上拿不到此保障，就报告“监控接棒能力缺失”，说明缺的是哪条通知链路，不宣称闭环。无需特意制造网页卡死来验收。
 
-**收到唤醒后**：先读 §6.3 的具体信号和状态文件，判断是完整回复、正常长工具链、页面不可用、进程崩溃还是疑似僵尸轮（§5.2）；保留证据后选 `collect`、继续等待、有限恢复、人工停轮或迁移。完成实际诊断后执行 `ack` 并重新运行受管 `watch`；管理器在完整提取并写入校验回执后才能执行 `release`。
+**收到唤醒后**：先读 §6.3 的具体信号和状态文件，判断是完整回复、正常长工具链、页面不可用、进程崩溃还是疑似僵尸轮（§5.2）；保留证据后选 `collect`、继续等待、有限恢复、人工停轮或迁移。完成实际诊断后执行 `ack` 并重新运行受管 `watch`；管理器在完整提取并写入校验回执后才能执行 `release`。2026-11-16 起 watch 的每条 exit 2 路径同步落盘 `a-watch-exit.json`（schema `ego-watch-exit/v1`，不存正文）；`ack` 为双账本：同 wakeId 同时命中监督 pending 与 watch-exit 时一次 ack 双清，已 ack 的 watch-exit 记录保留作历史证据，重复 ack 报 `WAKE_ID_ALREADY_ACKNOWLEDGED`。
 
 **异常处理闭环**：脚本退出或某条 `WAKE_SUPERVISOR` 日志出现后，本地 Agent 若未实际接到通知，按“监控能力缺失”上报 §9.1，不能把写日志视为恢复成功。未能照预案恢复的实战问题同样进入 Issues；普通执行 Agent 不私改 `monitor/` 或 Skill。
 
@@ -235,6 +238,22 @@ node monitor/dispatch-manager.mjs rebuild-space --monitor-dir <监控根目录> 
 - **审计**：每次调用（含拒绝与失败）追加一行 JSON 到 `<监控根目录>/a-space-rebuild-audit.ndjson`（ts/agentId/space/decision/outcome/result/exit），排障复盘以此为准。
 - **成功后**：`RESULT=SPACE_REBUILT`（exit 0）→ 直接重跑原 `send`/`watch`/`probe`，页面恢复仍走既有受管链路；会话归属账本由后续 probe/send 的 `claimAgentSpace` 自愈，rebuild-space 不改账本。
 - **边界**：本命令只解决「空间注册表丢失」；已知会话缺页（`CONVERSATION_PAGE_RECOVERY_REQUIRED`）仍按 #31 Test D 折衷走 reconciliation。probe/send 输出 `RECOVERY_HINT=SPACE_REGISTRY_LOST` 即提示本路径；takeover 场景不发 HINT。
+
+### 6.6 宿主唤醒保障钩子（wake-guard，#25③，ChatGPT High 裁决 A+C LIMITED GO 2026-11-16）
+
+**解决什么**：watch exit 2 唤醒被宿主漏处理（实测排队 3 分钟无人兜底）与 watch 静默死亡（实测空转 3 小时）。机制=事件持久化（C：`a-watch-exit.json`）→ 宿主发现（A：PreToolUse 注入）→ 强制重新进入处理回合（A：Stop 一次性接棒）→ 人工 ack。**这是事件驱动恢复机制，不是 24×7 实时监控**：宿主完全休眠、单次工具调用阻塞超 3 分钟、宿主进程死亡时无保障；OS 级守护明确不做（裁决边界）。
+
+**安装**：`node monitor/install-zcode-guard.mjs`（幂等升级：老配置只补缺失的 Stop 条目；发现重复 AgentKit 条目报 `ZCODE_GUARD_DUPLICATE_RULES` 不静默修复；首次写前备份 `.pre-chatgpt-guard.bak`；用户既有 hook 全保留）。`--verify` 扩展为同时审计 PreToolUse 守卫与 Stop/wake-context 模块存在性。**安装/升级后必须新开 ZCode 会话**——运行中的会话不热加载 hook 配置快照。
+
+**机器配置（显式，不猜 cwd）**：`~/.agents/ego-profile.json` 增加 `"monitorRoots": ["<监控根目录绝对路径>", …]`，每项=一次 `--monitor-dir` 的根（其下含 `conversations/<uuid>/`）。未配置/为空=钩子不启用（配置缺口，**不是健康信号**，零输出）。
+
+**PreToolUse 注入（仅异常注入，健康零输出）**：`[AGENT_KIT_WAKE_GUARD]` 块，四态——`WAKE_PENDING`（watch-exit 未 ack，0s 即报，action=INSPECT_AND_ACK_REQUIRED）/`SUPERVISION_PENDING`（监督 pending ≥60s）/`WATCH_STALE`（ACCEPTED 且 fast-state 陈旧 ≥7min，与监督 FAST_POLL_STALE 同值，且派单记录本身也超 7 分钟防刚派单误报，action=REARM_WATCH_AND_VERIFY）/`WAKE_STATUS_UNKNOWN`（关键状态文件损坏或不可读，绝不解释成健康，action=INSPECT_MONITOR_STATE）。限频：同 session+wakeId 60s 一次；每次 ≤3 事件（超出报 `additional=<n>`）；限频账本 `~/.agents/ego-wake-guard-state.json`（独立文件，不碰业务账本）。deny 共存冻结契约：deny 原因原文不动、注入并列；**禁止**因注入转 allow、禁止因监控文件读取失败放行本该 deny 的调用。
+
+**Stop 接棒**：宿主准备收尾仍有未处理唤醒 → 输出 `decision:block` 强制继续一轮（`stop_hook_active=true` 或 90s 冷却内不再 block；账本写失败仍 block，最坏多继续一轮，绝不静默放行未处理唤醒）。
+
+**处置闭环**：看到 `[AGENT_KIT_WAKE_GUARD]` → 按 state/action 处置（collect/重新布防/查状态）→ `node monitor/dispatch-manager.mjs ack --monitor-dir <根> --agent-id <ID> --space <空间> --conversation <uuid> --wake-id <注入的wakeId> --ack-action investigated|resolved`（双账本同 id 一次双清；已 ack 再 ack 报 `WAKE_ID_ALREADY_ACKNOWLEDGED`）→ 下次注入确认该 wakeId 消失。
+
+**测试缝**：环境变量 `EGO_WAKE_GUARD_PROFILE_PATH` / `EGO_WAKE_GUARD_LEDGER_PATH` 仅重定向只读配置与限频账本的查找路径（单测夹具用），不改变任何权限判定；生产默认 `~/.agents/` 下。
 
 ## 7. 统一参数表（唯一口径）
 

@@ -37,6 +37,8 @@ node monitor/dispatch-manager.mjs watch --monitor-dir <项目监控目录> --age
 
 退出码和 `WAKE_SUPERVISOR` 输出需要宿主实际转交给 Agent 才构成唤醒。未验证宿主退出通知时，不能声称已完成自动接棒。
 
+唤醒保障钩子（#25③，wake-guard）：watch 的每条 exit 2 路径先落盘 `a-watch-exit.json` 再退出；安装器（`monitor/install-zcode-guard.mjs`，幂等升级）同时安装 PreToolUse 注入与 Stop 一次性接棒——宿主每次工具调用前会在有未处理唤醒/监督积压/快探测陈旧时收到 `[AGENT_KIT_WAKE_GUARD]` 摘要（仅异常注入，健康零输出），收尾时仍有未处理唤醒则被强制继续一轮。机器需在 `~/.agents/ego-profile.json` 显式配置 `monitorRoots`（监控根目录绝对路径列表），未配置即不启用。处置后用 `ack --wake-id <注入的wakeId> --ack-action investigated|resolved` 双账本清账。详见手册 §6.6。该钩子是事件驱动恢复机制，不是 24×7 实时监控（宿主完全休眠/阻塞超 3 分钟/进程死亡无保障，OS 级守护按裁决不做）。
+
 ## ZCode 文件回执按需接棒
 
 需要等待 ZCode 文件回执时，手动运行 `monitor/start-zcode-reply-watcher.ps1`。监听 `D:\Downloads\zcode-codex交流\replies\` 中完整的 `<请求名>.reply.md`，延迟约两分钟后，通过 Codex CLI 请求原会话接棒。**默认不运行、不随 Windows 登录启动**。启动命令、状态与日志位置、已有测试及尚未通过的真实唤醒验收见 [`monitor/ZCODE-REPLY-WATCHER.md`](monitor/ZCODE-REPLY-WATCHER.md)。

@@ -5,5 +5,7 @@
   "spaceExpect": {
     "example-special-space-name": "other-account@example.com"
   },
-  "spaceRebuildAllowlist": []
+  "spaceRebuildAllowlist": [],
+  "monitorRoots": [],
+  "_monitorRootsComment": "Absolute paths of dispatch monitor roots (each root is the --monitor-dir that contains conversations/<uuid>/). The wake-guard hooks only scan these roots; missing or empty disables detection (a config gap, not a health signal). Example: [\"D:/Users/<you>/agent-kit/.monitors/agent-kit\"]"
 }

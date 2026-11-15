@@ -1,7 +1,8 @@
 #!/usr/bin/env node
-// Idempotently install the official PreToolUse policy into the USER ZCode hooks.
+// Idempotently install the official PreToolUse policy and the Stop one-shot
+// wake-handoff hook into the USER ZCode hooks (agent-kit #25 plan A).
 // Back up the original config before the first write, preserve all other hooks.
-// --verify [configPath]: read-only audit of the installed guard rule; no backup, no writes.
+// --verify [configPath]: read-only audit of the installed guard rules; no backup, no writes.
 import { readFile, writeFile, rename, copyFile, mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
@@ -10,9 +11,32 @@ import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 
 const script = resolve(dirname(fileURLToPath(import.meta.url)), "../plugins/chatgpt-dispatch-guard/hooks/pre-tool-use.mjs");
+const stopScript = resolve(dirname(fileURLToPath(import.meta.url)), "../plugins/chatgpt-dispatch-guard/hooks/stop.mjs");
+const wakeContextScript = resolve(dirname(fileURLToPath(import.meta.url)), "../plugins/chatgpt-dispatch-guard/hooks/wake-context.mjs");
 export const marker = "chatgpt-dispatch-guard/hooks/pre-tool-use.mjs";
+export const stopMarker = "chatgpt-dispatch-guard/hooks/stop.mjs";
 
-export function installConfig(existing, scriptPath = script) {
+function findOwn(entries, entryMarker) {
+  return entries.filter((group) => group.hooks?.some((h) => h.args?.some((a) => String(a).replace(/\\/g, "/").includes(entryMarker))));
+}
+
+function upsertOwn(entries, entryMarker, canonical) {
+  // Idempotent: an existing AgentKit entry is upgraded in place (older shape),
+  // missing entries are appended, duplicate AgentKit entries fail loudly
+  // instead of being silently repaired.
+  const own = findOwn(entries, entryMarker);
+  if (own.length > 1) throw new Error("ZCODE_GUARD_DUPLICATE_RULES");
+  if (!own.length) { entries.push(canonical); return true; }
+  if (JSON.stringify(own[0]) !== JSON.stringify(canonical)) {
+    // An older installation used matcher="*", which is an invalid regular expression.
+    Object.keys(own[0]).forEach((key) => delete own[0][key]);
+    Object.assign(own[0], canonical);
+    return true;
+  }
+  return false;
+}
+
+export function installConfig(existing, scriptPath = script, stopScriptPath = stopScript) {
   const config = structuredClone(existing);
   if (!config || typeof config !== "object" || Array.isArray(config)) throw new Error("ZCODE_CONFIG_INVALID");
   const hooks = config.hooks ||= {};
@@ -20,18 +44,13 @@ export function installConfig(existing, scriptPath = script) {
   const events = hooks.events ||= {};
   const pre = events.PreToolUse ||= [];
   if (!Array.isArray(pre)) throw new Error("ZCODE_HOOKS_INVALID");
+  const stop = events.Stop ||= [];
+  if (!Array.isArray(stop)) throw new Error("ZCODE_HOOKS_INVALID");
   let changed = hooks.enabled !== true;
   hooks.enabled = true;
-  const own = pre.filter((group) => group.hooks?.some((h) => h.args?.some((a) => String(a).replace(/\\/g, "/").includes(marker))));
-  if (own.length > 1) throw new Error("ZCODE_GUARD_DUPLICATE_RULES");
-  const canonical = { hooks: [{ type: "process", command: "node", args: [scriptPath], timeoutMs: 5000 }] };
-  if (!own.length) { pre.push(canonical); changed = true; }
-  else if (JSON.stringify(own[0]) !== JSON.stringify(canonical)) {
-    // An older installation used matcher="*", which is an invalid regular expression.
-    Object.keys(own[0]).forEach((key) => delete own[0][key]);
-    Object.assign(own[0], canonical);
-    changed = true;
-  }
+  changed = upsertOwn(pre, marker, { hooks: [{ type: "process", command: "node", args: [scriptPath], timeoutMs: 5000 }] }) || changed;
+  // Stop one-shot handoff: same idempotent rules as the PreToolUse guard.
+  changed = upsertOwn(stop, stopMarker, { hooks: [{ type: "process", command: "node", args: [stopScriptPath], timeoutMs: 5000 }] }) || changed;
   return { config, changed };
 }
 
@@ -40,7 +59,7 @@ function isRtkGroup(group) {
 }
 
 // Read-only audit of one installed guard rule against the canonical shape.
-export function verifyConfig(existing, scriptPath = script) {
+export function verifyConfig(existing, scriptPath = script, stopScriptPath = stopScript) {
   if (!existing || typeof existing !== "object" || Array.isArray(existing)) throw new Error("ZCODE_CONFIG_INVALID");
   const pre = existing.hooks?.events?.PreToolUse;
   if (existing.hooks?.enabled !== true) throw new Error("ZCODE_HOOKS_DISABLED");
@@ -60,6 +79,27 @@ export function verifyConfig(existing, scriptPath = script) {
   }
   if (hook.timeoutMs !== 5000) throw new Error("ZCODE_GUARD_TIMEOUT_INVALID");
   if (!pre.some(isRtkGroup)) throw new Error("ZCODE_GUARD_RTK_MISSING");
+  auditStopRule(existing.hooks?.events?.Stop, stopScriptPath);
+  return true;
+}
+
+// Read-only audit of the Stop one-shot handoff rule (agent-kit #25 plan A).
+function auditStopRule(stop, stopScriptPath) {
+  if (!Array.isArray(stop)) throw new Error("ZCODE_GUARD_STOP_NOT_INSTALLED");
+  const own = stop.flatMap((group) => (group.hooks || [])
+    .filter((h) => h.args?.some((a) => String(a).replace(/\\/g, "/").includes(stopMarker)))
+    .map((hook) => ({ group, hook })));
+  if (!own.length) throw new Error("ZCODE_GUARD_STOP_NOT_INSTALLED");
+  if (own.length > 1) throw new Error("ZCODE_GUARD_DUPLICATE_RULES");
+  const { group, hook } = own[0];
+  if ("matcher" in group) throw new Error("ZCODE_GUARD_MATCHER_PRESENT");
+  if (group.hooks.length !== 1) throw new Error("ZCODE_GUARD_RULE_SHAPE_INVALID");
+  if (hook.type !== "process") throw new Error("ZCODE_GUARD_TYPE_INVALID");
+  if (hook.command !== "node") throw new Error("ZCODE_GUARD_COMMAND_INVALID");
+  if (!Array.isArray(hook.args) || hook.args.length !== 1 || resolve(String(hook.args[0])) !== resolve(stopScriptPath)) {
+    throw new Error("ZCODE_GUARD_SCRIPT_PATH_MISMATCH");
+  }
+  if (hook.timeoutMs !== 5000) throw new Error("ZCODE_GUARD_TIMEOUT_INVALID");
   return true;
 }
 
@@ -68,7 +108,9 @@ export async function verify(file = join(homedir(), ".zcode/cli/config.json"), s
   try { original = await readFile(file, "utf8"); }
   catch (error) { if (error.code === "ENOENT") throw new Error("ZCODE_GUARD_NOT_INSTALLED"); throw error; }
   verifyConfig(JSON.parse(original), scriptPath);
-  if (!existsSync(scriptPath)) throw new Error("ZCODE_GUARD_SCRIPT_MISSING");
+  for (const path of [scriptPath, stopScript, wakeContextScript]) {
+    if (!existsSync(path)) throw new Error("ZCODE_GUARD_SCRIPT_MISSING");
+  }
   return true;
 }
 

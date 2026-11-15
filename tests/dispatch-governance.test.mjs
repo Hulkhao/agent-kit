@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { mkdtemp, mkdir, rm, writeFile, readFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -9,7 +10,7 @@ import { join, resolve } from "node:path";
 import { normalizeFastState } from "../monitor/state-schema.mjs";
 import { tick, acknowledge } from "../monitor/supervision-watchdog.mjs";
 import { shouldReviewStartupIdle } from "../monitor/supervision-policy.mjs";
-import { parseArgs, adaptTemplate, bindNewConversation, classifyManagerResult, loadAttachments, requireArmedDispatch, main, readEgoOutcome, ensureMonitor, authorizeSpaceRebuild, rebuildSpace } from "../monitor/dispatch-manager.mjs";
+import { parseArgs, adaptTemplate, bindNewConversation, classifyManagerResult, loadAttachments, requireArmedDispatch, main, readEgoOutcome, ensureMonitor, authorizeSpaceRebuild, rebuildSpace, exitWatching, acknowledgeWake } from "../monitor/dispatch-manager.mjs";
 import { withAgentRegistry } from "../monitor/agent-space.mjs";
 import { checkDispatchTool } from "../plugins/chatgpt-dispatch-guard/hooks/policy.mjs";
 import { installConfig, install } from "../monitor/install-zcode-guard.mjs";
@@ -662,6 +663,222 @@ test("#31: diagnostic detail truncates to 200 characters without a RESULT line",
 test("#31: the watch wake line appends diagnostic detail when present", async () => {
   const source = await readFile(new URL("../monitor/dispatch-manager.mjs", import.meta.url), "utf8");
   const watch = source.slice(source.indexOf('if (p.action === "watch")'), source.indexOf('if (p.action === "probe") await writeFile'));
-  assert.match(watch, /RESULT=FAST_PROBE_WAKE_SUPERVISOR signal=/);
+  // The unified exit still emits RESULT=FAST_PROBE_WAKE_SUPERVISOR signal=<result>
+  // exit=<code>[ detail=<tail>] and now appends the ledger wakeId.
+  assert.match(watch, /exitWatching\(dir, "FAST_PROBE_WAKE_SUPERVISOR", \{/);
+  assert.match(watch, /"signal=" \+ \(observation\.result \|\| "MISSING"\) \+ " exit=" \+ observation\.code \+/);
   assert.match(watch, /\(observation\.detail \? " detail=" \+ observation\.detail : ""\)/);
+});
+
+const WATCH_EXIT_FILE = "a-watch-exit.json";
+
+test("#25: exitWatching persists the frozen ego-watch-exit/v1 ledger before the wake exit", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ego-watch-exit-"));
+  const logs = [];
+  const originalLog = console.log;
+  console.log = (line) => logs.push(String(line));
+  let code;
+  try {
+    code = await exitWatching(dir, "FAST_PROBE_WAKE_SUPERVISOR");
+  } finally { console.log = originalLog; }
+  assert.equal(code, 2);
+  const stored = JSON.parse(await readFile(join(dir, WATCH_EXIT_FILE), "utf8"));
+  // The schema is frozen: exactly these seven fields, no task or reply body.
+  assert.deepEqual(Object.keys(stored).sort(),
+    ["ackAction", "acknowledgedAt", "exitCode", "issuedAt", "reason", "schema", "wakeId"]);
+  assert.equal(stored.schema, "ego-watch-exit/v1");
+  assert.equal(stored.reason, "FAST_PROBE_WAKE_SUPERVISOR");
+  assert.equal(stored.exitCode, 2);
+  assert.equal(stored.acknowledgedAt, null);
+  assert.equal(stored.ackAction, null);
+  assert.equal(Number.isFinite(stored.issuedAt), true);
+  assert.match(stored.wakeId, /^[a-f\d]{8}-[a-f\d]{4}-[1-8][a-f\d]{3}-[89ab][a-f\d]{3}-[a-f\d]{12}$/);
+  // The wake line announces the same wakeId so the host can ack directly.
+  const announced = logs.filter((line) => line.startsWith("RESULT=FAST_PROBE_WAKE_SUPERVISOR"));
+  assert.equal(announced.length, 1);
+  assert.equal(announced[0], "RESULT=FAST_PROBE_WAKE_SUPERVISOR wakeId=" + stored.wakeId);
+});
+
+test("#25: a failed watch-exit marker write keeps the wake exit and records stderr", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ego-watch-exit-fail-"));
+  const missing = join(root, "no-such-dir", "conv");
+  const errors = [];
+  const logs = [];
+  const originalError = console.error;
+  const originalLog = console.log;
+  console.error = (line) => errors.push(String(line));
+  console.log = (line) => logs.push(String(line));
+  let code;
+  try {
+    code = await exitWatching(missing, "WATCH_EXCEPTION");
+  } finally {
+    console.error = originalError;
+    console.log = originalLog;
+  }
+  // The write failure must not upgrade the wake into a success.
+  assert.equal(code, 2);
+  await assert.rejects(readFile(join(missing, WATCH_EXIT_FILE)), { code: "ENOENT" });
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /RESULT=WATCH_EXIT_MARKER_WRITE_FAILED wakeId=[\da-f-]{36} reason=WATCH_EXCEPTION code=ENOENT/);
+  // The wake reason is still announced on stdout; the loss lands on stderr only.
+  assert.equal(logs.filter((line) => line.startsWith("RESULT=")).length, 1);
+  assert.match(logs[0], /RESULT=WATCH_EXCEPTION wakeId=/);
+});
+
+test("#25: a staged-but-unconsumed reply exits watch through the durable ledger", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ego-watch-staged-"));
+  const dir = join(root, "conversations", uuid);
+  const logs = [];
+  const originalLog = console.log;
+  try {
+    await mkdir(dir, { recursive: true });
+    const record = { schema: "ego-dispatch-state/v2", dispatchId: uuid, conversationUuid: uuid,
+      taskSpace: "GDC-执行A", pageLabel: "p1", status: "COMPLETED",
+      baselineTailKey: null, baselineTailRole: null, baselineComposerLength: 0,
+      attempt: 1, createdAt: Date.now(), payload_sha256: sha256("任务") };
+    await writeFile(join(dir, "a-dispatch-state.json"), JSON.stringify(record));
+    await saveReply(dir, record, { text: "已暂存回复", source: "DOM_BOUNDARY_VISIBLE" }, uuid);
+    console.log = (line) => logs.push(String(line));
+    const code = await main(["watch", "--monitor-dir", root, "--agent-id", "gdc-a",
+      "--space", "GDC-执行A", "--conversation", uuid]);
+    assert.equal(code, 2);
+    const marker = JSON.parse(await readFile(join(dir, WATCH_EXIT_FILE), "utf8"));
+    assert.equal(marker.schema, "ego-watch-exit/v1");
+    assert.equal(marker.reason, "REPLY_STAGED_WAKE_SUPERVISOR");
+    assert.equal(marker.exitCode, 2);
+    assert.equal(marker.acknowledgedAt, null);
+    assert.equal(marker.ackAction, null);
+    assert.deepEqual(Object.keys(marker).sort(),
+      ["ackAction", "acknowledgedAt", "exitCode", "issuedAt", "reason", "schema", "wakeId"]);
+    assert.ok(logs.some((line) => line === "RESULT=REPLY_STAGED_WAKE_SUPERVISOR action=consume wakeId=" + marker.wakeId),
+      "wake line must carry the ledger wakeId: " + JSON.stringify(logs));
+  } finally {
+    console.log = originalLog;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("#25: every watch exit-2 path persists the ego-watch-exit ledger and announces its wakeId", async () => {
+  const source = await readFile(new URL("../monitor/dispatch-manager.mjs", import.meta.url), "utf8");
+  const watch = source.slice(source.indexOf('if (p.action === "watch")'), source.indexOf('if (p.action === "probe") await writeFile'));
+  // Path 4: REPLY_STAGED (staged reply, consumption still owed).
+  assert.match(watch, /exitWatching\(dir, "REPLY_STAGED_WAKE_SUPERVISOR", \{ detail: "action=consume" \}\)/);
+  // Path 1: DONE_CANDIDATE -> REPLY_READY.
+  assert.match(watch, /exitWatching\(dir, "REPLY_READY_WAKE_SUPERVISOR", \{ detail: "action=collect" \}\)/);
+  // Path 2: fast-probe anomaly, original wake fields preserved.
+  assert.match(watch, /exitWatching\(dir, "FAST_PROBE_WAKE_SUPERVISOR", \{/);
+  assert.match(watch, /"signal=" \+ \(observation\.result \|\| "MISSING"\) \+ " exit=" \+ observation\.code \+/);
+  // Path 3: abnormal supervision round reuses the supervision pending id so
+  // both ledgers share one wakeId; tick() already announced that line.
+  assert.match(watch, /exitWatching\(dir, supervisionReason, \{/);
+  assert.match(watch, /a-supervision-status\.json/);
+  assert.match(watch, /wakeId: pending && typeof pending\.id === "string" \? pending\.id : undefined/);
+  assert.match(watch, /pending\.reason : "MONITOR_WAKE_UNACKNOWLEDGED"/);
+  assert.match(watch, /announce: false/);
+  // Path 5: a catchable loop crash still leaves the ledger and exits 2.
+  assert.match(watch, /try \{\s*while \(true\)/);
+  assert.match(watch, /exitWatching\(dir, "WATCH_EXCEPTION", \{/);
+  assert.match(watch, /"code=" \+ \(\(error && \(error\.code \|\| error\.message\)\) \|\| "UNKNOWN"\)/);
+});
+
+test("#25: the watch-exit marker is written atomically with a fail-open-on-write exit", async () => {
+  const source = await readFile(new URL("../monitor/dispatch-manager.mjs", import.meta.url), "utf8");
+  const fn = source.slice(source.indexOf("// Unified watch exit"), source.indexOf("export async function acknowledgeWake"));
+  assert.match(source, /const WATCH_EXIT_SCHEMA = "ego-watch-exit\/v1";/);
+  assert.match(fn, /writeJsonAtomic\(join\(dir, "a-watch-exit\.json"\), marker\)/);
+  assert.match(fn, /schema: WATCH_EXIT_SCHEMA/);
+  assert.match(fn, /exitCode: 2/);
+  assert.match(fn, /acknowledgedAt: null/);
+  assert.match(fn, /ackAction: null/);
+  // Write failure: stderr record, exit code stays 2, never a success path.
+  assert.match(fn, /WATCH_EXIT_MARKER_WRITE_FAILED/);
+  assert.doesNotMatch(fn, /return 0|return 1/);
+  assert.match(fn, /SIGKILL|power loss/);
+});
+
+const supervisionLedger = (id, overrides = {}) => ({
+  schema: "ego-supervision/v1", generationKey: null, progressAt: 0,
+  abnormalRounds: 1, lastReviewAt: 0,
+  pending: { id, reason: "FAST_POLL_STALE", issuedAt: 1000 }, ...overrides,
+});
+
+test("#25: ack confirms the watch-exit ledger and retains it as evidence", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ego-ack-watch-exit-"));
+  try {
+    const wakeId = randomUUID();
+    const write = (marker) => writeFile(join(dir, WATCH_EXIT_FILE), JSON.stringify(marker));
+    await write({ schema: "ego-watch-exit/v1", wakeId, reason: "REPLY_READY_WAKE_SUPERVISOR",
+      issuedAt: 1234, exitCode: 2, acknowledgedAt: null, ackAction: null });
+    await assert.rejects(acknowledgeWake(wakeId, "bogus", dir), /ACK_ARGS_INVALID/);
+    await acknowledgeWake(wakeId, "investigated", dir, 5000);
+    const marker = JSON.parse(await readFile(join(dir, WATCH_EXIT_FILE), "utf8"));
+    assert.equal(marker.acknowledgedAt, 5000);
+    assert.equal(marker.ackAction, "investigated");
+    // Historical evidence is retained, not deleted or rewritten.
+    assert.equal(marker.wakeId, wakeId);
+    assert.equal(marker.reason, "REPLY_READY_WAKE_SUPERVISOR");
+    assert.equal(marker.issuedAt, 1234);
+    assert.deepEqual(Object.keys(marker).sort(),
+      ["ackAction", "acknowledgedAt", "exitCode", "issuedAt", "reason", "schema", "wakeId"]);
+    // A repeated ack of the already-acknowledged marker is rejected.
+    await assert.rejects(acknowledgeWake(wakeId, "resolved", dir, 6000), /WAKE_ID_ALREADY_ACKNOWLEDGED/);
+    const after = JSON.parse(await readFile(join(dir, WATCH_EXIT_FILE), "utf8"));
+    assert.equal(after.ackAction, "investigated");
+    assert.equal(after.acknowledgedAt, 5000);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("#25: one ack clears both ledgers sharing the same wakeId", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ego-ack-dual-"));
+  try {
+    const wakeId = randomUUID();
+    await writeFile(join(dir, "a-supervision-status.json"), JSON.stringify(supervisionLedger(wakeId)));
+    await writeFile(join(dir, WATCH_EXIT_FILE), JSON.stringify({ schema: "ego-watch-exit/v1", wakeId,
+      reason: "FAST_POLL_STALE", issuedAt: 1000, exitCode: 2, acknowledgedAt: null, ackAction: null }));
+    await acknowledgeWake(wakeId, "resolved", dir, 7000);
+    const status = JSON.parse(await readFile(join(dir, "a-supervision-status.json"), "utf8"));
+    assert.equal(status.pending, null);
+    assert.equal(status.lastReviewAt, 7000);
+    assert.equal(status.abnormalRounds, 0);
+    const marker = JSON.parse(await readFile(join(dir, WATCH_EXIT_FILE), "utf8"));
+    assert.equal(marker.acknowledgedAt, 7000);
+    assert.equal(marker.ackAction, "resolved");
+    assert.equal(marker.wakeId, wakeId);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("#25: an unknown or unreadable wake id still fails closed", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ego-ack-failclosed-"));
+  const other = "22222222-2222-4222-8222-222222222222";
+  try {
+    await assert.rejects(acknowledgeWake(randomUUID(), "investigated", dir), /WAKE_ID_NOT_PENDING/);
+    // Neither ledger matches the acked id: both stay untouched.
+    await writeFile(join(dir, "a-supervision-status.json"), JSON.stringify(supervisionLedger(other)));
+    const markerId = randomUUID();
+    await writeFile(join(dir, WATCH_EXIT_FILE), JSON.stringify({ schema: "ego-watch-exit/v1", wakeId: markerId,
+      reason: "WATCH_EXCEPTION", issuedAt: 1, exitCode: 2, acknowledgedAt: null, ackAction: null }));
+    await assert.rejects(acknowledgeWake(randomUUID(), "resolved", dir), /WAKE_ID_NOT_PENDING/);
+    const status = JSON.parse(await readFile(join(dir, "a-supervision-status.json"), "utf8"));
+    assert.equal(status.pending.id, other);
+    const marker = JSON.parse(await readFile(join(dir, WATCH_EXIT_FILE), "utf8"));
+    assert.equal(marker.acknowledgedAt, null);
+    // A corrupted watch-exit ledger must not be silently acknowledged.
+    await writeFile(join(dir, WATCH_EXIT_FILE), "{corrupted");
+    await assert.rejects(acknowledgeWake(markerId, "investigated", dir), /JSON at position|Unexpected token/);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("#25: supervision-only wake ids keep the existing ack semantics", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ego-ack-supervision-"));
+  try {
+    const pendingId = randomUUID();
+    await writeFile(join(dir, "a-supervision-status.json"), JSON.stringify(supervisionLedger(pendingId, { abnormalRounds: 2 })));
+    await acknowledgeWake(pendingId, "investigated", dir, 9000);
+    const status = JSON.parse(await readFile(join(dir, "a-supervision-status.json"), "utf8"));
+    assert.equal(status.pending, null);
+    assert.equal(status.lastReviewAt, 9000);
+    assert.equal(status.abnormalRounds, 2);
+    // A supervision ack never fabricates a watch-exit marker.
+    await assert.rejects(readFile(join(dir, WATCH_EXIT_FILE)), { code: "ENOENT" });
+  } finally { await rm(dir, { recursive: true, force: true }); }
 });

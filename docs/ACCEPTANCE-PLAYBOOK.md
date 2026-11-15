@@ -31,7 +31,12 @@
 1. **接管门复测**（490a182 遗留）：模拟升级后 user-owned 空间跑 probe → 期望 `EGO_TASKSPACE_TAKEOVER_REQUIRED`，probe 不自动抢占；人工 claim 后恢复。
 2. **源自验**（952b395）：受管页漂到 `chrome://settings/`（或杀掉导航让页停在错误页）→ probe 一轮内报 `RESULT=PROBE_INVALID_ORIGIN`（不记 strike）；对照：RECOVER 轮空白页/新建页导航前不误报。
 3. **升级回归**（缺口②核实结论）：制造持续 probe 失败 → 验证看门狗第 3 异常轮输出 `USER_ESCALATION_REQUIRED` 到达 Agent。
-4. **缺口③**：方案 A/C 待 PO 裁决（见 #25 2026-11-16 评论），裁决前不实施。
+4. **缺口③ wake-guard 实机验收（ChatGPT High 裁决 A+C LIMITED GO，2026-11-16）**。前置：本机 `node monitor/install-zcode-guard.mjs` 安装（幂等升级）且 `--verify` 通过 → **新开 ZCode 会话**（运行中会话不热加载 hook）→ `~/.agents/ego-profile.json` 已配 `monitorRoots`（指向验收用监控根）。
+   - **E1 延迟唤醒**：制造未 ack 的 `WAKE_PENDING`（`a-watch-exit.json` 的 issuedAt 回拨 180s）→ 宿主继续正常任务 → 下次 PreToolUse 收到 `[AGENT_KIT_WAKE_GUARD] WAKE_PENDING`（wakeId 一致）→ 尝试收尾回合 → Stop 强制继续一轮 → 处置并 `ack` → 该 wakeId 不再注入。
+   - **E2 watch 死亡接棒**：真实 active dispatch + 正常 watch → 记录 fast-state 时间戳 → 强杀 watch 进程（不走退出路径）→ fast-state 回拨 3h → 下次 PreToolUse 见 `WATCH_STALE` → 重新布防后提示消失。对照三项：完成/终态 dispatch 不误报；新鲜 watch 不误报；状态文件损坏报 `WAKE_STATUS_UNKNOWN` 不报健康。
+   - **E3 守卫兼容**：ChatGPT 直连浏览器调用/Backend API 直写照常 DENY；无关工具不受影响；deny+注入并存且 deny 原因原文不变；安装两次无重复条目（重复即 VERIFY 失败不静默修）；`--verify` 只读全过。
+   - **E4 端到端**：真实 ZCode 宿主完成 E1/E2 两场景，PO 确认两种历史失效形态（唤醒排队 3 分钟 / watch 死 3 小时）均被宿主主动发现并接棒。
+   - **PASS 判据**：E1~E3 全过 + wakeId 全程一致 + Stop 每停止流程只接棒一轮；E4 由 PO 在实机确认后才算关闭 #25 缺口③。
 
 ## E-20：composer 全机锁双 Agent 并发（issue #20）
 
