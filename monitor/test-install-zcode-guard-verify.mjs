@@ -27,6 +27,11 @@ test("verify passes on canonical install (rtk + guard + stop)", () => {
   verifyConfig(full());
 });
 
+test("verify accepts rtk group with full executable path command (field form, 2026-11-16)", () => {
+  const rtkPathForm = { matcher: "Bash", hooks: [{ type: "process", command: "D:\\AIGC\\tools\\rtk\\rtk.exe", args: ["hook", "claude"], timeoutMs: 5000 }] };
+  verifyConfig({ hooks: { enabled: true, events: { PreToolUse: [rtkPathForm, guard()], Stop: [stopGuard()] } } });
+});
+
 test("verify fails when guard rule absent", () => {
   let code = "";
   try { verifyConfig({ hooks: { enabled: true, events: { PreToolUse: [rtk], Stop: [stopGuard()] } } }); }

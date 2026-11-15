@@ -61,7 +61,10 @@ export function installConfig(existing, scriptPath = script, stopScriptPath = st
 }
 
 function isRtkGroup(group) {
-  return group.hooks?.some((h) => h.command === "rtk" || h.args?.some((a) => String(a).includes("rtk")));
+  // Real-world installs use a full executable path (e.g. D:\AIGC\tools\rtk\rtk.exe),
+  // not the bare "rtk" name; audit by substring so both spellings count
+  // (field-observed 2026-11-16, E-25③ hook install on this machine).
+  return group.hooks?.some((h) => String(h.command || "").includes("rtk") || h.args?.some((a) => String(a).includes("rtk")));
 }
 
 // Read-only audit of one installed guard rule against the canonical shape.
