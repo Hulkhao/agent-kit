@@ -69,10 +69,17 @@ test("verify fails when matcher present", () => {
   if (code !== "ZCODE_GUARD_MATCHER_PRESENT") throw new Error(code || "no throw");
 });
 
+test("verify accepts full node path command (portable-node host, field form 2026-11-16)", () => {
+  const nodePath = "D:\\Users\\Administrator\\ego\\node-portable\\node-v20.18.0-win-x64\\node.exe";
+  const guardPathForm = { hooks: [{ type: "process", command: nodePath, args: [realScript], timeoutMs: 5000 }] };
+  const stopPathForm = { hooks: [{ type: "process", command: nodePath, args: [realStopScript], timeoutMs: 5000 }] };
+  verifyConfig({ hooks: { enabled: true, events: { PreToolUse: [rtk, guardPathForm], Stop: [stopPathForm] } } });
+});
+
 test("verify fails on wrong type/command/timeout", () => {
   for (const [mutate, expected] of [
     [(h) => { h.type = "shell"; }, "ZCODE_GUARD_TYPE_INVALID"],
-    [(h) => { h.command = "node.exe"; }, "ZCODE_GUARD_COMMAND_INVALID"],
+    [(h) => { h.command = "nodejs"; }, "ZCODE_GUARD_COMMAND_INVALID"],
     [(h) => { h.timeoutMs = 3000; }, "ZCODE_GUARD_TIMEOUT_INVALID"],
     [(h) => { h.args = ["C:/old/plugins/chatgpt-dispatch-guard/hooks/pre-tool-use.mjs"]; }, "ZCODE_GUARD_SCRIPT_PATH_MISMATCH"],
   ]) {
@@ -132,7 +139,7 @@ test("verify fails on wrong Stop shape/path/timeout", () => {
   for (const [mutate, expected] of [
     [(g) => { g.matcher = "*"; }, "ZCODE_GUARD_MATCHER_PRESENT"],
     [(g) => { g.hooks[0].type = "shell"; }, "ZCODE_GUARD_TYPE_INVALID"],
-    [(g) => { g.hooks[0].command = "node.exe"; }, "ZCODE_GUARD_COMMAND_INVALID"],
+    [(g) => { g.hooks[0].command = "nodejs"; }, "ZCODE_GUARD_COMMAND_INVALID"],
     [(g) => { g.hooks[0].timeoutMs = 3000; }, "ZCODE_GUARD_TIMEOUT_INVALID"],
     [(g) => { g.hooks[0].args = ["D:/old/plugins/chatgpt-dispatch-guard/hooks/stop.mjs"]; }, "ZCODE_GUARD_SCRIPT_PATH_MISMATCH"],
   ]) {
@@ -210,7 +217,10 @@ test("installConfig upgrades an old PreToolUse-only config by adding exactly one
   const { config, changed } = installConfig(old);
   if (!changed) throw new Error("expected changed=true when adding Stop entry");
   if (config.hooks.events.Stop.length !== 1) throw new Error("expected exactly one Stop entry");
-  if (JSON.stringify(config.hooks.events.Stop[0]) !== JSON.stringify(stopGuard())) {
+  // Install writes the resolved node command (full path of the running node),
+  // not the bare "node" spelling — see resolveNodeCommand().
+  const expectedStop = { hooks: [{ type: "process", command: process.execPath, args: [realStopScript], timeoutMs: 5000 }] };
+  if (JSON.stringify(config.hooks.events.Stop[0]) !== JSON.stringify(expectedStop)) {
     throw new Error("Stop entry shape mismatch: " + JSON.stringify(config.hooks.events.Stop[0]));
   }
   verifyConfig(config);

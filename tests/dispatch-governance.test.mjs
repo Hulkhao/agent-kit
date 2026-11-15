@@ -442,7 +442,9 @@ test("user hook installer keeps existing hook rules, makes a backup and does not
     assert.equal(result.hooks.events.PreToolUse.length, 2);
     assert.deepEqual(result.hooks.events.PreToolUse[0], initial.hooks.events.PreToolUse[0]);
     assert.deepEqual(result.plugins, initial.plugins);
-    assert.equal(result.hooks.events.PreToolUse[1].hooks[0].command, "node");
+    // Install writes the resolved node command (full path), not bare "node" —
+    // portable-node hosts have no system node (field-observed 2026-11-16).
+    assert.equal(result.hooks.events.PreToolUse[1].hooks[0].command, process.execPath);
     assert.equal(Object.hasOwn(result.hooks.events.PreToolUse[1], "matcher"), false);
     assert.deepEqual(JSON.parse(await readFile(configFile + ".pre-chatgpt-guard.bak")), initial);
     assert.equal(installConfig(result).changed, false);
@@ -458,7 +460,7 @@ test("installer repairs older invalid matcher and disabled hooks without duplica
   assert.equal(config.hooks.enabled, true);
   assert.equal(config.hooks.events.PreToolUse.length, 1);
   assert.deepEqual(config.hooks.events.PreToolUse[0], { hooks: [
-    { type: "process", command: "node", args: ["C:/agent-kit/plugins/chatgpt-dispatch-guard/hooks/pre-tool-use.mjs"], timeoutMs: 5000 },
+    { type: "process", command: process.execPath, args: ["C:/agent-kit/plugins/chatgpt-dispatch-guard/hooks/pre-tool-use.mjs"], timeoutMs: 5000 },
   ] });
   assert.equal(installConfig(config, "C:/agent-kit/plugins/chatgpt-dispatch-guard/hooks/pre-tool-use.mjs").changed, false);
 });

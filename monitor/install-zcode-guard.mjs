@@ -16,6 +16,23 @@ const wakeContextScript = resolve(dirname(fileURLToPath(import.meta.url)), "../p
 export const marker = "chatgpt-dispatch-guard/hooks/pre-tool-use.mjs";
 export const stopMarker = "chatgpt-dispatch-guard/hooks/stop.mjs";
 
+// Bare "node" only works if the HOST process PATH can resolve it. Field-observed
+// 2026-11-16 (E-25③ live): on portable-node-only machines like this one there is
+// no system node, so the ZCode host spawns the hook with ENOENT and every guard
+// run fails (hook.run.failed, ~50ms each). Install therefore writes the full
+// path of the node running the installer — the same resolve-anywhere rule the
+// rtk group already uses in the field (cf. 97b8a897).
+export function resolveNodeCommand() {
+  const execPath = String(process.execPath || "");
+  const base = execPath.replace(/\\/g, "/").split("/").pop().toLowerCase();
+  return base === "node" || base === "node.exe" ? execPath : "node";
+}
+
+export function isNodeCommand(hook) {
+  const base = String(hook?.command || "").replace(/\\/g, "/").split("/").pop().toLowerCase();
+  return base === "node" || base === "node.exe";
+}
+
 // Hook-level matching (WG-05): duplicates are counted per actual Agent Kit
 // hook across all groups — matching verifyConfig/auditStopRule, so install and
 // VERIFY agree. Two Agent Kit hooks inside ONE group are duplicates too.
@@ -42,7 +59,7 @@ function upsertOwn(entries, entryMarker, canonical) {
   return false;
 }
 
-export function installConfig(existing, scriptPath = script, stopScriptPath = stopScript) {
+export function installConfig(existing, scriptPath = script, stopScriptPath = stopScript, nodeCommand = resolveNodeCommand()) {
   const config = structuredClone(existing);
   if (!config || typeof config !== "object" || Array.isArray(config)) throw new Error("ZCODE_CONFIG_INVALID");
   const hooks = config.hooks ||= {};
@@ -54,9 +71,9 @@ export function installConfig(existing, scriptPath = script, stopScriptPath = st
   if (!Array.isArray(stop)) throw new Error("ZCODE_HOOKS_INVALID");
   let changed = hooks.enabled !== true;
   hooks.enabled = true;
-  changed = upsertOwn(pre, marker, { hooks: [{ type: "process", command: "node", args: [scriptPath], timeoutMs: 5000 }] }) || changed;
+  changed = upsertOwn(pre, marker, { hooks: [{ type: "process", command: nodeCommand, args: [scriptPath], timeoutMs: 5000 }] }) || changed;
   // Stop one-shot handoff: same idempotent rules as the PreToolUse guard.
-  changed = upsertOwn(stop, stopMarker, { hooks: [{ type: "process", command: "node", args: [stopScriptPath], timeoutMs: 5000 }] }) || changed;
+  changed = upsertOwn(stop, stopMarker, { hooks: [{ type: "process", command: nodeCommand, args: [stopScriptPath], timeoutMs: 5000 }] }) || changed;
   return { config, changed };
 }
 
@@ -82,7 +99,10 @@ export function verifyConfig(existing, scriptPath = script, stopScriptPath = sto
   if ("matcher" in group) throw new Error("ZCODE_GUARD_MATCHER_PRESENT");
   if (group.hooks.length !== 1) throw new Error("ZCODE_GUARD_RULE_SHAPE_INVALID");
   if (hook.type !== "process") throw new Error("ZCODE_GUARD_TYPE_INVALID");
-  if (hook.command !== "node") throw new Error("ZCODE_GUARD_COMMAND_INVALID");
+  // Command may be bare "node" or any full node path — identity is anchored by
+  // the script arg below; the host PATH decides which spelling can spawn (see
+  // resolveNodeCommand comment, field-observed 2026-11-16).
+  if (!isNodeCommand(hook)) throw new Error("ZCODE_GUARD_COMMAND_INVALID");
   if (!Array.isArray(hook.args) || hook.args.length !== 1 || resolve(String(hook.args[0])) !== resolve(scriptPath)) {
     throw new Error("ZCODE_GUARD_SCRIPT_PATH_MISMATCH");
   }
@@ -104,7 +124,7 @@ function auditStopRule(stop, stopScriptPath) {
   if ("matcher" in group) throw new Error("ZCODE_GUARD_MATCHER_PRESENT");
   if (group.hooks.length !== 1) throw new Error("ZCODE_GUARD_RULE_SHAPE_INVALID");
   if (hook.type !== "process") throw new Error("ZCODE_GUARD_TYPE_INVALID");
-  if (hook.command !== "node") throw new Error("ZCODE_GUARD_COMMAND_INVALID");
+  if (!isNodeCommand(hook)) throw new Error("ZCODE_GUARD_COMMAND_INVALID");
   if (!Array.isArray(hook.args) || hook.args.length !== 1 || resolve(String(hook.args[0])) !== resolve(stopScriptPath)) {
     throw new Error("ZCODE_GUARD_SCRIPT_PATH_MISMATCH");
   }

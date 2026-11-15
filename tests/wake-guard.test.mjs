@@ -610,7 +610,8 @@ test("installer: old PreToolUse-only config gains exactly one canonical Stop ent
   const { config, changed } = installConfig(old);
   assert.equal(changed, true);
   assert.equal(config.hooks.events.Stop.length, 1);
-  assert.deepEqual(config.hooks.events.Stop[0], { hooks: [{ type: "process", command: "node", args: [realStopScript], timeoutMs: 5000 }] });
+  // Canonical install output carries the resolved node command (full path).
+  assert.deepEqual(config.hooks.events.Stop[0], { hooks: [{ type: "process", command: process.execPath, args: [realStopScript], timeoutMs: 5000 }] });
   verifyConfig(config);
 });
 
@@ -667,9 +668,10 @@ test("installer: user hooks and legacy matcher repair behavior are preserved alo
   assert.equal(changed, true);
   assert.equal(config.hooks.enabled, true);
   // The user's rtk rule is untouched; the guard group is repaired in place; Stop is added.
+  // Repaired/added groups carry the resolved node command (full path), not bare "node".
   assert.deepEqual(config.hooks.events.PreToolUse[1], { matcher: "Bash", hooks: [{ type: "process", command: "rtk", args: ["hook", "claude"] }] });
-  assert.deepEqual(config.hooks.events.PreToolUse[0], { hooks: [{ type: "process", command: "node", args: ["C:/old/plugins/chatgpt-dispatch-guard/hooks/pre-tool-use.mjs"], timeoutMs: 5000 }] });
-  assert.deepEqual(config.hooks.events.Stop, [{ hooks: [{ type: "process", command: "node", args: ["C:/old/plugins/chatgpt-dispatch-guard/hooks/stop.mjs"], timeoutMs: 5000 }] }]);
+  assert.deepEqual(config.hooks.events.PreToolUse[0], { hooks: [{ type: "process", command: process.execPath, args: ["C:/old/plugins/chatgpt-dispatch-guard/hooks/pre-tool-use.mjs"], timeoutMs: 5000 }] });
+  assert.deepEqual(config.hooks.events.Stop, [{ hooks: [{ type: "process", command: process.execPath, args: ["C:/old/plugins/chatgpt-dispatch-guard/hooks/stop.mjs"], timeoutMs: 5000 }] }]);
   verifyConfig(config, "C:/old/plugins/chatgpt-dispatch-guard/hooks/pre-tool-use.mjs", "C:/old/plugins/chatgpt-dispatch-guard/hooks/stop.mjs");
 });
 
