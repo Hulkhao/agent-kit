@@ -45,4 +45,11 @@ try {
 if (!claimed || claimed.ownership !== "agent" || (claimed.taskId && claimed.taskId !== SPACE)) {
   stop("SPACE_CLAIM_OWNERSHIP_UNVERIFIED");
 }
+// #27 Batch 2 owner-attribution evidence: expose the claimed TaskSpace's
+// registry identity for the manager's audit fields. Best evidence only — a
+// field ego does not expose stays absent, never invented.
+const claimedEvidence = [];
+if (claimed.taskId) claimedEvidence.push("SPACE_CLAIMED_TASK_ID=" + claimed.taskId);
+if (claimed.name) claimedEvidence.push("SPACE_CLAIMED_TASK_NAME=" + claimed.name);
+if (claimedEvidence.length) console.log(claimedEvidence.join(" "));
 console.log("RESULT=SPACE_CLAIMED_ACCOUNT_VERIFIED");

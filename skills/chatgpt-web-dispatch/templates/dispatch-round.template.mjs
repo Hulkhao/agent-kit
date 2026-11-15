@@ -42,7 +42,7 @@ const {
 } = await import(pathToFileURL(MON + "/dispatch-state.mjs").href);
 const { isTaskSpaceTakeover, TASKSPACE_TAKEOVER_SIGNAL, assertAgentOwnedTaskSpace } =
   await import(pathToFileURL(MON + "/taskspace-takeover.mjs").href);
-const { claimAgentSpace } = await import(pathToFileURL(MON + "/agent-space.mjs").href);
+const { claimAgentSpace, isValidNewTaskSpaceName } = await import(pathToFileURL(MON + "/agent-space.mjs").href);
 const { recoverConversationPage, conversationIdFromUrl } = await import(pathToFileURL(MON + "/page-recovery.mjs").href);
 
 const payload = await fs.readFile(MSG_FILE, "utf-8");
@@ -119,6 +119,11 @@ try {
     // instead of failing send with TASKSPACE_NOT_FOUND until a new chat happens.
     spaceRegistryMissing = true;
     if (!profileCfg.defaultProfileId) abort("ACCOUNT_CONFIG_MISSING_STOP");
+    // #27 Batch 2 frozen naming convention: only NEW space creation is
+    // constrained — an existing space keeps its (possibly legacy) name, the
+    // reuse branch above never calls the validator. A legacy-named space lost
+    // from the registry recovers through the managed rebuild-space path.
+    if (!isValidNewTaskSpaceName(SPACE, AGENT_ID)) abort("TASKSPACE_NAMING_VIOLATION_STOP");
     task = await taskSpace(SPACE, { profileId: profileCfg.defaultProfileId });
     targetSpace = (await listTaskSpaces()).find((space) => space.taskId === SPACE || space.name === SPACE);
   }

@@ -58,6 +58,7 @@
    - `resolved`：需所有权证据，满足其一即 GRANTED：①注册表绑定——`ego-taskspaces.json`（withAgentRegistry）中该 agentId 的 spaceName === 会话账本（`conversations/<conversation>/a-dispatch-state.json`）的 taskSpace；②claim 接管证据——`--monitor-dir` 下 `a-space-rebuild-audit.ndjson` 存在 `action:"claim"` 且 `outcome:"CLAIMED"` 且 agentId、space 均匹配的行；
    - 无证据的 resolved → `ACK_RESOLVED_OWNERSHIP_REQUIRED` + OPERATOR 指引（先受管 claim 或降级 investigated），exit 2，**账本与 ego-watch-exit 标记零改动（fail-closed）**；
    - 每次受管 ack 在 `--monitor-dir` 下 `a-wake-ack-audit.ndjson` 追加一行 `{ts, agentId, space, conversation, wakeId, ackAction, outcome[, reason, evidence]}`；DENIED（含所有权拒绝与 WAKE_ID_NOT_PENDING 失败）也留痕；
+   - **审计尽力写入（规划师 r5 遗留项澄清）**：审计记录采用尽力写入；写入失败输出 `ACK_AUDIT_WRITE_FAILED`，不改变 ack 业务结果。审计文件不可写时，不能保证该次操作留下审计行。
    - **落点偏离说明**：裁决表格列的落点是 hooks/pre-tool-use.mjs，但 hook 层只有命令字符串与 session_id，无可靠的会话↔agent 身份映射；裁决自身规定「无法取得可靠会话身份时 resolved 必须 fail-closed」——在 hook 层执行 resolved 门禁会拒绝所有 Owner 的合法 resolved，与分级设计矛盾。故门禁落在唯一能核验声明身份与目标 TaskSpace 所有权关系的 dispatch-manager 受管 ack 路径（注册表绑定与会话账本均在此可读），hook 层不加拦截。此偏离需规划师逐项验收时裁定；
    - **身份边界说明（规划师复审 B-03）**：本门禁验证的是调用者**声明**的 agentId 与目标 TaskSpace 的所有权关系；不验证调用进程的真实 Agent 身份，不防止主动伪造 agentId——这是操作治理机制，不是安全认证；
    - **ego-watch-exit/v1 七字段合同零改动**（#25 冻结，现有 marker 测试原样通过）。
@@ -65,6 +66,26 @@
 3. **fail-open 维持记录（PO 决策 dcc8701）**：PreToolUse hook 进程故障/无法启动时，工具调用**静默放行**——安装器 `install-zcode-guard.mjs` 零改动、不写 `onError`，hooks config 写入形态不变。守卫不阻断工具，依赖 wake 注入（本批次观察 A 修订后可靠性更高）与探针判别法兜底。规划师的 deny-on-error 收紧建议被 PO 否决，双方观点与风险已按冲突处置纪律记录于 `docs/planning/issue-27-ruling-20261116.md` §五第 1 项；如需重启讨论，以该记录为凭。
 
 **PASS 判据**：1a~1g 与 2 各条全部符合，且与 `tests/wake-guard.test.mjs`、`tests/dispatch-governance.test.mjs` 对应用例一一对应；3 项为记录性条款（无实机动作），核对安装器产物不含 `onError` 即可。
+
+## E-27 Batch 2：TaskSpace 归属治理回归合同（issue #27，V1 口径，规划师裁决 §三 + §六）
+
+**范围**：命名规范固化、probe owner 日志、release 清理扩展、claim 归属审计字段。前置：git pull 至含 Batch 2 的 commit；验收空间命名按 §1 规范新建（`-accept-` 前缀纪律与命名规范并用）。对应测试：`tests/dispatch-governance.test.mjs` #27 B2 用例。归属与清理合同正文见 `docs/OPERATIONS.md`。
+
+1. **命名规范合同**（冻结形态 `<project>-<purpose>-<AGENT_ID>-<YYYYMMDD>`）：
+   - 合法名（含 AGENT_ID、8 位日期）通过校验；缺 AGENT_ID / 错 AGENT_ID / 非 8 位日期 / 超 120 字符 / 空 project/purpose 段拒绝；
+   - 校验只落**新建分支**（probe 自举 + dispatch-round Gate 1.5）：不匹配即 `TASKSPACE_NAMING_VIOLATION_STOP`，fail-closed 不创建；不匹配的**新**名无法借道 probe 失败→rebuild-space 绕过（rebuild 需 #31 授权链，无账本绑定即 DENIED）；
+   - **旧空间名复用不受影响**：复用路径与 rebuild-space 恢复路径无命名校验，旧名照原名复用/恢复，不改名不迁移；
+   - probe 启动行 `PROBE_BOOT version=... space=... mon=... owner=<AGENT_ID>` 带 Owner 标识。
+2. **release 清理合同**（受管 release 动作扩展 + `a-release-sweep-audit.ndjson` 逐页审计）：
+   - 应关：注册表 known 集合内、账本终态（COMPLETED/ABORTED/RELEASED）的其他会话页（`TEMP_RESULT_PAGE_FINISHED_DISPATCH`）；
+   - 保留：账本活跃页（`ACTIVE_DISPATCH_LEDGER`）、账本不可证页（`LEDGER_UNPROVEN`）、空白页与归属不明页（`OWNERSHIP_UNPROVEN`）、release 目标残留（`RELEASE_TARGET_RESIDUAL`，由既有受管路径独占处理）；
+   - TaskSpace 本身不删除；其他 Agent 页面/用户页面不可触碰（unmanaged tab 由既有 `assertManagedReleasePages` 前置拦截）；
+   - 清理失败（关页失败/枚举失败/审计写失败）→ `RESULT=AGENT_SPACE_RELEASE_SWEEP_FAILED` exit 2，真实上报不伪装完整 release，OPERATOR 指引幂等重跑；
+   - 幂等：无临时页 zero-close 算成功；重复 release 走注册表早退，零浏览器调用直接成功。
+3. **claim 归属字段合同**：claim 审计行含 `ownerAgentId`、`taskSpaceId`、`taskSpaceName`、`conversation:null`；模板回读证据（`SPACE_CLAIMED_TASK_ID/NAME`）缺失时字段如实留 null；**#33 授权链（ledger binding → spaceTaken → allowlist → deny）零变化**（`authorizeSpaceRebuild` 源码与既有用例原样通过）。
+4. **V1 口径记录**：第 0 步只读检查未发现 ego lite TaskSpace 自定义元数据 API（详见 `docs/OPERATIONS.md` §5），V2 待正式 API 能力证据后另行立项。
+
+**PASS 判据**：1~3 各条全部符合，且与 `tests/dispatch-governance.test.mjs` #27 B2 用例一一对应；实机验收时新建空间走规范名、旧空间原样复用一次、release 后核对 sweep 审计行与幂等重跑。
 
 ## E-20：composer 全机锁双 Agent 并发（issue #20）
 

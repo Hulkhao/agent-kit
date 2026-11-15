@@ -11,7 +11,7 @@ import { normalizeFastState } from "../monitor/state-schema.mjs";
 import { tick, acknowledge } from "../monitor/supervision-watchdog.mjs";
 import { shouldReviewStartupIdle } from "../monitor/supervision-policy.mjs";
 import { parseArgs, adaptTemplate, bindNewConversation, classifyManagerResult, loadAttachments, requireArmedDispatch, main, readEgoOutcome, ensureMonitor, authorizeSpaceRebuild, rebuildSpace, claimSpace, taskspaceOwnershipLost, announceTaskspaceOwnershipLoss, exitWatching, acknowledgeWake, releaseDelivered, managedAcknowledge, ackOwnershipEvidence, ACK_RESOLVED_OWNERSHIP_REQUIRED, ACK_AUDIT_FILE } from "../monitor/dispatch-manager.mjs";
-import { withAgentRegistry } from "../monitor/agent-space.mjs";
+import { withAgentRegistry, isValidNewTaskSpaceName } from "../monitor/agent-space.mjs";
 import { taskspaceOperatorAction } from "../monitor/taskspace-takeover.mjs";
 import { checkDispatchTool } from "../plugins/chatgpt-dispatch-guard/hooks/policy.mjs";
 import { installConfig, install } from "../monitor/install-zcode-guard.mjs";
@@ -1590,4 +1590,129 @@ test("#33: collect failures are classified with post-mortem details and operator
   // The boundary failure exits through a classified RESULT, never a bare throw.
   assert.match(source, /console\.log\("RESULT=COLLECT_BOUNDARY_OR_FINALITY_UNVERIFIED"\)/);
   assert.doesNotMatch(source, /throw new Error\("COLLECT_BOUNDARY_OR_FINALITY_UNVERIFIED"\)/);
+});
+
+// ---- #27 Batch 2: TaskSpace ownership governance (V1: naming + probe owner
+// log + managed release sweep + claim attribution audit) ----
+
+test("#27 B2: the frozen naming convention gates NEW-space creation only", async () => {
+  const agent = "gdc-b1-planner"; // contains dashes: the literal is regex-anchored
+  // Legal names pass (project/purpose exclude dashes, so AGENT_ID is unambiguous).
+  assert.equal(isValidNewTaskSpaceName("agentkit-dispatch-gdc-b1-planner-20261116", agent), true);
+  assert.equal(isValidNewTaskSpaceName("agentkit.fix-db_sync-gdc-b1-planner-20261116", agent), true);
+  // Missing / wrong AGENT_ID is rejected (ruling: AGENT_ID is mandatory and stable).
+  assert.equal(isValidNewTaskSpaceName("agentkit-dispatch-20261116", agent), false);
+  assert.equal(isValidNewTaskSpaceName("agentkit-dispatch-other-agent-20261116", agent), false);
+  assert.equal(isValidNewTaskSpaceName("agentkit-dispatch-gdc-b1-planner-2026", agent), false);
+  assert.equal(isValidNewTaskSpaceName("agentkit-dispatch-gdc-b1-planner-2026111", agent), false);
+  assert.equal(isValidNewTaskSpaceName("-dispatch-gdc-b1-planner-20261116", agent), false);
+  assert.equal(isValidNewTaskSpaceName("agentkit--gdc-b1-planner-20261116", agent), false);
+  assert.equal(isValidNewTaskSpaceName("x".repeat(115) + "-20261116", agent), false);
+  assert.equal(isValidNewTaskSpaceName("", agent), false);
+  assert.equal(isValidNewTaskSpaceName("agentkit-dispatch-gdc-b1-planner-20261116", ""), false);
+  // Legacy space names fail the NEW-creation rule BY DESIGN — but are never
+  // renamed: reuse and rebuild paths never call the validator.
+  assert.equal(isValidNewTaskSpaceName("GDC-执行A", agent), false);
+  const probe = await readFile(new URL("../monitor/ego-fast-probe.mjs", import.meta.url), "utf8");
+  const round = await readFile(new URL("../skills/chatgpt-web-dispatch/templates/dispatch-round.template.mjs", import.meta.url), "utf8");
+  const rebuild = await readFile(new URL("../monitor/rebuild-space.template.mjs", import.meta.url), "utf8");
+  // Both creation branches fail closed immediately before the creation call.
+  assert.match(probe, /if \(!isValidNewTaskSpaceName\(SPACE, AGENT_ID\)\) throw new Error\("TASKSPACE_NAMING_VIOLATION_STOP"\);\s*\n\s*task = await taskSpace\(SPACE, \{ profileId: pinnedProfileId \}\)/);
+  assert.match(round, /if \(!isValidNewTaskSpaceName\(SPACE, AGENT_ID\)\) abort\("TASKSPACE_NAMING_VIOLATION_STOP"\);\s*\n\s*task = await taskSpace\(SPACE, \{ profileId: profileCfg\.defaultProfileId \}\)/);
+  // The violation keeps its own code instead of being masked as a registry loss.
+  assert.match(probe, /error\?\.message === "TASKSPACE_NAMING_VIOLATION_STOP" \? "TASKSPACE_NAMING_VIOLATION_STOP"/);
+  // The legacy recovery path has NO naming gate: old spaces are recovered under
+  // their proven original names (registry loss → managed rebuild-space).
+  assert.doesNotMatch(rebuild, /isValidNewTaskSpaceName|TASKSPACE_NAMING/);
+});
+
+test("#27 B2: the probe boot line announces the stable Owner next to the space", async () => {
+  const probe = await readFile(new URL("../monitor/ego-fast-probe.mjs", import.meta.url), "utf8");
+  // Same space-separated frozen format; owner is the adapted stable AGENT_ID.
+  assert.match(probe, /PROBE_BOOT version=\$\{PROBE_VERSION\} space=\$\{SPACE\} mon=\$\{MON\} owner=\$\{AGENT_ID\}/);
+});
+
+test("#27 B2: the release sweep keeps the conservative boundary and reports truthfully", async () => {
+  const source = await readFile(new URL("../monitor/release-agent-space.template.mjs", import.meta.url), "utf8");
+  // Close ONLY provably finished pages of THIS agent: registry-known conversation
+  // + terminal dispatch ledger.
+  assert.match(source, /const TERMINAL_DISPATCH = new Set\(\["COMPLETED", "ABORTED", "RELEASED"\]\)/);
+  assert.match(source, /TEMP_RESULT_PAGE_FINISHED_DISPATCH/);
+  assert.match(source, /assigned\.known\.some\(\(k\) => typeof k === "string" && k\.toLowerCase\(\) === uuid\.toLowerCase\(\)\)/);
+  // Conservative keeps: active dispatch, unproven ledger, unattributable pages,
+  // release-target residual (the managed close/finish path is exclusive there).
+  assert.match(source, /ACTIVE_DISPATCH_LEDGER/);
+  assert.match(source, /LEDGER_UNPROVEN/);
+  assert.match(source, /"OWNERSHIP_UNPROVEN"/);
+  assert.match(source, /RELEASE_TARGET_RESIDUAL/);
+  // The TaskSpace itself is never deleted; blank pages fall under OWNERSHIP_UNPROVEN.
+  assert.doesNotMatch(source, /deleteTaskSpace|removeTaskSpace|finish\(\{\s*\}\)/);
+  // Per-page audit lines carry page identity and reason; failures are audited too.
+  assert.match(source, /a-release-sweep-audit\.ndjson/);
+  assert.match(source, /action: "release-sweep"/);
+  assert.match(source, /page: \{ label: page\.label \?\? null, uuid: uuid \?\? null \}, decision, reason/);
+  assert.match(source, /"close-failed"/);
+  // A cleanup failure is reported truthfully, never disguised as a full release.
+  assert.match(source, /RESULT=AGENT_SPACE_RELEASE_SWEEP_FAILED closed=\$\{closed\} kept=\$\{kept\} failed=\$\{failed\}/);
+  // Last-conversation finish skips the sweep (finish already closed everything).
+  assert.match(source, /if \(result\.finished\) \{[\s\S]*?SPACE_FINISHED_BY_RELEASE/);
+  // Idempotency: the registry early-exit path (repeat release) stays a
+  // zero-close success with zero browser calls.
+  const early = source.slice(source.indexOf("if (!assigned.active.includes(CONV)"), source.indexOf("const spaces = await listTaskSpaces();"));
+  assert.match(early, /RESULT=AGENT_SPACE_RELEASED/);
+  assert.doesNotMatch(early, /task\.pages|page\.close|finish\(/);
+  // Manager wiring: the sweep failure is classified exit 2 with operator guidance.
+  const manager = await readFile(new URL("../monitor/dispatch-manager.mjs", import.meta.url), "utf8");
+  assert.match(manager, /if \(released\.result === "AGENT_SPACE_RELEASE_SWEEP_FAILED"\)/);
+  assert.match(manager, /OPERATOR_ACTION=release 临时页清理未完整完成/);
+  assert.match(manager, /if \(p\.action === "release" && observation\.result === "AGENT_SPACE_RELEASE_SWEEP_FAILED"\)/);
+});
+
+test("#27 B2: claim audit rows carry owner attribution without touching the #33 chain", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ego-claim-owner-"));
+  try {
+    await withAgentRegistry((registry) => {
+      registry.agents["gdc-a"] = { spaceName: "GDC-执行A", active: [], known: [] };
+      return { changed: true };
+    }, root);
+    const p = parseArgs(["claim", "--monitor-dir", root, "--agent-id", "gdc-a", "--space", "GDC-执行A"]);
+    // The template's post-claim registry readback feeds the owner fields.
+    assert.equal(await claimSpace(p, {
+      directory: root,
+      runScript: async () => ({ code: 0, result: "SPACE_CLAIMED_ACCOUNT_VERIFIED",
+        output: "probe noise\nSPACE_CLAIMED_TASK_ID=t-123 SPACE_CLAIMED_TASK_NAME=GDC-执行A\n" }),
+    }), 0);
+    const claimed = JSON.parse((await readFile(join(root, "a-space-rebuild-audit.ndjson"), "utf8")).trim().split("\n").at(-1));
+    assert.equal(claimed.ownerAgentId, "gdc-a");
+    assert.equal(claimed.taskSpaceId, "t-123");
+    assert.equal(claimed.taskSpaceName, "GDC-执行A");
+    assert.equal(claimed.conversation, null); // a claim has no conversation ledger
+    // Missing readback evidence stays null (never invented).
+    assert.equal(await claimSpace(p, {
+      directory: root,
+      runScript: async () => ({ code: 0, result: "SPACE_CLAIMED_ACCOUNT_VERIFIED" }),
+    }), 0);
+    const again = JSON.parse((await readFile(join(root, "a-space-rebuild-audit.ndjson"), "utf8")).trim().split("\n").at(-1));
+    assert.equal(again.ownerAgentId, "gdc-a");
+    assert.equal(again.taskSpaceId, null);
+    assert.equal(again.taskSpaceName, null);
+    assert.equal(again.conversation, null);
+    // The template exposes the claimed identity for the manager to audit, and
+    // only when ego actually reported it.
+    const template = await readFile(new URL("../monitor/claim-space.template.mjs", import.meta.url), "utf8");
+    assert.match(template, /SPACE_CLAIMED_TASK_ID=/);
+    assert.match(template, /SPACE_CLAIMED_TASK_NAME=/);
+    assert.match(template, /if \(claimed\.taskId\)/);
+    assert.match(template, /if \(claimed\.name\)/);
+    // Boundary (ruling §3.4): the owner fields live ONLY in audit rows — the
+    // #33 authorization chain keeps its original evidence order untouched.
+    const source = await readFile(new URL("../monitor/dispatch-manager.mjs", import.meta.url), "utf8");
+    const authorize = source.slice(source.indexOf("export async function authorizeSpaceRebuild"), source.indexOf("export async function rebuildSpace"));
+    assert.match(authorize, /SPACE_REBUILD_AGENT_BOUND_TO_OTHER_SPACE/);
+    assert.match(authorize, /SPACE_OWNED_BY_ANOTHER_AGENT/);
+    assert.match(authorize, /AGENT_SPACE_RELEASE_PENDING/);
+    assert.match(authorize, /spaceRebuildAllowlist/);
+    assert.match(authorize, /SPACE_REBUILD_NOT_AUTHORIZED/);
+    assert.doesNotMatch(authorize, /ownerAgentId|taskSpaceId|taskSpaceName/);
+  } finally { await rm(root, { recursive: true, force: true }); }
 });

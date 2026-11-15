@@ -475,6 +475,13 @@ export async function releaseDelivered(params, dir, { runScript } = {}) {
     ? await runScript(adaptTemplate(template, params), dir)
     : await runEgo(adaptTemplate(template, params), dir, "release");
   if (released.code !== 0 || released.result !== "AGENT_SPACE_RELEASED") {
+    // #27 Batch 2: the release template may finish the ledger close but leave
+    // temp-page cleanup incomplete (RESULT=AGENT_SPACE_RELEASE_SWEEP_FAILED).
+    // The classification stays fail-closed (exit 2 below); the operator is
+    // pointed at the sweep audit and the idempotent re-release.
+    if (released.result === "AGENT_SPACE_RELEASE_SWEEP_FAILED") {
+      console.error("OPERATOR_ACTION=release 临时页清理未完整完成（明细见监控根 a-release-sweep-audit.ndjson）：处置后重跑 release，幂等收尾。");
+    }
     // The dispatch is already COMPLETED here, so wake-context's WATCH_STALE
     // backstop would never re-raise it; the only durable handoff is the
     // watch-exit marker. Exit 2 therefore goes through exitWatching (WG-03),
@@ -594,10 +601,20 @@ export async function claimSpace(p, { directory, profileConfig, runScript } = {}
     ? await runScript(source, p.monitorDir)
     : await runEgo(source, p.monitorDir, "claim");
   const claimed = classifyManagerResult("claim", observation) === 0;
+  // #27 Batch 2 owner-attribution fields (audit/identification ONLY — they
+  // never feed the #33 authorization chain, whose order is unchanged). Taken
+  // from the template's post-claim registry readback when present; anything
+  // ego does not expose stays null and a claim has no conversation ledger
+  // (conversation stays null, never invented).
+  const taskSpaceId = claimed
+    ? (observation.output?.match(/SPACE_CLAIMED_TASK_ID=(\S+)/)?.[1] ?? null) : null;
+  const taskSpaceName = claimed
+    ? (observation.output?.match(/SPACE_CLAIMED_TASK_NAME=(.+?)\s*$/m)?.[1]?.trim() ?? null) : null;
   // The audit row records the verified-ownership verdict, not the raw template code.
   await audit({ decision, outcome: claimed ? "CLAIMED" : "FAILED",
     result: claimed ? "SPACE_CLAIMED_OWNERSHIP_VERIFIED" : (observation.result || "MISSING"),
-    exit: observation.code });
+    exit: observation.code,
+    ownerAgentId: p.agentId, taskSpaceId, taskSpaceName, conversation: null });
   if (claimed) {
     console.log("RESULT=SPACE_CLAIMED space=" + p.space);
     return 0;
@@ -858,6 +875,11 @@ export async function main(args = process.argv.slice(2)) {
   // it at its own takeover exits, so it is not repeated here for probe runs.
   if (observation.code !== 0 && p.action !== "probe") {
     announceTaskspaceOwnershipLoss(observation, p.space);
+  }
+  // #27 Batch 2: same truthful reporting for the direct `release` action —
+  // the sweep-failure RESULT is already classified as exit 2 above.
+  if (p.action === "release" && observation.result === "AGENT_SPACE_RELEASE_SWEEP_FAILED") {
+    console.error("OPERATOR_ACTION=release 临时页清理未完整完成（明细见监控根 a-release-sweep-audit.ndjson）：处置后重跑 release，幂等收尾。");
   }
   if (p.recoverOnly) {
     const recovered = await readDispatchState(dir);

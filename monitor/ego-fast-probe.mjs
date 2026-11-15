@@ -16,7 +16,10 @@ if ([MON, SPACE, AGENT_ID].some((value) => value.startsWith("REPLACE_"))) {
 // output stream, so a stale project-local copy (old params, drifted tags) is immediately
 // visible in fast-out.txt instead of failing silently forever.
 const PROBE_VERSION = "r45.2";
-console.log(`PROBE_BOOT version=${PROBE_VERSION} space=${SPACE} mon=${MON}`);
+// #27 Batch 2: the boot line carries the stable Owner id next to the space, so
+// a stale/deployed copy's identity (and its TaskSpace ownership) is checkable
+// from the output stream alone. Same space-separated frozen format.
+console.log(`PROBE_BOOT version=${PROBE_VERSION} space=${SPACE} mon=${MON} owner=${AGENT_ID}`);
 
 const {
   appendEvent,
@@ -48,6 +51,7 @@ const { selectUniqueConversationPage, isConversationUrl, probeOriginVerdict } = 
 const { TASKSPACE_TAKEOVER_SIGNAL, isTaskSpaceTakeover, isTaskspaceOwnershipLoss,
   assertAgentOwnedTaskSpace, taskspaceOperatorAction } =
   await import(pathToFileURL(MON + "/taskspace-takeover.mjs").href);
+const { isValidNewTaskSpaceName } = await import(pathToFileURL(MON + "/agent-space.mjs").href);
 const { claimAgentSpace, reserveAgentPage } = await import(pathToFileURL(MON + "/agent-space.mjs").href);
 const { shouldReviewStartupIdle } = await import(pathToFileURL(MON + "/supervision-policy.mjs").href);
 
@@ -181,6 +185,11 @@ try {
     if (!pinnedProfileId) throw new Error("TASKSPACE_BOOTSTRAP_NO_PIN");
     const knownProfiles = await profiles();
     if (!knownProfiles.some((p) => p.id === pinnedProfileId)) throw new Error("TASKSPACE_BOOTSTRAP_PROFILE_UNKNOWN");
+    // #27 Batch 2 frozen naming convention: only NEW space creation is
+    // constrained — an existing space keeps its (possibly legacy) name, the
+    // reuse branch above never calls the validator. A legacy-named space lost
+    // from the registry recovers through the managed rebuild-space path.
+    if (!isValidNewTaskSpaceName(SPACE, AGENT_ID)) throw new Error("TASKSPACE_NAMING_VIOLATION_STOP");
     task = await taskSpace(SPACE, { profileId: pinnedProfileId });
     // verify what actually got created before continuing (name/taskId, ownership, profileId when exposed)
     const created = (await listTaskSpaces()).find((space) => space.taskId === SPACE || space.name === SPACE);
@@ -203,7 +212,11 @@ try {
     task = await taskSpace(spaceId);
   }
 } catch (error) {
-  const code = isTaskSpaceTakeover(error) ? TASKSPACE_TAKEOVER_SIGNAL : "TASKSPACE_RECOVERY_FAILED";
+  // A naming violation keeps its own code (it is a config/usage error, not a
+  // registry loss): brand-new non-conforming names stay blocked, while a
+  // legacy-named space routed to rebuild-space recovers under its proven name.
+  const code = isTaskSpaceTakeover(error) ? TASKSPACE_TAKEOVER_SIGNAL :
+    error?.message === "TASKSPACE_NAMING_VIOLATION_STOP" ? "TASKSPACE_NAMING_VIOLATION_STOP" : "TASKSPACE_RECOVERY_FAILED";
   await writeState({ spaceId, probeFailed: true, recoveryFailed: true, errorCode: code, ...safeError(error) });
   await appendEvent(MON, code, { spaceId, ...safeError(error) });
   console.log("RECOVERY_DETAIL=" + String(error && error.message || error).slice(0, 200));

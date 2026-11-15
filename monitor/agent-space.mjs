@@ -130,3 +130,17 @@ export async function releaseAgentConversation({ agentId, spaceName, conversatio
     return { changed: true, value: { finished: remaining.length === 0, active: remaining } };
   }, directory);
 }
+
+// #27 Batch 2 (ruling §3.2, frozen): a NEWLY created TaskSpace must be named
+// <project>-<purpose>-<AGENT_ID>-<YYYYMMDD>. AGENT_ID is the Agent's stable
+// identity — temporary session ids and omission are forbidden. The project and
+// purpose segments exclude dashes so the AGENT_ID literal stays unambiguous.
+// CREATION ONLY: existing spaces keep their names forever (no rename, no
+// migration) — reuse and rebuild paths never call this validator, so legacy
+// names keep working.
+export function isValidNewTaskSpaceName(name, agentId) {
+  if (typeof name !== "string" || typeof agentId !== "string" ||
+      name === "" || agentId === "" || name.length > 120) return false;
+  const escaped = agentId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp("^[A-Za-z0-9][A-Za-z0-9_.]*-[A-Za-z0-9][A-Za-z0-9_.]*-" + escaped + "-\\d{8}$").test(name);
+}
