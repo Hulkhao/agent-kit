@@ -261,28 +261,38 @@ async function scanConversation(dir, name, now, io, events) {
 export async function detectWakeAnomalies(monitorRoots, now, io = defaultIo) {
   const events = [];
   for (const root of Array.isArray(monitorRoots) ? monitorRoots : []) {
+    const from = events.length;
+    let rootReadable = true;
     try {
       await io.readdir(root, { withFileTypes: true });
     } catch (error) {
       // The whole monitorRoot is absent or unreadable (ENOENT/EACCES/...):
       // fail closed as UNKNOWN.
+      rootReadable = false;
       events.push(unknownEvent(root, error?.code || "READ_FAILED"));
-      continue;
     }
-    const conversationsDir = join(root, "conversations");
-    let entries;
-    try {
-      entries = await io.readdir(conversationsDir, { withFileTypes: true });
-    } catch (error) {
-      if (error?.code === "ENOENT") continue; // root exists, conversations not yet created: benign empty state
-      events.push(unknownEvent(conversationsDir, error?.code || "READ_FAILED"));
-      continue;
+    if (rootReadable) {
+      const conversationsDir = join(root, "conversations");
+      let entries = null;
+      try {
+        entries = await io.readdir(conversationsDir, { withFileTypes: true });
+      } catch (error) {
+        // Root exists, conversations not yet created: benign empty state.
+        // Any other conversations read failure is UNKNOWN.
+        if (error?.code !== "ENOENT") events.push(unknownEvent(conversationsDir, error?.code || "READ_FAILED"));
+      }
+      if (entries) {
+        for (const entry of entries) {
+          if (!entry.isDirectory()) continue;
+          try { await scanConversation(join(conversationsDir, entry.name), entry.name, now, io, events); }
+          catch { events.push(unknownEvent(join(conversationsDir, entry.name), "SCAN_FAILED")); }
+        }
+      }
     }
-    for (const entry of entries) {
-      if (!entry.isDirectory()) continue;
-      try { await scanConversation(join(conversationsDir, entry.name), entry.name, now, io, events); }
-      catch { events.push(unknownEvent(join(conversationsDir, entry.name), "SCAN_FAILED")); }
-    }
+    // Observation A (#27 ruling): pin every event to the monitorRoot that
+    // produced it, so per-event cooldown identities isolate roots — an event
+    // of one root never masks (or inherits a cooldown from) another root's.
+    for (let i = from; i < events.length; i++) events[i].monitorRoot = root;
   }
   return { healthy: events.length === 0, events };
 }
@@ -310,17 +320,22 @@ function eventLines(event) {
   return lines;
 }
 
-// Frozen injection format (ruling §2.2): a single text block whose first line
-// is [AGENT_KIT_WAKE_GUARD], at most 3 events (excess reported as a count),
-// zero output for a healthy state (returns null). No permission semantics here.
-export function formatWakeContext(events, maxEvents = 3) {
+// Frozen injection format (ruling §2.2, as amended by #27 observation A): a
+// single text block whose first line is [AGENT_KIT_WAKE_GUARD], at most 3
+// events (excess reported as an additional count — "additional=N suppressed by
+// cap"), zero output for a healthy state (returns null). No permission
+// semantics here. `additional` may be passed explicitly by the caller when the
+// displayed events were pre-filtered (per-event cooldown selection) and the
+// capped tail is not part of `events`.
+export function formatWakeContext(events, maxEvents = 3, additional = null) {
   if (!Array.isArray(events) || events.length === 0) return null;
   const lines = ["[AGENT_KIT_WAKE_GUARD]"];
   events.slice(0, maxEvents).forEach((event, index) => {
     if (index > 0) lines.push("");
     lines.push(...eventLines(event));
   });
-  if (events.length > maxEvents) lines.push(`additional=${events.length - maxEvents}`);
+  const extra = additional ?? Math.max(0, events.length - maxEvents);
+  if (extra > 0) lines.push(`additional=${extra} suppressed by cap`);
   return lines.join("\n");
 }
 
@@ -382,4 +397,44 @@ export function withInjection(ledger, key, now) {
 
 export function withStopBlock(ledger, sessionId, now) {
   return { ...ledger, stopBlocks: { ...ledger.stopBlocks, [sessionId]: now } };
+}
+
+// Observation A (#27 ruling): per-event identity key = eventType + wakeId +
+// monitorRoot. Events without a wakeId (WAKE_STATUS_UNKNOWN and friends) fall
+// back to their stable source identifier — the source path already pins both
+// the file and the monitorRoot, so two roots' UNKNOWN events never share an
+// identity (step f: cross-root isolation).
+export function eventIdentity(event) {
+  const type = typeof event?.type === "string" && event.type !== "" ? event.type : "EVENT";
+  const id = typeof event?.wakeId === "string" && event.wakeId !== "" ? event.wakeId
+    : typeof event?.source === "string" && event.source !== "" ? event.source : "anonymous";
+  const root = typeof event?.monitorRoot === "string" ? event.monitorRoot : "";
+  return `${type}:${id}:${root}`;
+}
+
+// Observation A: per-event cooldown selection, replacing the whole-block
+// suppression (the old events[0]-hit-cooldown path swallowed every batch-mate).
+// Pipeline, in order:
+// 1. in-batch dedup — one identity appears at most once per event block;
+// 2. per-event cooldown — a cooled identity is suppressed by ITSELF only and
+//    never hides a fresh batch-mate;
+// 3. display cap — at most `cap` events are shown; the fresh tail is reported
+//    as an additional count. Cooldown bookkeeping is stamped ONLY for
+//    displayed events: an event hidden behind the cap has not been shown, so
+//    it must stay eligible for the next block.
+// Returns { shown: [{ event, key }], additional }. Ledger keys are
+// "<sessionId>:<identity>" — new-format keys coexist with the pre-#27
+// "<sessionId>:wake:<id>" keys, which stay in the state file untouched.
+export function selectWakeEvents(events, ledger, sessionId, now, cooldownMs = INJECTION_COOLDOWN_MS, cap = 3) {
+  const seen = new Set();
+  const fresh = [];
+  for (const event of Array.isArray(events) ? events : []) {
+    const key = (sessionId ?? "global") + ":" + eventIdentity(event);
+    if (seen.has(key)) continue; // in-batch dedup: same identity shows once per block
+    seen.add(key);
+    if (injectionCooldownActive(ledger, key, now, cooldownMs)) continue; // per-event cooldown
+    fresh.push({ event, key });
+  }
+  const shown = fresh.slice(0, cap);
+  return { shown, additional: Math.max(0, fresh.length - cap) };
 }

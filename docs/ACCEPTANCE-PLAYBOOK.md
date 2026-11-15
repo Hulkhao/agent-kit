@@ -38,6 +38,33 @@
    - **E4 端到端**：真实 ZCode 宿主完成 E1/E2 两场景，PO 确认两种历史失效形态（唤醒排队 3 分钟 / watch 死 3 小时）均被宿主主动发现并接棒。
    - **PASS 判据**：E1~E3 全过 + wakeId 全程一致 + Stop 每停止流程只接棒一轮；E4 由 PO 在实机确认后才算关闭 #25 缺口③。
 
+## E-27 Batch 1：wake-guard 可靠性回归合同（issue #27，规划师裁决 + PO 终局 dcc8701）
+
+**范围**：观察 A 逐事件冷却、观察 B ack 权限分级（受管 ack 路径）、C 项 fail-open 维持记录。前置：git pull 至含 Batch 1 的 commit；`node monitor/install-zcode-guard.mjs --verify` 通过；新开 ZCode 会话（运行中会话不热加载 hook）；`~/.agents/ego-profile.json` 已配 `monitorRoots`。
+
+1. **逐事件冷却合同**（落点 `plugins/chatgpt-dispatch-guard/hooks/wake-context.mjs` + `pre-tool-use.mjs`；对应 `tests/wake-guard.test.mjs` #27 A 用例）：
+   - a. 事件 A 首次出现 → 注入 A；
+   - b. A 60s 内重复 → 抑制 A（按 A 自己的冷却）；
+   - c. A 冷却期间同批次出现新事件 B → 只抑制 A，B 正常注入（**整块抑制废除**：`events[0]` 命中冷却不得吞掉同块新事件）；
+   - d. 同一事件在同一事件块内重复出现 → 块内去重，只展示一次；
+   - e. 重复 B → 按 B 自己的 60s 冷却周期抑制；
+   - f. 不同 monitorRoot 的 UNKNOWN 事件互不掩盖（跨 root 隔离）；
+   - g. 一批超过 3 个新事件 → 展示前 3 个，其余以 `additional=N suppressed by cap` 计数；**被计数隐藏的事件本轮不写冷却**（未被展示过，下一批仍可见）。
+   - 身份键 = `eventType + wakeId + monitorRoot`（无 wakeId 的事件用稳定来源标识，UNKNOWN 的来源路径已含 root）；冷却期维持 60s 不变。
+   - **向后兼容**：旧冷却状态文件 `~/.agents/ego-wake-guard-state.json` 原样解析，旧键（`<session>:wake:<id>` 形态）保留有效，新键按 `<session>:<TYPE>:<id>:<root>` 形态追加，不清洗旧条目。
+
+2. **ack 分级合同**（落点 `monitor/dispatch-manager.mjs` 受管 ack 路径；对应 `tests/dispatch-governance.test.mjs` #27 B 用例）：
+   - `investigated`：任意合法 `--agent-id` 实际调查后即可 ack（现状行为不变）；
+   - `resolved`：需所有权证据，满足其一即 GRANTED：①注册表绑定——`ego-taskspaces.json`（withAgentRegistry）中该 agentId 的 spaceName === 会话账本（`conversations/<conversation>/a-dispatch-state.json`）的 taskSpace；②claim 接管证据——`--monitor-dir` 下 `a-space-rebuild-audit.ndjson` 存在 `action:"claim"` 且 `outcome:"CLAIMED"` 且 agentId、space 均匹配的行；
+   - 无证据的 resolved → `ACK_RESOLVED_OWNERSHIP_REQUIRED` + OPERATOR 指引（先受管 claim 或降级 investigated），exit 2，**账本与 ego-watch-exit 标记零改动（fail-closed）**；
+   - 每次受管 ack 在 `--monitor-dir` 下 `a-wake-ack-audit.ndjson` 追加一行 `{ts, agentId, space, conversation, wakeId, ackAction, outcome[, reason, evidence]}`；DENIED（含所有权拒绝与 WAKE_ID_NOT_PENDING 失败）也留痕；
+   - **落点偏离说明**：裁决表格列的落点是 hooks/pre-tool-use.mjs，但 hook 层只有命令字符串与 session_id，无可靠的会话↔agent 身份映射；裁决自身规定「无法取得可靠会话身份时 resolved 必须 fail-closed」——在 hook 层执行 resolved 门禁会拒绝所有 Owner 的合法 resolved，与分级设计矛盾。故门禁落在唯一有可靠身份证据的 dispatch-manager 受管 ack 路径（注册表绑定与会话账本均在此可读），hook 层不加拦截。此偏离需规划师逐项验收时裁定；
+   - **ego-watch-exit/v1 七字段合同零改动**（#25 冻结，现有 marker 测试原样通过）。
+
+3. **fail-open 维持记录（PO 决策 dcc8701）**：PreToolUse hook 进程故障/无法启动时，工具调用**静默放行**——安装器 `install-zcode-guard.mjs` 零改动、不写 `onError`，hooks config 写入形态不变。守卫不阻断工具，依赖 wake 注入（本批次观察 A 修订后可靠性更高）与探针判别法兜底。规划师的 deny-on-error 收紧建议被 PO 否决，双方观点与风险已按冲突处置纪律记录于 `docs/planning/issue-27-ruling-20261116.md` §五第 1 项；如需重启讨论，以该记录为凭。
+
+**PASS 判据**：1a~1g 与 2 各条全部符合，且与 `tests/wake-guard.test.mjs`、`tests/dispatch-governance.test.mjs` 对应用例一一对应；3 项为记录性条款（无实机动作），核对安装器产物不含 `onError` 即可。
+
 ## E-20：composer 全机锁双 Agent 并发（issue #20）
 
 1. 同账号、两个空间、两个会话目录，用两个受管 `send`（脚本化并发，间隔 <30s 启动）。

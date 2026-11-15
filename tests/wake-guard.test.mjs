@@ -8,7 +8,7 @@ import { spawnSync } from "node:child_process";
 import { mkdtemp, mkdir, writeFile, readFile, rm, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { detectWakeAnomalies, formatWakeContext, summarizeEvents, readMonitorRoots, parseLedger, injectionCooldownActive, stopCooldownActive, withInjection, withStopBlock } from "../plugins/chatgpt-dispatch-guard/hooks/wake-context.mjs";
+import { detectWakeAnomalies, formatWakeContext, summarizeEvents, readMonitorRoots, parseLedger, injectionCooldownActive, stopCooldownActive, withInjection, withStopBlock, eventIdentity, selectWakeEvents } from "../plugins/chatgpt-dispatch-guard/hooks/wake-context.mjs";
 import { install, installConfig, verifyConfig } from "../monitor/install-zcode-guard.mjs";
 
 const hooksDir = join(import.meta.dirname, "../plugins/chatgpt-dispatch-guard/hooks");
@@ -359,7 +359,7 @@ test("injection format: frozen header, action mapping, 3-event cap with addition
   assert.match(context, /state=SUPERVISION_PENDING[\s\S]*action=INSPECT_AND_ACK_REQUIRED/);
   assert.match(context, /state=WATCH_STALE\ndispatch=ACCEPTED\nfastStateAge=3h\naction=REARM_WATCH_AND_VERIFY/);
   assert.doesNotMatch(context, /wakeId=w2/); // capped at 3 events
-  assert.equal(lines.at(-1), "additional=2");
+  assert.equal(lines.at(-1), "additional=2 suppressed by cap");
   // The 4th event is beyond the cap; its shape is checked on its own.
   assert.equal(formatWakeContext([events[3]]), "[AGENT_KIT_WAKE_GUARD]\nstate=WAKE_STATUS_UNKNOWN\naction=INSPECT_MONITOR_STATE");
   assert.equal(summarizeEvents(events).split("; ").length, 3);
@@ -396,6 +396,276 @@ test("ledger: legacy global stopBlockAt migrates to the \"global\" session key o
   // Named sessions are independent of the migrated global cooldown.
   assert.equal(stopCooldownActive(parsed, "global", now + 1), true);
   assert.equal(stopCooldownActive(parsed, "sess-1", now + 1), false);
+});
+
+// ---- #27 observation A (Batch 1): per-event cooldown, in-batch dedup,
+// display cap, cross-root isolation. Ruling acceptance steps a–f plus the cap. ----
+
+const wakeA = "33333333-3333-4333-8333-333333333333";
+const wakeB = "44444444-4444-4444-8444-444444444444";
+const wakeC = "55555555-5555-4555-8555-555555555555";
+const wakeD = "66666666-6666-4666-8666-666666666666";
+
+test("#27 A identity key: type + wakeId + monitorRoot; source fallback isolates roots", () => {
+  const root = "C:/monitor-a";
+  const wake = { type: "WAKE_PENDING", wakeId: wakeA, source: root + "/conversations/x", monitorRoot: root };
+  assert.equal(eventIdentity(wake), "WAKE_PENDING:" + wakeA + ":" + root);
+  // Same wakeId under a different monitorRoot is a DIFFERENT identity (step f).
+  assert.notEqual(eventIdentity(wake), eventIdentity({ ...wake, monitorRoot: "C:/monitor-b" }));
+  // Unknown events have no wakeId: the stable source path is the identity, and
+  // it embeds the root, so two roots' UNKNOWN events never collide.
+  const unknown = { type: "WAKE_STATUS_UNKNOWN", wakeId: null, source: root + "/conversations/x/a-watch-exit.json", monitorRoot: root };
+  assert.equal(eventIdentity(unknown), "WAKE_STATUS_UNKNOWN:" + unknown.source + ":" + root);
+  assert.notEqual(eventIdentity(unknown), eventIdentity({ ...unknown, source: "C:/monitor-b/conversations/x/a-watch-exit.json", monitorRoot: "C:/monitor-b" }));
+  // Same source, different type: never the same identity.
+  assert.notEqual(eventIdentity(wake), eventIdentity({ ...wake, type: "WATCH_STALE" }));
+});
+
+test("#27 A ruling six steps: per-event cooldown, in-batch dedup, cross-root isolation", async () => {
+  const t0 = 1_800_000_000_000;
+  const roots = [];
+  const conv = async (root, name, wakeId) => {
+    const dir = join(root, "conversations", name);
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, "a-watch-exit.json"),
+      JSON.stringify(watchExit(t0 - 181_000, { wakeId })), "utf8");
+  };
+  const newRoot = async (prefix) => {
+    const root = await mkdtemp(join(tmpdir(), prefix));
+    roots.push(root);
+    return root;
+  };
+  try {
+    const root1 = await newRoot("ego-wake-six-r1-");
+    let ledger = parseLedger(null);
+    const detect = (list) => detectWakeAnomalies(list, t0 + 0);
+    const select = (events, at) => selectWakeEvents(events, ledger, "sess-6", at);
+    const stamp = (result, at) => { for (const { key } of result.shown) ledger = withInjection(ledger, key, at); };
+
+    // a. A first appearance -> injected.
+    await conv(root1, "conv-a", wakeA);
+    const a = select((await detect([root1])).events, t0);
+    assert.deepEqual(a.shown.map(({ event }) => event.wakeId), [wakeA]);
+    assert.equal(a.additional, 0);
+    stamp(a, t0);
+
+    // b. A repeats within 60s -> suppressed (by A's own cooldown only).
+    assert.deepEqual(select((await detect([root1])).events, t0 + 30_000).shown, []);
+
+    // c. While A cools, new event B appears in the same batch -> A suppressed,
+    //    B injected (the whole-block suppression is abolished).
+    await conv(root1, "conv-b", wakeB);
+    const c = select((await detect([root1])).events, t0 + 40_000);
+    assert.deepEqual(c.shown.map(({ event }) => event.wakeId), [wakeB]);
+    stamp(c, t0 + 40_000);
+
+    // d. A and B duplicated within one batch (same wakeId, same root, two
+    //    conversation dirs) -> in-batch dedup: each identity appears once.
+    //    Both cooldowns have now expired (A stamped at t0, B at t0+40s; 101s
+    //    elapsed), so both identities are fresh again.
+    await conv(root1, "conv-a2", wakeA);
+    await conv(root1, "conv-b2", wakeB);
+    const d = select((await detect([root1])).events, t0 + 101_000);
+    assert.deepEqual(d.shown.map(({ event }) => event.wakeId).sort(), [wakeA, wakeB].sort());
+    stamp(d, t0 + 101_000);
+
+    // e. Repeating B -> suppressed by B's OWN cooldown period (A likewise).
+    assert.deepEqual(select((await detect([root1])).events, t0 + 102_000).shown, []);
+
+    // f. UNKNOWN events of different monitorRoots never mask each other.
+    const root2 = await newRoot("ego-wake-six-r2-");
+    const root3 = await newRoot("ego-wake-six-r3-");
+    const root4 = await newRoot("ego-wake-six-r4-");
+    for (const root of [root2, root3, root4]) {
+      const dir = join(root, "conversations", uuid);
+      await mkdir(dir, { recursive: true });
+      await writeFile(join(dir, "a-watch-exit.json"), "{corrupted", "utf8");
+    }
+    ledger = parseLedger(null); // fresh ledger for the isolation check
+    const both = select((await detect([root2, root3])).events, t0);
+    assert.equal(both.shown.length, 2); // each root's UNKNOWN shown independently
+    assert.deepEqual(new Set(both.shown.map(({ event }) => event.monitorRoot)), new Set([root2, root3]));
+    stamp(both, t0);
+    assert.deepEqual(select((await detect([root2, root3])).events, t0 + 1_000).shown, []);
+    // A third root's new UNKNOWN is not masked by the cooled ones.
+    const third = select((await detect([root2, root3, root4])).events, t0 + 2_000);
+    assert.equal(third.shown.length, 1);
+    assert.equal(third.shown[0].event.monitorRoot, root4);
+  } finally {
+    for (const root of roots) await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("#27 A display cap: 4 fresh events show 3 + additional count; the capped tail stays eligible", async () => {
+  const t0 = 1_800_000_000_000;
+  const root = await mkdtemp(join(tmpdir(), "ego-wake-cap-"));
+  try {
+    for (const [name, wakeId] of [["c1", wakeA], ["c2", wakeB], ["c3", wakeC], ["c4", wakeD]]) {
+      const dir = join(root, "conversations", name);
+      await mkdir(dir, { recursive: true });
+      await writeFile(join(dir, "a-watch-exit.json"),
+        JSON.stringify(watchExit(t0 - 181_000, { wakeId })), "utf8");
+    }
+    const { events } = await detectWakeAnomalies([root], t0);
+    assert.equal(events.length, 4);
+    let ledger = parseLedger(null);
+    const first = selectWakeEvents(events, ledger, "sess-cap", t0);
+    assert.equal(first.shown.length, 3);
+    assert.equal(first.additional, 1);
+    const shown1 = first.shown.map(({ event }) => event.wakeId).sort();
+    const context = formatWakeContext(first.shown.map(({ event }) => event), 3, first.additional);
+    assert.equal(context.split("\n").at(-1), "additional=1 suppressed by cap");
+    for (const { key } of first.shown) ledger = withInjection(ledger, key, t0);
+    // Second batch: the three shown events are cooled; the capped 4th was
+    // never displayed (hence never stamped) and now surfaces on its own.
+    const second = selectWakeEvents(events, ledger, "sess-cap", t0 + 1_000);
+    assert.equal(second.shown.length, 1);
+    assert.equal(second.additional, 0);
+    assert.deepEqual([...shown1, second.shown[0].event.wakeId].sort(),
+      [wakeA, wakeB, wakeC, wakeD].sort());
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("#27 A hook integration: cooled event no longer swallows a new batch-mate", async () => {
+  const now = 1_800_000_000_000;
+  const { root } = await makeRoot(now, { "a-watch-exit.json": watchExit(now - 181_000) });
+  const home = await mkdtemp(join(tmpdir(), "ego-wake-home7-"));
+  await profileWith(home, [root]);
+  const env = { EGO_WAKE_GUARD_PROFILE_PATH: join(home, "ego-profile.json"), EGO_WAKE_GUARD_LEDGER_PATH: join(home, "ledger.json") };
+  const ev = { hookEventName: "PreToolUse", toolName: "Read", toolInput: {}, sessionId: "sess-abc" };
+  try {
+    // a. A injected.
+    const first = run("pre-tool-use.mjs", ev, env);
+    const ctx1 = JSON.parse(first.stdout).hookSpecificOutput.additionalContext;
+    assert.match(ctx1, new RegExp("wakeId=" + wakeUuid));
+    // b. A repeat within 60s -> suppressed.
+    assert.equal(run("pre-tool-use.mjs", ev, env).stdout, "");
+    // c. New event B in the same batch -> B injected while A stays suppressed.
+    const dirB = join(root, "conversations", "conv-b");
+    await mkdir(dirB, { recursive: true });
+    await writeFile(join(dirB, "a-watch-exit.json"),
+      JSON.stringify(watchExit(now - 181_000, { wakeId: wakeB })), "utf8");
+    const third = run("pre-tool-use.mjs", ev, env);
+    const ctx3 = JSON.parse(third.stdout).hookSpecificOutput.additionalContext;
+    assert.match(ctx3, new RegExp("wakeId=" + wakeB));
+    assert.doesNotMatch(ctx3, new RegExp("wakeId=" + wakeUuid));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("#27 A hook integration: duplicate identity within one batch shows exactly once", async () => {
+  const now = 1_800_000_000_000;
+  const { root } = await makeRoot(now, { "a-watch-exit.json": watchExit(now - 181_000, { wakeId: wakeB }) });
+  // A second conversation dir carrying the SAME wakeId under the SAME root:
+  // identical identity -> deduped inside the block.
+  const dir2 = join(root, "conversations", "conv-b2");
+  await mkdir(dir2, { recursive: true });
+  await writeFile(join(dir2, "a-watch-exit.json"),
+    JSON.stringify(watchExit(now - 181_000, { wakeId: wakeB })), "utf8");
+  const home = await mkdtemp(join(tmpdir(), "ego-wake-home8-"));
+  await profileWith(home, [root]);
+  const env = { EGO_WAKE_GUARD_PROFILE_PATH: join(home, "ego-profile.json"), EGO_WAKE_GUARD_LEDGER_PATH: join(home, "ledger.json") };
+  try {
+    const result = run("pre-tool-use.mjs", { hookEventName: "PreToolUse", toolName: "Read", toolInput: {}, sessionId: "sess-dedup" }, env);
+    const ctx = JSON.parse(result.stdout).hookSpecificOutput.additionalContext;
+    assert.equal((ctx.match(new RegExp("wakeId=" + wakeB, "g")) || []).length, 1);
+    // Repeat -> suppressed by the (single) identity's own cooldown.
+    assert.equal(run("pre-tool-use.mjs", { hookEventName: "PreToolUse", toolName: "Read", toolInput: {}, sessionId: "sess-dedup" }, env).stdout, "");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("#27 A hook integration: at most 3 events displayed, capped 4th surfaces next batch", async () => {
+  const now = 1_800_000_000_000;
+  const root = await mkdtemp(join(tmpdir(), "ego-wake-cap-hook-"));
+  for (const [name, wakeId] of [["c1", wakeA], ["c2", wakeB], ["c3", wakeC], ["c4", wakeD]]) {
+    const dir = join(root, "conversations", name);
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, "a-watch-exit.json"),
+      JSON.stringify(watchExit(now - 181_000, { wakeId })), "utf8");
+  }
+  const home = await mkdtemp(join(tmpdir(), "ego-wake-home9-"));
+  await profileWith(home, [root]);
+  const env = { EGO_WAKE_GUARD_PROFILE_PATH: join(home, "ego-profile.json"), EGO_WAKE_GUARD_LEDGER_PATH: join(home, "ledger.json") };
+  const ev = { hookEventName: "PreToolUse", toolName: "Read", toolInput: {}, sessionId: "sess-cap" };
+  try {
+    const ctx1 = JSON.parse(run("pre-tool-use.mjs", ev, env).stdout).hookSpecificOutput.additionalContext;
+    assert.equal((ctx1.match(/state=WAKE_PENDING/g) || []).length, 3);
+    assert.equal(ctx1.split("\n").at(-1), "additional=1 suppressed by cap");
+    // The capped event was never shown, so it is not cooled: next batch it
+    // surfaces alone while the three displayed ones sit out their cooldown.
+    const ctx2 = JSON.parse(run("pre-tool-use.mjs", ev, env).stdout).hookSpecificOutput.additionalContext;
+    assert.equal((ctx2.match(/state=WAKE_PENDING/g) || []).length, 1);
+    assert.doesNotMatch(ctx2, /additional=/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("#27 A hook integration: UNKNOWN events of different monitorRoots never mask each other", async () => {
+  const now = 1_800_000_000_000;
+  const rootA = await makeRoot(now, { "a-watch-exit.json": "{corrupted" });
+  const rootB = await makeRoot(now, { "a-watch-exit.json": "{corrupted" });
+  const rootC = await makeRoot(now, { "a-watch-exit.json": "{corrupted" });
+  const home = await mkdtemp(join(tmpdir(), "ego-wake-home10-"));
+  await profileWith(home, [rootA.root, rootB.root]);
+  const env = { EGO_WAKE_GUARD_PROFILE_PATH: join(home, "ego-profile.json"), EGO_WAKE_GUARD_LEDGER_PATH: join(home, "ledger.json") };
+  const ev = { hookEventName: "PreToolUse", toolName: "Read", toolInput: {}, sessionId: "sess-cross" };
+  try {
+    // Both roots' UNKNOWN events are injected independently.
+    const ctx1 = JSON.parse(run("pre-tool-use.mjs", ev, env).stdout).hookSpecificOutput.additionalContext;
+    assert.equal((ctx1.match(/state=WAKE_STATUS_UNKNOWN/g) || []).length, 2);
+    // Repeat: both suppressed by their own identities — and a third root's
+    // brand-new UNKNOWN is NOT masked by the cooled ones.
+    assert.equal(run("pre-tool-use.mjs", ev, env).stdout, "");
+    await profileWith(home, [rootA.root, rootB.root, rootC.root]);
+    const ctx3 = JSON.parse(run("pre-tool-use.mjs", ev, env).stdout).hookSpecificOutput.additionalContext;
+    assert.equal((ctx3.match(/state=WAKE_STATUS_UNKNOWN/g) || []).length, 1);
+  } finally {
+    for (const { root } of [rootA, rootB, rootC]) await rm(root, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("#27 A backward compatibility: legacy ledger keys stay valid, new-format keys append", async () => {
+  const now = 1_800_000_000_000;
+  const { root } = await makeRoot(now, { "a-watch-exit.json": watchExit(now - 181_000) });
+  const home = await mkdtemp(join(tmpdir(), "ego-wake-home11-"));
+  await profileWith(home, [root]);
+  const ledgerPath = join(home, "ledger.json");
+  const legacyKey = "sess-old:wake:" + wakeUuid;
+  await writeFile(ledgerPath, JSON.stringify({
+    schema: "ego-wake-guard-state/v1",
+    injections: { [legacyKey]: 1 },
+    stopBlocks: {},
+  }), "utf8");
+  try {
+    // The pre-#27 state file parses and the hook appends new-format identity
+    // keys without wiping legacy entries.
+    const result = run("pre-tool-use.mjs", { hookEventName: "PreToolUse", toolName: "Read", toolInput: {}, sessionId: "sess-new" },
+      { EGO_WAKE_GUARD_PROFILE_PATH: join(home, "ego-profile.json"), EGO_WAKE_GUARD_LEDGER_PATH: ledgerPath });
+    assert.match(JSON.parse(result.stdout).hookSpecificOutput.additionalContext, /^\[AGENT_KIT_WAKE_GUARD\]/);
+    const ledger = JSON.parse(await readFile(ledgerPath, "utf8"));
+    assert.equal(ledger.injections[legacyKey], 1);
+    assert.ok(Object.keys(ledger.injections).some((key) => key.startsWith("sess-new:WAKE_PENDING:" + wakeUuid + ":")));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("#27 A: the whole-block suppression is abolished in the hook source", async () => {
+  const source = await readFile(realScript, "utf8");
+  assert.match(source, /selectWakeEvents\(events, ledger, sessionId, now\)/);
+  // The old whole-block key (events[0] alone deciding the fate of the block)
+  // and its direct cooldown check are gone from the wrapper layer.
+  assert.doesNotMatch(source, /events\[0\]\?\.key/);
+  assert.doesNotMatch(source, /injectionCooldownActive/);
 });
 
 test("PreToolUse: deny and additionalContext coexist with the deny reason byte-for-byte", async () => {
@@ -452,7 +722,7 @@ test("PreToolUse: healthy monitor or unconfigured monitorRoots produce zero outp
   await rm(home2, { recursive: true, force: true });
 });
 
-test("PreToolUse: 60s rate limit per session+wakeId, ledger written with frozen schema", async () => {
+test("PreToolUse: 60s rate limit per session+event identity, ledger written with frozen schema", async () => {
   const now = 1_800_000_000_000;
   const { root, write } = await makeRoot(now, { "a-watch-exit.json": watchExit(now - 181_000) });
   const home = await mkdtemp(join(tmpdir(), "ego-wake-home5-"));
@@ -463,9 +733,10 @@ test("PreToolUse: 60s rate limit per session+wakeId, ledger written with frozen 
   assert.match(JSON.parse(first.stdout).hookSpecificOutput.additionalContext, /^\[AGENT_KIT_WAKE_GUARD\]/);
   const ledger = JSON.parse(await readFile(join(home, "ledger.json"), "utf8"));
   assert.equal(ledger.schema, "ego-wake-guard-state/v1");
-  assert.ok(Object.keys(ledger.injections).some((key) => key.startsWith("sess-1:wake:")));
+  // Observation A identity keys: <session>:<type>:<wakeId>:<monitorRoot>.
+  assert.ok(Object.keys(ledger.injections).some((key) => key.startsWith("sess-1:WAKE_PENDING:" + wakeUuid + ":")));
   const second = run("pre-tool-use.mjs", event, env);
-  assert.equal(second.stdout, ""); // same session + same wakeId inside 60s
+  assert.equal(second.stdout, ""); // same session + same identity inside 60s
   const otherSession = run("pre-tool-use.mjs", { ...event, sessionId: "sess-2" }, env);
   assert.match(JSON.parse(otherSession.stdout).hookSpecificOutput.additionalContext, /^\[AGENT_KIT_WAKE_GUARD\]/);
   await rm(root, { recursive: true, force: true });

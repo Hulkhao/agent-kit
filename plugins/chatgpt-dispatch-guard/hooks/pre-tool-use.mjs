@@ -14,7 +14,7 @@ import { readFile, writeFile, rename } from "node:fs/promises";
 import { checkDispatchTool } from "./policy.mjs";
 import {
   detectWakeAnomalies, formatWakeContext, readMonitorRoots,
-  parseLedger, injectionCooldownActive, withInjection,
+  parseLedger, selectWakeEvents, withInjection,
   DEFAULT_PROFILE_PATH, DEFAULT_LEDGER_PATH,
 } from "./wake-context.mjs";
 
@@ -45,15 +45,23 @@ async function wakeContext(event, now = Date.now()) {
     try { ledger = parseLedger(await readFile(ledgerPath, "utf8")); }
     catch { ledger = parseLedger(null); } // unreadable ledger: skip dedup (worst case: repeated injection)
     const { events } = await detectWakeAnomalies(roots, now);
-    const context = formatWakeContext(events);
-    if (!context) return null; // healthy state: zero output
+    if (!events.length) return null; // healthy state: zero output
     const sessionId = event?.sessionId ?? event?.session_id ?? "global";
-    const key = sessionId + ":" + (events[0]?.key ?? "wake");
-    if (injectionCooldownActive(ledger, key, now)) return null;
+    // Observation A (#27 ruling): per-event cooldown — a cooled event never
+    // suppresses its batch-mates; in-batch duplicates collapse to one
+    // identity; at most 3 events are displayed with an additional count for
+    // the capped tail (the pre-#27 whole-block suppression is abolished).
+    const { shown, additional } = selectWakeEvents(events, ledger, sessionId, now);
+    if (!shown.length) return null; // every identity cooled or duplicated
+    const context = formatWakeContext(shown.map(({ event: shownEvent }) => shownEvent), 3, additional);
     // The rate-limit ledger write is best-effort ONLY (WG-02): the anomaly is
     // already identified, so it must still be injected. A write failure means
     // at worst a repeated injection on the next call — never a dropped wake.
-    try { await saveLedger(withInjection(ledger, key, now), now); }
+    // Only DISPLAYED events are stamped: a capped event was never shown and
+    // must stay eligible for the next block.
+    let next = ledger;
+    for (const { key } of shown) next = withInjection(next, key, now);
+    try { await saveLedger(next, now); }
     catch { /* ledger unwritable: skip dedup bookkeeping, keep the injection */ }
     return context;
   } catch {

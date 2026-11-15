@@ -272,6 +272,105 @@ export async function acknowledgeWake(id, action, dir, now = Date.now()) {
   if (!supervisionMatched && markerMatches && marker.acknowledgedAt !== null) throw new Error("WAKE_ID_ALREADY_ACKNOWLEDGED");
 }
 
+// ---- #27 observation B (Batch 1): managed ack tiering ----
+
+export const ACK_AUDIT_FILE = "a-wake-ack-audit.ndjson";
+export const ACK_RESOLVED_OWNERSHIP_REQUIRED = "ACK_RESOLVED_OWNERSHIP_REQUIRED";
+
+// Ownership evidence for a `resolved` ack (ruling #27 observation B). Either
+// proof below grants; anything unprovable returns null and the caller must
+// fail closed. Evidence is only looked for — never fabricated — here, where
+// reliable identity actually exists:
+// (a) REGISTRY: the machine-wide ownership ledger (~/.agents/ego-taskspaces.json,
+//     withAgentRegistry) binds this agentId to the taskSpace of THIS
+//     conversation's dispatch ledger. An unreadable registry or ledger proves
+//     nothing and never grants.
+// (b) CLAIM: a managed claim takeover recorded in the monitor root's shared
+//     a-space-rebuild-audit.ndjson — a row with action:"claim", outcome:"CLAIMED"
+//     and matching agentId AND space. Claim is the only managed cross-session
+//     takeover channel; an ack must not bypass it.
+export async function ackOwnershipEvidence(agentId, space, monitorDir, dir, { directory } = {}) {
+  let record = null;
+  try { record = await readDispatchState(dir); }
+  catch { record = null; } // unreadable/corrupt ledger proves nothing (fail-closed)
+  if (record && typeof record.taskSpace === "string" && record.taskSpace !== "") {
+    let boundSpace = null;
+    try {
+      // withAgentRegistry actions return { changed, value } — read-only here.
+      boundSpace = await withAgentRegistry((registry) => ({
+        changed: false,
+        value: registry.agents[agentId]?.spaceName ?? null,
+      }), directory);
+    } catch { boundSpace = null; } // unreadable registry proves nothing
+    if (typeof boundSpace === "string" && boundSpace === record.taskSpace) return "REGISTRY";
+  }
+  try {
+    const raw = await readFile(join(monitorDir, "a-space-rebuild-audit.ndjson"), "utf8");
+    for (const line of raw.split("\n")) {
+      if (!line.trim()) continue;
+      let row;
+      try { row = JSON.parse(line); } catch { continue; }
+      if (row.action === "claim" && row.outcome === "CLAIMED" && row.agentId === agentId && row.space === space) {
+        return "CLAIM";
+      }
+    }
+  } catch { /* unreadable audit ledger proves nothing */ }
+  return null;
+}
+
+// The managed ack path (`dispatch-manager.mjs ack`): tiered permissions per the
+// #27 ruling — `investigated` stays open to any valid agent identity that
+// actually inspected the wake; `resolved` requires ownership evidence (registry
+// binding or managed claim takeover). A resolved without evidence is denied
+// with ACK_RESOLVED_OWNERSHIP_REQUIRED + operator guidance, and is fail-closed:
+// the watch-exit marker and supervision ledger keep zero changes.
+//
+// PLACEMENT NOTE (kept for the planner's per-item acceptance): the ruling's
+// Batch-1 table lists hooks/pre-tool-use.mjs as the落点, but the hook layer only
+// sees a command string and a session id — there is no reliable
+// session↔agent identity mapping there, and the ruling itself demands that
+// resolved fail closed whenever reliable identity is unavailable. Gating
+// resolved at the hook layer would therefore reject every Owner's legitimate
+// resolved. The gate lives in the one place with reliable identity evidence:
+// this managed ack path (registry binding and the conversation ledger are both
+// readable here). The hook layer stays unchanged.
+//
+// Every managed ack attempt appends one audit line to
+// <monitorDir>/a-wake-ack-audit.ndjson:
+//   { ts, agentId, space, conversation, wakeId, ackAction, outcome[, reason, evidence] }
+// outcome is GRANTED or DENIED; denials (including ownership denials and
+// WAKE_ID_NOT_PENDING failures) leave evidence too. The ego-watch-exit/v1
+// marker schema is untouched (#25 frozen seven-field contract).
+export async function managedAcknowledge(p, { directory, now = Date.now() } = {}) {
+  const dir = conversationDir(p);
+  const auditFile = join(p.monitorDir, ACK_AUDIT_FILE);
+  const audit = (entry) => appendFile(auditFile, JSON.stringify({
+    ts: new Date().toISOString(), agentId: p.agentId, space: p.space,
+    conversation: p.conversation, wakeId: p.wakeId, ackAction: p.ackAction, ...entry,
+  }) + "\n", "utf8");
+  let evidence = null;
+  if (p.ackAction === "resolved") {
+    try { evidence = await ackOwnershipEvidence(p.agentId, p.space, p.monitorDir, dir, { directory }); }
+    catch { evidence = null; } // evidence lookup failure never grants
+    if (!evidence) {
+      await audit({ outcome: "DENIED", reason: ACK_RESOLVED_OWNERSHIP_REQUIRED }).catch(() => {});
+      console.error("RESULT=ACK_DENIED code=" + ACK_RESOLVED_OWNERSHIP_REQUIRED);
+      console.error("OPERATOR_ACTION=resolved 需空间所有权证据：先用受管 claim 接管该空间" +
+        "（node monitor/dispatch-manager.mjs claim --monitor-dir <根> --agent-id <ID> --space <空间>），" +
+        "或将本次 ack 降级为 investigated");
+      return 2;
+    }
+  }
+  try {
+    await acknowledgeWake(p.wakeId, p.ackAction, dir, now);
+    await audit(evidence ? { outcome: "GRANTED", evidence } : { outcome: "GRANTED" });
+    return 0;
+  } catch (error) {
+    await audit({ outcome: "DENIED", reason: String(error.code || error.message) }).catch(() => {});
+    throw error;
+  }
+}
+
 export function classifyManagerResult(action, observation, record, params) {
   if (action === "release") return observation.code === 0 && observation.result === "AGENT_SPACE_RELEASED" ? 0 : 2;
   // Managed claim: the template must prove the post-claim agent ownership.
@@ -586,7 +685,7 @@ export async function main(args = process.argv.slice(2)) {
       await handle?.close();
     }
   }
-  if (p.action === "ack") { await acknowledgeWake(p.wakeId, p.ackAction, dir); return 0; }
+  if (p.action === "ack") return managedAcknowledge(p);
   if (p.action === "consume") {
     const record = await readDispatchState(dir);
     if (!record || record.conversationUuid.toLowerCase() !== p.conversation.toLowerCase() || record.taskSpace !== p.space) {
