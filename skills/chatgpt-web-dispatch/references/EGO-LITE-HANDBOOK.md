@@ -211,6 +211,7 @@ const r = await page.fetch("/backend-api/conversation/" + uuid,
 | `FAST_PROBE_WAKE_SUPERVISOR signal=MISSING exit=<code> [detail=<行>]` | watch 子进程异常退出且无 RESULT 行（2026-11-16 起 detail=末条非 RESULT 输出行，≤200 字符，#31） | 三段判定：detail 含 `command not found`=命令缺失（修 ego-browser PATH/环境后全套重启）；detail 为 JS 堆栈行（`at …`/`Error: …`）=脚本崩溃（留 tail 证据上报 §9.1）；无 detail=零输出静默退出（查托管宿主/进程被杀，非脚本逻辑）。exit=127 通常是命令缺失 |
 | `WATCH_EXCEPTION code=<…> wakeId=<uuid>`（#25③） | watch 分支内可捕获异常（2026-11-16 起 watch 全部 exit 2 路径统一先落盘 `a-watch-exit.json` 再退出，含初始化段与 RELEASE_PENDING） | 读 stderr 定位异常；按 wakeId 处置后 `ack`（§6.6，与监督账本同 id 时一次 ack 双清）；再重新布防 |
 | `REPLY_DELIVERED_RELEASE_PENDING wakeId=<uuid>`（#25③） | 回复已交付但 Page release 未成功（dispatch 已 COMPLETED——此时 WATCH_STALE 不会兜底，唯一持久凭据就是 watch-exit 标记） | 按 wakeId ack 后重跑 `release`（或按 §6.5/接管流程处理空间问题）；不要当成功放行 |
+| `HASFOCUS_FALSE_AFTER_BRINGTOFRONT`（实测 2026-11-16） | 派单焦点门连续失败：ego 浏览器窗口被**最小化**（IsIconic=true）时 `Page.bringToFront` 无法让页面拿到 document 焦点，重试无效 | OS 级恢复窗口（ShowWindow SW_RESTORE + SetForegroundWindow/AppActivate，属窗口管理不属页面自动化，守卫不拦）→ `recover-draft` 清掉 PREPARED 残稿 → 重发即过；勿盲试第三次 |
 
 2026-11-16 起，watch 的全部 exit 2 唤醒行（REPLY_READY/REPLY_STAGED/FAST_PROBE/WATCH_EXCEPTION）末尾统一追加 `wakeId=<uuid>`，处置后按该 id ack（§6.6）；tick 监督路径复用监督 pending id（双账本同 id）。
 
