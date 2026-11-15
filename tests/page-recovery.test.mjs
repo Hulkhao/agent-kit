@@ -137,6 +137,30 @@ test("#31: release accepts managed restart blanks and registered conversation Pa
   ], [target]), { code: "SPACE_HAS_UNREGISTERED_PAGE_STOP" });
 });
 
+test("#31+E-30: release accepts blank spellings across page/tabs evidence sources", async () => {
+  // Field-observed 2026-11-16 (E-30 acceptance): the same blank targetId reports
+  // "chrome://new-tab-page/" via page.url() and the short "chrome://newtab/" via
+  // task.tabs() metadata. The release contract must accept both spellings on both
+  // evidence sources — an agent-owned blank is not an unregistered page.
+  const pages = [managed("p1", conversation(target)), managed("p2", "chrome://new-tab-page/")];
+  const tabs = [
+    { label: "p1", url: conversation(target), openedBy: "agent", targetId: "p1" },
+    // the field-observed mismatch: page long form, tab metadata short form
+    { label: "p2", url: "chrome://newtab/", openedBy: "agent", targetId: "p2" },
+  ];
+  await assertManagedReleasePages(pages, tabs, [target]);
+  // short form on the live Page URL is the same blank as well
+  await assertManagedReleasePages([managed("p3", "chrome://newtab/")], [
+    { label: "p3", url: "chrome://newtab/", openedBy: "agent", targetId: "p3" },
+  ], [target]);
+  // both spellings are still blanks for recovery reuse
+  const f = fixture([managed("p1", conversation(other)), managed("p2", "chrome://newtab/", "tab2")]);
+  const result = await recoverConversationPage(f.task, target);
+  assert.equal(result.page, f.pages[1]);
+  assert.equal(result.needsNavigation, true);
+  assert.equal(f.allocations, 0);
+});
+
 test("unreadable URLs and multiple blank Pages retain fail-closed behavior", async () => {
   const failed = fixture([{ label: "p1", url: async () => { throw new Error("offline"); } }]);
   await assert.rejects(recoverConversationPage(failed.task, target), { code: "PAGE_URL_INSPECTION_FAILED" });

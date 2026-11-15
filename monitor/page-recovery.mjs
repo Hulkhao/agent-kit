@@ -64,7 +64,12 @@ export async function selectUniqueConversationPage(pages, conversationUuid) {
 }
 
 const recoveryError = (code) => Object.assign(new Error(code), { code });
-const blankPageUrl = (url) => url === "about:blank" || url === "chrome://new-tab-page/";
+// Chrome renders its new-tab page under two spellings: the live Page URL reports
+// "chrome://new-tab-page/" while persisted/restored tab metadata (task.tabs()) can
+// report the short "chrome://newtab/" form for the same targetId (field-observed
+// 2026-11-16 during E-30 acceptance: release aborted SPACE_HAS_UNREGISTERED_PAGE_STOP
+// on an agent-owned blank whose tabs evidence used the short form). Both are blanks.
+const blankPageUrl = (url) => url === "about:blank" || url === "chrome://new-tab-page/" || url === "chrome://newtab/";
 
 // A TaskSpace release may finish only its own registered conversations and
 // managed blank Pages left by a browser restart.

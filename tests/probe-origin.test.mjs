@@ -31,6 +31,14 @@ test("blank navigation intermediates are TRANSITION, never INVALID", () => {
   // itself only has to guarantee they are not reported as INVALID.
   assert.equal(probeOriginVerdict("about:blank", target), "TRANSITION");
   assert.equal(probeOriginVerdict("chrome://new-tab-page/", target), "TRANSITION");
+  // Short spelling that persisted tab metadata can report for the same blank
+  // (field-observed 2026-11-16 E-30: task.tabs() "chrome://newtab/" vs page.url()
+  // "chrome://new-tab-page/", same targetId). Not accepting it misclassifies an
+  // agent-owned blank as INVALID / unregistered and blocks release.
+  assert.equal(probeOriginVerdict("chrome://newtab/", target), "TRANSITION");
+  // The probe's own inline blank predicate must stay in lockstep with the shared
+  // helper (source-slice pin, same style as the rest of this file).
+  assert.match(probeSource, /isBlankPageUrl = \(rawUrl\) => rawUrl === "about:blank" \|\| rawUrl === "chrome:\/\/new-tab-page\/" \|\| rawUrl === "chrome:\/\/newtab\/"/);
 });
 
 test("every other source is INVALID, fail-closed", () => {

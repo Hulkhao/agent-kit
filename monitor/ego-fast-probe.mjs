@@ -221,8 +221,10 @@ try {
   const tabs = await task.tabs();
   // Resolve managed Pages by conversation URL; never select by a stale page label.
   const urlMatchesConversation = (rawUrl, exactHost = false) => isConversationUrl(rawUrl, uuid, exactHost);
-  // Blank-page reuse (agent-kit#18 R1): a fresh ego Page may sit on either URL.
-  const isBlankPageUrl = (rawUrl) => rawUrl === "about:blank" || rawUrl === "chrome://new-tab-page/";
+  // Blank-page reuse (agent-kit#18 R1): a fresh ego Page may sit on either URL;
+  // "chrome://newtab/" is the short spelling persisted tab metadata can report for
+  // the same blank (field-observed 2026-11-16, see page-recovery.mjs blankPageUrl).
+  const isBlankPageUrl = (rawUrl) => rawUrl === "about:blank" || rawUrl === "chrome://new-tab-page/" || rawUrl === "chrome://newtab/";
   let selectionEvidence = null;
   let singlePageUrl = null;
   if (pages.length > 1) {
