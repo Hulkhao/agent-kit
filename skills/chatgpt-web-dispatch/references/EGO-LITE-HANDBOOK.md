@@ -175,8 +175,8 @@ const r = await page.fetch("/backend-api/conversation/" + uuid,
 - 快轮询 **DOM 为主要状态证据**，不在正常每 30 秒轮询中调用 conversation API（R2.4 起驻页探测约 6 次 goto/小时，见 §7）。判定=「可见停止按钮」的生成→空闲翻转 + 75 秒确认窗（滤工具链间隙假阳性）。完成候选由管理器优先 DOM 提取，必要时一次 API 辅助验证；无法确认本次派单边界就停止释放并交给 Agent。
 - 监督模块 `supervision-watchdog.mjs` 在每轮快探测之后执行，重读会话目录配置。`supervisionMinutes` 允许 1–60（默认 10），`maxAbnormalRounds` 默认 3。无真实进展超过间隔才唤醒；接棒 Agent 完成实际检查后使用管理器 `ack`，`investigated` 重新计时，已解决用 `resolved` 重置异常轮次。未确认的唤醒再次运行只输出 `MONITOR_WAKE_UNACKNOWLEDGED`，禁止假装已处理。第三轮仍无进展输出 `USER_ESCALATION_REQUIRED`，由主管联系 PO；IM/邮件暂不自动发送。
 - **退出后必须有实际接棒**：任何告警后先确认本地 Agent 收到任务退出通知并处理；未证明通知链路时不得宣称“已唤醒”或“有人值守”（实测 7 小时空转事故的根因）。
-- **良性信号自愈（issue #8，2026-11-09 起）**：fast-poll.sh wrapper 对 `START_IDLE_WAKE_SUPERVISOR` 类「重启即自愈」良性信号自动重启 probe 并留痕（`BENIGN_SIGNAL_SELFHEAL=… streak=n/20`），连续超过 20 轮仍良性才真退出唤醒——消除「wrapper 退出后接棒单点」的 50 分钟空窗形态（实测 2026-11-08）。`REPLY_ARRIVED`（DONE_CANDIDATE）/`CONVERSATION_DEAD` 等需主管裁决的信号维持真退出。
-- **长任务巡检纪律（issue #8）**：主管处于长任务链（派单/执行/多任务并行）时，值守健康巡检（`a-fast-state.json` 时间戳、fast-history.log 尾部）纳入任务步骤前后的检查点；发现 `STATE_MISSING` 或 wrapper 已退出（日志尾部 `fast-poller exit`）立即接力重启，不允许把唤醒留给「之后有空再说」。
+- **良性信号自愈（issue #8，2026-11-09 起）**：fast-poll.sh wrapper 对 `START_IDLE_WAKE_SUPERVISOR` 类「重启即自愈」良性信号自动重启 probe runner（仅重启受管脚本/任务，不终止或重启 Ego Lite 宿主 `ego.exe`）并留痕（`BENIGN_SIGNAL_SELFHEAL=… streak=n/20`），连续超过 20 轮仍良性才真退出唤醒——消除「wrapper 退出后接棒单点」的 50 分钟空窗形态（实测 2026-11-08）。`REPLY_ARRIVED`（DONE_CANDIDATE）/`CONVERSATION_DEAD` 等需主管裁决的信号维持真退出。
+- **长任务巡检纪律（issue #8）**：主管处于长任务链（派单/执行/多任务并行）时，值守健康巡检（`a-fast-state.json` 时间戳、fast-history.log 尾部）纳入任务步骤前后的检查点；发现 `STATE_MISSING` 或 wrapper 已退出（日志尾部 `fast-poller exit`）立即接力重启对应的受管 probe runner（仅脚本/任务层，不重启 Ego Lite 宿主），不允许把唤醒留给「之后有空再说」。
 - probe 内置硬化（规范版已含，勿删）：**R2.4 起快轮询三分支驻页探测（FINAL PASS 65c78e4）**——STAY 轮（页面就绪）0 goto 零加载；CALIBRATE 轮（距 navRef ≥10 分钟）1 次 goto 校准；RECOVER 轮（页面失就绪/timeOrigin 读取失败）走恢复。navRef = max(lastGotoAt, performance.timeOrigin)；goto 全部收敛到统一 `navigate(reason)` 入口（单一 `gotoAt` 时间戳 + GOTO_ATTEMPT 事件）。就绪等待只认**正文 >600 字符**（上限 40s——空壳也带「发送」按钮，按按钮判就绪会假阳性）；**例外：NEW_CONV 类导航（新聊天落地页，无会话体可渲染，#12-1 实测 bodyLen 455-467）**就绪改认结构化证据——composer（aria-label 口径）与模型菜单按钮同时存在且 bodyLen>300，空壳防线不放宽（会话页仍按 >600）。goto/渲染失败 → **8 分钟退避**（退避期只刷状态文件时间戳）；**死页梯子**：见死标 → 刷 2 次 → 仍死记 1 strike → **8 分钟后再试** → 连续 3 strikes 才判会话真死并唤醒主管；恢复渲染后 strike 清零。dispatch 侧 `PAGE_NOT_READY_AFTER_NAVIGATE` / `COMPOSER_SURFACE_UNAVAILABLE` abort 后**不自行重试导航**，转交既有 probe 恢复流程（含本梯子），避免双责任方写同一梯子状态（规划师裁决 2026-11-10）；会话页 `bodyLen≈305-308`（侧栏完整、主区空）是实测可恢复形态（#21/#23），梯子轮次内不判死。429/加载风暴与 Composer 冻结走共享风暴通道（`CHAT_SURFACE_STRUCTURALLY_UNAVAILABLE` + `stormBackoffDeadline` = max(8min, 9min+SPACE相位)，单次重试由 planStormRecovery 把关，失败重新武装，详见 §3.1）。
 - **恢复首轮若为空闲态 → startIdle=true → 强制走「启动即提取」复核**（防吞退避期间已到达的回复）。
 - **Page 恢复顺序（#18 R1，send 自动恢复补充）**：先盘点 `task.pages()` 受管 Page 与 `task.tabs()`（含 unmanaged）。受管 Page 按目标 conversation UUID 的 URL 完整路径段判定：唯一匹配即复用；多匹配 `PAGE_URL_MATCH_AMBIGUOUS` 立即 STOP，绝不按历史 `pageLabel` 消歧。受管零匹配时，先查 unmanaged：仅有一条目标 UUID 匹配、host 严格为 `chatgpt.com`（HTTPS）且 `openedBy=agent`、`targetId`/Page 身份证据齐全才 `adopt`；多条匹配熔断，证据不全 `PAGE_ADOPTION_EVIDENCE_INCOMPLETE` STOP，不接管用户来源页。无可收养目标时，`send` 可复用唯一已确认 Agent-owned 空白 Page（`about:blank` 或 `chrome://new-tab-page/`，匹配 tabs 的 label/targetId），或在其它受管 Page 全部为已识别会话、没有空白页时为目标会话 `newPage()`；零 Page 时同样新建。新建和空白页复用均走 `navigate("CONVERSATION_PAGE_RECOVERY")` 恢复原 UUID，再通过原派单闸门。此类自动恢复无需向 PO 申请重开页。未知 URL、URL 读取失败、多空白页或所有权不明时按证据报错并停止，避免占用其它任务 Page。probe 维持自身已有的恢复与 reservation 契约。
@@ -193,20 +193,22 @@ const r = await page.fetch("/backend-api/conversation/" + uuid,
 
 ### 6.3 唤醒信号处置表
 
+本表中的「重启」均指重新运行对应的受管 probe/watch runner，或恢复 Agent 自己的 Page / TaskSpace；**不指终止或重启 Ego Lite 桌面宿主 `ego.exe`**。
+
 | 信号 | 含义 | 主管动作 |
 |---|---|---|
 | `REPLY_ARRIVED_WAKE_SUPERVISOR`（脚本1） | 翻转确认，回复到达候选 | API 单次终验（tail assistant+end_turn=true）→ 提取结果 |
-| `CONVERSATION_DEAD_WAKE_SUPERVISOR`（脚本1） | 死页梯子 3 strikes，会话判死 | 深查/重派/迁移 → 全套重启 |
+| `CONVERSATION_DEAD_WAKE_SUPERVISOR`（脚本1） | 死页梯子 3 strikes，会话判死 | 深查/重派/迁移；按需重新运行受管 probe/watch runner，不重启宿主 |
 | `WAKE_SUPERVISOR reason=NO_SUBSTANTIVE_PROGRESS`（脚本2） | 配置窗口无实质进展 | 本地 Agent 检查状态/工具/页面，按 wakeId 回执并重新布防 |
 | `WAKE_SUPERVISOR reason=REPLY_UNHANDLED` | 回复到达但还未交付 | 立即提取、处理结果，再回执 |
 | `DELIVERY_SUSPECTED_WAKE_SUPERVISOR`（#38） | 账本 ACCEPTED 但发送疑似未持久化（vanish-mode：非生成态下 tail==派单 baseline，或乐观 user 轮悬空无回复；assistant 尾部越过 baseline 则永不触发） | 受管 probe 复核尾部（必要时全新 goto 取服务端真态）：确认未落 → 用受管 `abort` 按证据关闭账本（见下行与 docs/OPERATIONS.md §7，备份先行）并按 §3.1 重派；确认已落 → 正常监控；禁止当完成候选、禁止盲重发 |
 | `DISPATCH_ABORTED_WAKE_SUPERVISOR`（#38 修复3） | 受管 `abort` 已按证据门把在途账本关闭为 ABORTED（账本含 abortReason/abortedAt/abortedBy；原账本字节级备份 `a-dispatch-state.archive-<dispatchId前8>-abort.json`；probe 观测到 ABORTED 账本即报此信号） | 读 `DISPATCH_ABORTED` 事件与备份核对 reason/证据来源；确认后 `ack` 该 wakeId；ABORTED 无回复可言——禁止 collect/consume，禁止重复 abort（`ABORT_NOT_APPLICABLE`）；按 §3.1 决定是否重派 |
 | `USER_ESCALATION_REQUIRED` | 连续 3 轮异常且没有实质进展 | 联系 PO；不能把第三次告警直接当“会话死亡” |
-| `STATE_MISSING / WATCHDOG_TRIGGER(stale>=7min)` | 快轮询死亡 | 修快轮询（页面失附→重新 goto）→全套重启 |
+| `STATE_MISSING / WATCHDOG_TRIGGER(stale>=7min)` | 快轮询死亡 | 修复快轮询（页面失附→重新 goto）后重新运行受管 probe/watch runner，不重启宿主 |
 | `startIdle=true` | 监视器启动/恢复时页面已空闲（基线时序风险） | 「启动即提取」：单次 API 比对派单基线，防吞已到达回复 |
-| `STATE_CORRUPT`（watchdog/probe） | 状态文件 JSON 损坏、缺字段或类型错误（v3 Schema 校验拒绝） | 不猜状态：按现场恢复流程重建状态后全套重启 |
-| `UUID_MISSING_OR_INVALID` | 被监视 UUID 文件缺失或格式非法 | 补 uuid 文件后重启 |
-| `TASKSPACE_RECOVERY_FAILED`（含 `PAGE_URL_MATCH_*`） | Page 恢复 fail-closed（多标签歧义/无匹配/URL 不可读）；输出含 `RECOVERY_HINT=SPACE_REGISTRY_LOST` 时=ego 重启丢失了该空间的注册表 | 带 HINT：先跑受管 `rebuild-space`（§6.5）再重新布防；其余：人工清空间残留标签或核对 UUID 后重启 |
+| `STATE_CORRUPT`（watchdog/probe） | 状态文件 JSON 损坏、缺字段或类型错误（v3 Schema 校验拒绝） | 不猜状态：按现场恢复流程重建状态后重新运行受管 probe/watch runner，不重启宿主 |
+| `UUID_MISSING_OR_INVALID` | 被监视 UUID 文件缺失或格式非法 | 补 uuid 文件后重新运行对应受管 probe/watch runner，不重启宿主 |
+| `TASKSPACE_RECOVERY_FAILED`（含 `PAGE_URL_MATCH_*`） | Page 恢复 fail-closed（多标签歧义/无匹配/URL 不可读）；输出含 `RECOVERY_HINT=SPACE_REGISTRY_LOST` 时=ego 重启丢失了该空间的注册表 | 带 HINT：先跑受管 `rebuild-space`（§6.5）再重新布防；其余：人工清空间残留标签或核对 UUID 后重新运行受管 probe/watch runner；一律不重启宿主 |
 | `PROBE_INVALID_ORIGIN`（#25） | 受管页漂到非会话源（chrome:// 内页、外来 host 等非空白过渡态），页内请求必败导致假盲监控；probe 一轮即报，不再记 strike 退避 | 检查 ego 页面状态/重启 ego；必要时 rebuild-space（§6.5）后重新布防 |
 | `EGO_TASKSPACE_TAKEOVER_REQUIRED`（#25） | ego 升级后 TaskSpace 接管门阻止脚本访问 | 先 `listTaskSpaces()` 找 id，人工 `claimTaskSpace(id)`，再重跑 probe/布防双循环；不得误走死页梯子 |
 | `DISPATCH_ACCEPTED_WAKE_SUPERVISOR` / `DISPATCH_ATTEMPTED_WAKE_SUPERVISOR`（#26） | 任意 STOP 时本轮消息身份匹配且账本已 ACCEPTED 或已进入发送尝试 | 查看 `DISPATCH_LEDGER` + `STOP_CAUSE`；ACCEPTED 立即布防监控，SEND_STARTED/UNCERTAIN 先对账；都不得盲重发 |
@@ -226,7 +228,7 @@ const r = await page.fetch("/backend-api/conversation/" + uuid,
 
 **派单后核对**：`watch` 受管任务有可追踪 ID，任务的结束/异常退出能进入当前本地 Agent 的可处理通知或回调。在现有运行平台上拿不到此保障，就报告“监控接棒能力缺失”，说明缺的是哪条通知链路，不宣称闭环。无需特意制造网页卡死来验收。
 
-**收到唤醒后**：先读 §6.3 的具体信号和状态文件，判断是完整回复、正常长工具链、页面不可用、进程崩溃还是疑似僵尸轮（§5.2）；保留证据后选 `collect`、继续等待、有限恢复、人工停轮或迁移。完成实际诊断后执行 `ack` 并重新运行受管 `watch`；管理器在完整提取并写入校验回执后才能执行 `release`。2026-11-16 起 watch 的每条 exit 2 路径同步落盘 `a-watch-exit.json`（schema `ego-watch-exit/v1`，不存正文）；`ack` 为双账本：同 wakeId 同时命中监督 pending 与 watch-exit 时一次 ack 双清，已 ack 的 watch-exit 记录保留作历史证据，重复 ack 报 `WAKE_ID_ALREADY_ACKNOWLEDGED`。
+**收到唤醒后**：先读 §6.3 的具体信号和状态文件，判断是完整回复、正常长工具链、页面不可用、受管 runner 崩溃还是疑似僵尸轮（§5.2）；保留证据后选 `collect`、继续等待、仅在 runner/Page/自有 TaskSpace 范围内恢复、人工停轮或迁移。不得终止或重启 Ego Lite 宿主 `ego.exe`。完成实际诊断后执行 `ack` 并重新运行受管 `watch`；管理器在完整提取并写入校验回执后才能执行 `release`。2026-11-16 起 watch 的每条 exit 2 路径同步落盘 `a-watch-exit.json`（schema `ego-watch-exit/v1`，不存正文）；`ack` 为双账本：同 wakeId 同时命中监督 pending 与 watch-exit 时一次 ack 双清，已 ack 的 watch-exit 记录保留作历史证据，重复 ack 报 `WAKE_ID_ALREADY_ACKNOWLEDGED`。
 
 **异常处理闭环**：脚本退出或某条 `WAKE_SUPERVISOR` 日志出现后，本地 Agent 若未实际接到通知，按“监控能力缺失”上报 §9.1，不能把写日志视为恢复成功。未能照预案恢复的实战问题同样进入 Issues；普通执行 Agent 不私改 `monitor/` 或 Skill。
 
@@ -289,11 +291,11 @@ node monitor/dispatch-manager.mjs rebuild-space --monitor-dir <监控根目录> 
 
 **冻结参数边界（2026-11-08 R2.2 裁决）**：除 2026-11-14 调整快轮询为 30 秒外，上表其余参数保持原值；DOM 选择器属于 §6.2 的运行时 UI 契约，不属于 §7 冻结参数。DOM 改版不构成变更任何计时、轮询或退避参数的理由。
 
-## 8. Windows / Git Bash 环境坑（与 ego 无关但同场实测）
+## 8. Windows / Git Bash 环境与进程管理
 
 1. Windows 编码三坑：Python `open()` 默认 GBK（加 `encoding='utf-8'`）；subprocess 输出默认 GBK（加 `encoding='utf-8', errors='replace'`）；PowerShell 5.1 把 UTF-8 文件读成 ANSI（长脚本一律走 .mjs 文件）。
 2. Git Bash 里 `powershell -Command "...$_..."` 会被 bash 展开毁掉——复杂 PowerShell 逻辑写成 `.ps1` 文件再 `-File` 执行。
-3. Windows 后台进程要杀 ego/node 时：`Get-CimInstance Win32_Process` 按 Name+CommandLine 过滤拿 PID 再 `Stop-Process`（`wmic` 已不可靠）。
+3. **Ego Lite 宿主进程保护（硬禁令）**：Ego Lite 桌面宿主为 `ego.exe`（本机实测路径：`C:\Program Files\Citro Labs\ego lite\Application\ego.exe`）及其进程树。任何 Agent 不得终止、杀掉或重启宿主及其子进程；禁止 `Get-Process ego | Stop-Process -Force`、`taskkill /IM ego.exe /F`、按 Name 匹配后批量 `Stop-Process` 或其他等效操作。`ego-browser nodejs` runner/watch 退出只代表受管执行轮次退出，不代表宿主故障，不能据此操作宿主。若确需停止一个**明确独立于 Ego Lite 宿主进程树**的外部任务进程，只能使用该 Agent 在启动时记录的精确 PID，并核对 ProcessId、ParentProcessId、ExecutablePath、CommandLine 均与该次启动记录一致；缺少任一证据或不一致即 STOP。`Get-CimInstance Win32_Process` 可用于只读取证 Name、CommandLine、ProcessId、ParentProcessId，但不授予终止权限。宿主异常唯一处置：停止操作、保留脱敏证据并报告 PO。
 4. 跨 bash/pwsh 传路径一律 Windows 绝对路径（Git Bash 的 `/tmp` 会被 pwsh 解析成 `C:\tmp`）。
 5. **node:test 在 ego 内置 Electron node 上不可用作测试证据（2026-11-10 本机实测）**：`run({files})` 只报文件级计数且不反映内部用例失败（故意失败的文件仍报 pass 1，阴性对照证伪）；TAP stdout 输出触发 `ERR_UNKNOWN_ENCODING: buffer` 崩溃。验收测试用独立便携版 Node 官方 `node --test`（本机 `D:/Users/Administrator/ego/node-portable/` v20.18.0）。限定为本机观察结果，其他机器以实机为准。
 
@@ -408,20 +410,20 @@ node monitor/dispatch-manager.mjs rebuild-space --monitor-dir <监控根目录> 
 - 保留原会话作为故障现场；只有确认原轮次已结束或明确死亡，才新建任务。
 - 禁止把等待超时当成「未发送」；禁止以新会话重派来掩盖原轮次状态不明。
 
-### 11.5 浏览器辅助进程重启与会话恢复
+### 11.5 受管任务 runner 中断与会话恢复（不含 Ego Lite 宿主）
 
-进程重启会丢失 JavaScript 变量，但不一定意味着 TaskSpace、浏览器上下文或 ChatGPT 会话消失。恢复顺序：
+本节的「进程重启」仅指本地 Agent 受管的 Node.js 任务 runner（例如 `dispatch-manager` / `watch` 执行进程）退出后重新运行；**不指 Ego Lite 桌面宿主 `ego.exe`**。宿主 `ego.exe` 及其进程树属于用户共享运行环境，任何 Agent 不得终止或重启，详见 §8 第 3 条。runner 退出会丢失其 JavaScript 变量，但不一定意味着 TaskSpace、浏览器上下文或 ChatGPT 会话消失。恢复顺序：
 
 1. 用原 TaskSpace 名重新连接；不要创建第二个同目标 TaskSpace。
 2. 通过 task.pages() 枚举现有标签，再按标签找到页面对象。继续遵守 §2：task.page(label) 在标签不存在时可能异步抛错，不能用同步 try/catch 判断是否存在。
 3. 检查页面 URL 是否仍包含原 conversation UUID；项目 URL 允许有额外路径，按 includes(uuid) 判断。
 4. 页面仍可用时复用原页面；若页面渲染冻结，按 §6.2 的全新 goto 与死页梯子恢复，不把 page.reload() 当默认恢复动作。
 5. 页面进程已丢失时，才新建页面并导航到原 /c/<uuid>；先核对原 user 气泡、assistant 状态和工具状态，再决定后续动作。
-6. 采用有限重启预算。达到上限仍未恢复时停止自动重启，保存现场并唤醒主管；不得无限重启形成 crash loop。
+6. 对受管 Node.js runner 采用有限恢复预算：优先使用原派单账本和原参数恢复原任务，不创建重复派单。达到 runner 恢复上限仍未恢复时停止自动重试，保存现场并唤醒主管；不得无限重启形成 crash loop，更不得通过终止/重启 `ego.exe` 代替恢复。
 
 关闭正在运行的浏览器标签会终止该轮任务。恢复过程中不要为了「清理页面」关闭仍在生成或等待工具结果的标签。只有确认轮次已完成、已取消或已判死，才释放对应页面。
 
-### 11.6 防止辅助进程重启后重复提交
+### 11.6 防止受管任务 runner 重启后重复提交
 
 网页发送无法提供真正的 exactly-once 保证，因此采用「持久化状态 + 发送后对账 + 不确定时不重发」的 at-most-once 策略。
 
@@ -472,8 +474,8 @@ ChatGPT 页面不是稳定 API。composer、模型选择器、轮次渲染器和
 
 - 新 UI 结构无法识别时，明确报结构不匹配并保留现场；不要静默切换模型、发送方式或传输通道。
 - 修选择器前先采集当前真实页面结构；只保留已经实测可用的布局分支。
-- 浏览器冒烟测试通过只证明当时的登录态和基础控件可用，不等于真实任务完整通过。完整验收至少覆盖：发送接受、流式正文增长、工具调用及结果返回、最终答案、取消、进程重启恢复、长任务继续和失败诊断导出。
-- 任何取消、关闭标签或重启动作，都要验证原任务确实停止/恢复，不能只看 UI 按钮状态。
+- 浏览器冒烟测试通过只证明当时的登录态和基础控件可用，不等于真实任务完整通过。完整验收至少覆盖：发送接受、流式正文增长、工具调用及结果返回、最终答案、取消、受管 runner 中断恢复、长任务继续和失败诊断导出；不通过终止 Ego Lite 宿主来测试恢复。
+- 任何取消、关闭标签或受管 runner 重启动作，都要验证原任务确实停止/恢复，不能只看 UI 按钮状态；Ego Lite 宿主终止/重启不属于 Agent 可执行的恢复动作。
 
 ### 11.9 上游实现细节的适用边界
 
