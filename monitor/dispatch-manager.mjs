@@ -2,14 +2,16 @@
 // Single entry point for ChatGPT web dispatch, monitoring and page release.
 // Use this command as a MANAGED foreground/background tool task: exit code 2
 // carries a wake signal to the hosting Agent (only if its job API supports it).
-import { readFile, writeFile, mkdir, copyFile, unlink, stat, rename, open } from "node:fs/promises";
+import { readFile, writeFile, mkdir, copyFile, unlink, stat, rename, open, appendFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { dirname, join, resolve, isAbsolute } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { tick, acknowledge } from "./supervision-watchdog.mjs";
 import { readDispatchState, markCompleted, writeJsonAtomic, validateDispatchRecord } from "./dispatch-state.mjs";
 import { verifiedReply, acknowledgeReply, verifiedConsumption, sha256 } from "./reply-delivery.mjs";
+import { withAgentRegistry } from "./agent-space.mjs";
 
 const sourceDir = dirname(fileURLToPath(import.meta.url));
 const kitDir = dirname(sourceDir);
@@ -29,9 +31,10 @@ const templates = {
   probe: join(sourceDir, "ego-fast-probe.mjs"),
   release: join(sourceDir, "release-agent-space.template.mjs"),
   collect: join(sourceDir, "collect-reply.template.mjs"),
+  "rebuild-space": join(sourceDir, "rebuild-space.template.mjs"),
 };
 const modules = ["agent-space.mjs", "dispatch-state.mjs", "reply-delivery.mjs", "page-recovery.mjs", "state-schema.mjs", "taskspace-takeover.mjs", "supervision-policy.mjs"];
-const allowed = new Set(["send", "send-new", "recover-draft", "probe", "watch", "collect", "consume", "release", "ack"]);
+const allowed = new Set(["send", "send-new", "recover-draft", "probe", "watch", "collect", "consume", "release", "ack", "rebuild-space"]);
 const uuid = /^[a-f\d]{8}-[a-f\d]{4}-[1-8][a-f\d]{3}-[89ab][a-f\d]{3}-[a-f\d]{12}$/i;
 
 export function parseArgs(args) {
@@ -51,6 +54,17 @@ export function parseArgs(args) {
   params.newChat = action === "send-new";
   params.recoverOnly = action === "recover-draft";
   if (params.newChat && !params.conversation && uuid.test(params.requestId || "")) params.conversation = params.requestId;
+  // Space-level rebuild is authorized by agent+space identity alone; a conversation
+  // or payload would mean this is really a dispatch action, not a registry rebuild.
+  if (action === "rebuild-space") {
+    if (["conversation", "requestId", "message", "attachmentsFile", "wakeId", "ackAction", "replySha256", "archivedRecord"]
+        .some((key) => params[key])) throw new Error("MANAGER_IDENTITY_INVALID");
+    if (!params.agentId || !/^[a-z0-9][a-z0-9_.-]{1,63}$/i.test(params.agentId) ||
+        !params.space || params.space !== params.space.trim() || params.space.length > 120) {
+      throw new Error("MANAGER_IDENTITY_INVALID");
+    }
+    return params;
+  }
   if (!params.agentId || !/^[a-z0-9][a-z0-9_.-]{1,63}$/i.test(params.agentId) ||
     !params.space || params.space.length > 120 || !uuid.test(params.conversation) ||
     (params.newChat && (params.conversation !== params.requestId || !uuid.test(params.requestId))) ||
@@ -253,6 +267,71 @@ async function releaseDelivered(params, dir) {
   return 0;
 }
 
+async function readLocalProfileConfig() {
+  try { return JSON.parse(await readFile(join(homedir(), ".agents", "ego-profile.json"), "utf8")); }
+  catch (error) {
+    if (error.code === "ENOENT") return null;
+    throw new Error("SPACE_REBUILD_PIN_CONFIG_INVALID");
+  }
+}
+
+// A rebuilt TaskSpace must be provably owned before any browser is touched —
+// otherwise the guard would be right to block ad-hoc rebuilds (agent-kit#31).
+// Primary evidence: the machine-wide ownership ledger still binds this agent to
+// this space (it survives ego restarts; releasePending still blocks). Fallback:
+// an explicit machine-local allowlist for spaces whose ledger entry is gone too —
+// and never for a space another agent still owns.
+export async function authorizeSpaceRebuild(agentId, space, { directory, profileConfig } = {}) {
+  const evidence = await withAgentRegistry((registry) => ({
+    changed: false,
+    value: {
+      entry: registry.agents[agentId] ? structuredClone(registry.agents[agentId]) : null,
+      spaceTaken: Object.entries(registry.agents).some(([id, owned]) => id !== agentId && owned.spaceName === space),
+    },
+  }), directory);
+  if (evidence.entry) {
+    if (evidence.entry.spaceName !== space) throw new Error("SPACE_REBUILD_AGENT_BOUND_TO_OTHER_SPACE");
+    if (evidence.entry.releasePending) throw new Error("AGENT_SPACE_RELEASE_PENDING");
+    return "LEDGER_PROOF";
+  }
+  if (evidence.spaceTaken) throw new Error("SPACE_OWNED_BY_ANOTHER_AGENT");
+  const config = profileConfig ?? await readLocalProfileConfig();
+  if (Array.isArray(config?.spaceRebuildAllowlist) && config.spaceRebuildAllowlist.includes(space)) return "ALLOWLIST";
+  throw new Error("SPACE_REBUILD_NOT_AUTHORIZED");
+}
+
+// One audited, self-service recovery step: rebuild a TaskSpace whose registry
+// entry an ego restart lost. The audit line records denials too, so blind
+// retries leave evidence instead of silently hammering the browser.
+export async function rebuildSpace(p, { directory, profileConfig, runScript } = {}) {
+  await mkdir(p.monitorDir, { recursive: true });
+  const auditFile = join(p.monitorDir, "a-space-rebuild-audit.ndjson");
+  const audit = (entry) => appendFile(auditFile, JSON.stringify({
+    ts: new Date().toISOString(), action: "rebuild-space", agentId: p.agentId, space: p.space, ...entry,
+  }) + "\n", "utf8");
+  let decision;
+  try { decision = await authorizeSpaceRebuild(p.agentId, p.space, { directory, profileConfig }); }
+  catch (error) {
+    const code = error.message || "SPACE_REBUILD_NOT_AUTHORIZED";
+    await audit({ decision: "DENIED", code }).catch(() => {});
+    console.log("RESULT=SPACE_REBUILD_DENIED code=" + code);
+    return 2;
+  }
+  const template = await readFile(templates["rebuild-space"], "utf8");
+  const source = adaptTemplate(template, p);
+  const observation = runScript
+    ? await runScript(source, p.monitorDir)
+    : await runEgo(source, p.monitorDir, "rebuild-space");
+  const rebuilt = observation.code === 0 && observation.result === "SPACE_REBUILT_ACCOUNT_VERIFIED";
+  await audit({ decision, outcome: rebuilt ? "REBUILT" : "FAILED", result: observation.result || "MISSING", exit: observation.code });
+  if (rebuilt) {
+    console.log("RESULT=SPACE_REBUILT space=" + p.space);
+    return 0;
+  }
+  console.log("RESULT=SPACE_REBUILD_FAILED result=" + (observation.result || "MISSING") + " exit=" + observation.code);
+  return 2;
+}
+
 export async function ensureMonitor(dir) {
   await mkdir(dir, { recursive: true });
   for (const name of modules) {
@@ -326,6 +405,9 @@ export async function main(args = process.argv.slice(2)) {
     try { await readFile(join(p.monitorDir, name)); throw new Error("LEGACY_SHARED_STATE_REQUIRES_ISOLATION"); }
     catch (error) { if (error.code !== "ENOENT") throw error; }
   }
+  // A space-level rebuild owns no conversation ledger; route it before the
+  // per-conversation directory layout is touched at all.
+  if (p.action === "rebuild-space") return rebuildSpace(p);
   const dir = conversationDir(p);
   p.rootMonitorDir = p.monitorDir;
   if (p.newChat) {

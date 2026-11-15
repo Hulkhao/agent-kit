@@ -156,6 +156,9 @@ if (isBackoffActive(previous, now())) {
 
 let task;
 let spaceId = previous.spaceId || null;
+// Set once the bootstrap branch is entered; a failure there means the registry
+// lost the space (agent-kit#31), which the managed rebuild-space step can fix.
+let spaceRegistryMissing = false;
 // r45 LIMITED GO (issue #6): the probe may bootstrap a MISSING space, but ONLY with the machine-local
 // account pin — bare taskSpace(SPACE) creation is forbidden (it recreates the wrong-account space,
 // the exact root cause of the mini-tier incident). Existing-space reuse keeps the prior checks.
@@ -171,6 +174,7 @@ try {
   const targetSpace = spaces.find((space) => space.taskId === SPACE || space.name === SPACE) ||
     (spaceId ? spaces.find((space) => space.id === spaceId && (!space.taskId || space.taskId === SPACE)) : null);
   if (!targetSpace) {
+    spaceRegistryMissing = true;
     const pinnedProfileId = await readPinnedProfileId();
     if (!pinnedProfileId) throw new Error("TASKSPACE_BOOTSTRAP_NO_PIN");
     const knownProfiles = await profiles();
@@ -201,6 +205,9 @@ try {
   await writeState({ spaceId, probeFailed: true, recoveryFailed: true, errorCode: code, ...safeError(error) });
   await appendEvent(MON, code, { spaceId, ...safeError(error) });
   console.log("RECOVERY_DETAIL=" + String(error && error.message || error).slice(0, 200));
+  if (spaceRegistryMissing && !isTaskSpaceTakeover(error)) {
+    console.log('RECOVERY_HINT=SPACE_REGISTRY_LOST command="dispatch-manager.mjs rebuild-space --monitor-dir <monitor-dir> --agent-id <agent-id> --space <space>"');
+  }
   console.log("RESULT=" + code);
   process.exit(0);
 }

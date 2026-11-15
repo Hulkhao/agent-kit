@@ -3,13 +3,14 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { fileURLToPath } from "node:url";
-import { mkdtemp, mkdir, rm, writeFile, readFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, writeFile, readFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { normalizeFastState } from "../monitor/state-schema.mjs";
 import { tick, acknowledge } from "../monitor/supervision-watchdog.mjs";
 import { shouldReviewStartupIdle } from "../monitor/supervision-policy.mjs";
-import { parseArgs, adaptTemplate, bindNewConversation, classifyManagerResult, loadAttachments, requireArmedDispatch, main, readEgoOutcome, ensureMonitor } from "../monitor/dispatch-manager.mjs";
+import { parseArgs, adaptTemplate, bindNewConversation, classifyManagerResult, loadAttachments, requireArmedDispatch, main, readEgoOutcome, ensureMonitor, authorizeSpaceRebuild, rebuildSpace } from "../monitor/dispatch-manager.mjs";
+import { withAgentRegistry } from "../monitor/agent-space.mjs";
 import { checkDispatchTool } from "../plugins/chatgpt-dispatch-guard/hooks/policy.mjs";
 import { installConfig, install } from "../monitor/install-zcode-guard.mjs";
 import { extractDomReply, extractApiReply, saveReply, verifiedReply, acknowledgeReply, verifiedConsumption, sha256, visibleTextHash } from "../monitor/reply-delivery.mjs";
@@ -494,4 +495,124 @@ test("supervisor re-arms after review, escalates at round 3, resets on progress"
     assert.equal(status.pending, null);
     assert.equal(status.abnormalRounds, 0);
   } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("#31: rebuild-space parses space-level identity and rejects dispatch-only args", () => {
+  const base = ["--monitor-dir", ".monitor", "--agent-id", "gdc-a", "--space", "GDC-执行A"];
+  const p = parseArgs(["rebuild-space", ...base]);
+  assert.equal(p.action, "rebuild-space");
+  assert.equal(p.monitorDir, resolve(".monitor"));
+  assert.throws(() => parseArgs(["rebuild-space", ...base, "--conversation", uuid]), /MANAGER_IDENTITY_INVALID/);
+  assert.throws(() => parseArgs(["rebuild-space", ...base, "--request-id", uuid]), /MANAGER_IDENTITY_INVALID/);
+  assert.throws(() => parseArgs(["rebuild-space", ...base, "--message", "msg.txt"]), /MANAGER_IDENTITY_INVALID/);
+  assert.throws(() => parseArgs(["rebuild-space", "--monitor-dir", ".monitor", "--space", "GDC-执行A"]), /MANAGER_IDENTITY_INVALID/);
+  assert.throws(() => parseArgs(["rebuild-space", ...base, "--bogus", "x"]), /MANAGER_ARG_INVALID/);
+});
+
+test("#31: rebuild-space authorization requires ledger proof or an explicit allowlist", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ego-rebuild-auth-"));
+  try {
+    await assert.rejects(authorizeSpaceRebuild("gdc-a", "GDC-执行A", { directory: root }), /SPACE_REBUILD_NOT_AUTHORIZED/);
+    await withAgentRegistry((registry) => {
+      registry.agents["gdc-a"] = { spaceName: "GDC-执行A", active: [], known: [] };
+      return { changed: true };
+    }, root);
+    assert.equal(await authorizeSpaceRebuild("gdc-a", "GDC-执行A", { directory: root }), "LEDGER_PROOF");
+    await assert.rejects(authorizeSpaceRebuild("gdc-a", "其他空间", { directory: root }), /SPACE_REBUILD_AGENT_BOUND_TO_OTHER_SPACE/);
+    await withAgentRegistry((registry) => {
+      registry.agents["gdc-b"] = { spaceName: "B空间", active: [], known: [] };
+      return { changed: true };
+    }, root);
+    await assert.rejects(authorizeSpaceRebuild("gdc-c", "B空间", { directory: root, profileConfig: { spaceRebuildAllowlist: ["B空间"] } }),
+      /SPACE_OWNED_BY_ANOTHER_AGENT/);
+    await withAgentRegistry((registry) => {
+      registry.agents["gdc-a"].releasePending = { conversationUuid: uuid, finished: false };
+      return { changed: true };
+    }, root);
+    await assert.rejects(authorizeSpaceRebuild("gdc-a", "GDC-执行A", { directory: root }), /AGENT_SPACE_RELEASE_PENDING/);
+    assert.equal(await authorizeSpaceRebuild("gdc-c", "新空间", { directory: root, profileConfig: { spaceRebuildAllowlist: ["新空间"] } }), "ALLOWLIST");
+    await assert.rejects(authorizeSpaceRebuild("gdc-c", "新空间", { directory: root, profileConfig: {} }), /SPACE_REBUILD_NOT_AUTHORIZED/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("#31: rebuild-space denies before any browser call and audits the denial", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ego-rebuild-deny-"));
+  try {
+    assert.equal(await main(["rebuild-space", "--monitor-dir", root, "--agent-id", "gdc-a", "--space", "GDC-执行A"]), 2);
+    const audit = JSON.parse(await readFile(join(root, "a-space-rebuild-audit.ndjson"), "utf8"));
+    assert.equal(audit.decision, "DENIED");
+    assert.equal(audit.agentId, "gdc-a");
+    assert.equal(audit.space, "GDC-执行A");
+    assert.match(audit.code, /SPACE_REBUILD|AGENT_SPACE_RELEASE_PENDING/);
+    // A space-level action must not create the per-conversation layout.
+    await assert.rejects(stat(join(root, "conversations")), { code: "ENOENT" });
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("#31: rebuild-space runs the adapted template and audits the browser outcome", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ego-rebuild-run-"));
+  try {
+    await withAgentRegistry((registry) => {
+      registry.agents["gdc-a"] = { spaceName: "GDC-执行A", active: [], known: [] };
+      return { changed: true };
+    }, root);
+    const p = parseArgs(["rebuild-space", "--monitor-dir", root, "--agent-id", "gdc-a", "--space", "GDC-执行A"]);
+    const scripts = [];
+    assert.equal(await rebuildSpace(p, {
+      directory: root,
+      runScript: async (script, dir) => {
+        scripts.push({ script, dir });
+        return { code: 0, result: "SPACE_REBUILT_ACCOUNT_VERIFIED" };
+      },
+    }), 0);
+    assert.equal(scripts.length, 1);
+    assert.equal(scripts[0].dir, root);
+    assert.match(scripts[0].script, /const SPACE = "GDC-执行A";/);
+    assert.doesNotMatch(scripts[0].script, /REPLACE_WITH_/);
+    const audit = (await readFile(join(root, "a-space-rebuild-audit.ndjson"), "utf8")).trim().split("\n");
+    assert.equal(JSON.parse(audit[0]).decision, "LEDGER_PROOF");
+    assert.equal(JSON.parse(audit[0]).outcome, "REBUILT");
+    assert.equal(await rebuildSpace(p, {
+      directory: root,
+      runScript: async () => ({ code: 1, result: "SPACE_REBUILD_ACCOUNT_UNPROVEN" }),
+    }), 2);
+    const lines = (await readFile(join(root, "a-space-rebuild-audit.ndjson"), "utf8")).trim().split("\n");
+    assert.equal(lines.length, 2);
+    assert.equal(JSON.parse(lines[1]).outcome, "FAILED");
+    assert.equal(JSON.parse(lines[1]).result, "SPACE_REBUILD_ACCOUNT_UNPROVEN");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("#31: the rebuild template is standalone, pins creation, and closes its page", async () => {
+  const source = await readFile(new URL("../monitor/rebuild-space.template.mjs", import.meta.url), "utf8");
+  assert.match(source, /taskSpace\(SPACE, \{ profileId: pin\.defaultProfileId \}\)/);
+  assert.match(source, /RESULT=SPACE_REBUILT_ACCOUNT_VERIFIED/);
+  assert.match(source, /EGO_TASKSPACE_TAKEOVER_REQUIRED/);
+  assert.match(source, /page\.close\(\)/);
+  // Standalone: no monitor-module imports, so it runs before any conversation
+  // directory (and its managed module copies) exists.
+  assert.doesNotMatch(source, /dispatch-state\.mjs|agent-space\.mjs|MON\s*\+/);
+  const p = parseArgs(["rebuild-space", "--monitor-dir", ".monitor", "--agent-id", "gdc-a", "--space", "GDC-执行A"]);
+  const adapted = adaptTemplate(source, p);
+  assert.match(adapted, /const SPACE = "GDC-执行A";/);
+  assert.doesNotMatch(adapted, /REPLACE_WITH_/);
+});
+
+test("#31: probe and send point at rebuild-space only when the registry lost the space", async () => {
+  const probe = await readFile(new URL("../monitor/ego-fast-probe.mjs", import.meta.url), "utf8");
+  assert.match(probe, /spaceRegistryMissing/);
+  assert.match(probe, /RECOVERY_HINT=SPACE_REGISTRY_LOST/);
+  assert.match(probe, /spaceRegistryMissing && !isTaskSpaceTakeover\(error\)/);
+  const send = await readFile(new URL("../skills/chatgpt-web-dispatch/templates/dispatch-round.template.mjs", import.meta.url), "utf8");
+  assert.match(send, /RECOVERY_HINT=SPACE_REGISTRY_LOST/);
+  assert.match(send, /spaceRegistryMissing && !spaceReady && !isTaskSpaceTakeover\(error\)/);
+});
+
+test("#31: the guard keeps the managed rebuild-space entry point allowed", () => {
+  const native = (toolName, toolInput) => ({ hookEventName: "PreToolUse", toolName, toolInput, toolCallId: "probe-rebuild" });
+  const command = "node monitor/dispatch-manager.mjs rebuild-space --monitor-dir .monitor --agent-id gdc-a --space GDC-执行A";
+  assert.equal(checkDispatchTool(native("Bash", { command })), null);
+  // The ad-hoc rebuild path the guard exists to block stays blocked.
+  const adhoc = "ego-browser nodejs -e \"await import('file:///C:/tmp/adhoc-rebuild.mjs')\"";
+  assert.equal(checkDispatchTool(native("Bash", { command: adhoc })).hookSpecificOutput.permissionDecision, "deny");
 });

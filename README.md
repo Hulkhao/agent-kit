@@ -25,7 +25,9 @@ git push -u origin master
 
 ## ChatGPT 网页派单统一入口
 
-`monitor/dispatch-manager.mjs` 提供 `send`、`send-new`、`probe`、`watch`、`collect`、`consume`、`release` 和 `ack`。每个 Agent 用固定 `--agent-id` 与可读中文 `--space`，每个会话用 `--conversation`（UUID）隔离账本、回复及监控状态。`send` 还需 `--message` 指向任务文件。新聊天使用 `send-new --request-id <新请求UUID> --message <文件路径>`，由管理器返回实际会话 UUID。同一请求只能以同一身份与正文哈希恢复绑定，禁止盲目重发。
+`monitor/dispatch-manager.mjs` 提供 `send`、`send-new`、`probe`、`watch`、`collect`、`consume`、`release`、`ack` 和 `rebuild-space`。每个 Agent 用固定 `--agent-id` 与可读中文 `--space`，每个会话用 `--conversation`（UUID）隔离账本、回复及监控状态。`send` 还需 `--message` 指向任务文件。新聊天使用 `send-new --request-id <新请求UUID> --message <文件路径>`，由管理器返回实际会话 UUID。同一请求只能以同一身份与正文哈希恢复绑定，禁止盲目重发。
+
+`rebuild-space --agent-id <AgentID> --space <空间名>` 用于 ego 重启丢失空间注册表后的受管重建（#31）：管理器先核验所有权证据——机器级归属账本 `~/.agents/ego-taskspaces.json` 仍把该 Agent 绑定到该空间（主证据），或本机 `ego-profile.json` 的 `spaceRebuildAllowlist` 显式白名单（兜底）——通过后才由管理器子进程按账号钉扎重建空间、在真实页面上核对钉扎账号并关闭该页；每次调用（含拒绝）都追加审计行到 `<监控目录>/a-space-rebuild-audit.ndjson`。无证据即拒绝（exit 2），此时按手册上报 PO，不得盲试 ad-hoc ego 调用（守卫会拦截）。
 
 ```powershell
 node monitor/dispatch-manager.mjs watch --monitor-dir <项目监控目录> --agent-id gdc-exec-a --space GDC-本地执行A --conversation <会话UUID>

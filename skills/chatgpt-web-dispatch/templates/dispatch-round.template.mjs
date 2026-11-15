@@ -105,6 +105,11 @@ await checkStorm();
 let task;
 let page = null;
 let pageNeedsNavigation = false;
+// Distinguish the two failure domains inside the shared try: a bootstrap attempt
+// that never completed means the registry lost the space (agent-kit#31), which
+// the managed rebuild-space step can fix; later page-recovery failures must not.
+let spaceRegistryMissing = false;
+let spaceReady = false;
 try {
   const spaces = await listTaskSpaces();
   let targetSpace = spaces.find((space) => space.taskId === SPACE || space.name === SPACE);
@@ -112,12 +117,14 @@ try {
     // r48: ego restart clears the space registry. Bootstrap the pinned space for
     // BOTH new chats and existing-conversation sends (same rule as ego-fast-probe),
     // instead of failing send with TASKSPACE_NOT_FOUND until a new chat happens.
+    spaceRegistryMissing = true;
     if (!profileCfg.defaultProfileId) abort("ACCOUNT_CONFIG_MISSING_STOP");
     task = await taskSpace(SPACE, { profileId: profileCfg.defaultProfileId });
     targetSpace = (await listTaskSpaces()).find((space) => space.taskId === SPACE || space.name === SPACE);
   }
   assertAgentOwnedTaskSpace(targetSpace, SPACE);
   if (!task) task = await taskSpace(targetSpace.id);
+  spaceReady = true;
   if (NEW_CHAT) {
     const request = JSON.parse(await fs.readFile(MON + "/a-new-request.json", "utf8"));
     if (request.requestId.toLowerCase() !== CONV.toLowerCase() || request.space !== SPACE ||
@@ -141,6 +148,9 @@ try {
   }
 } catch (error) {
   console.log("RECOVERY_DETAIL=" + String(error && error.message || error).slice(0, 220));
+  if (spaceRegistryMissing && !spaceReady && !isTaskSpaceTakeover(error)) {
+    console.log('RECOVERY_HINT=SPACE_REGISTRY_LOST command="dispatch-manager.mjs rebuild-space --monitor-dir <monitor-dir> --agent-id <agent-id> --space <space>"');
+  }
   abort(isTaskSpaceTakeover(error) ? TASKSPACE_TAKEOVER_SIGNAL : "TASKSPACE_RECOVERY_FAILED");
 }
 if (!page) abort("CONVERSATION_PAGE_MISSING");

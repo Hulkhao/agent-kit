@@ -201,7 +201,7 @@ const r = await page.fetch("/backend-api/conversation/" + uuid,
 | `startIdle=true` | 监视器启动/恢复时页面已空闲（基线时序风险） | 「启动即提取」：单次 API 比对派单基线，防吞已到达回复 |
 | `STATE_CORRUPT`（watchdog/probe） | 状态文件 JSON 损坏、缺字段或类型错误（v3 Schema 校验拒绝） | 不猜状态：按现场恢复流程重建状态后全套重启 |
 | `UUID_MISSING_OR_INVALID` | 被监视 UUID 文件缺失或格式非法 | 补 uuid 文件后重启 |
-| `TASKSPACE_RECOVERY_FAILED`（含 `PAGE_URL_MATCH_*`） | Page 恢复 fail-closed（多标签歧义/无匹配/URL 不可读） | 人工清空间残留标签或核对 UUID 后重启 |
+| `TASKSPACE_RECOVERY_FAILED`（含 `PAGE_URL_MATCH_*`） | Page 恢复 fail-closed（多标签歧义/无匹配/URL 不可读）；输出含 `RECOVERY_HINT=SPACE_REGISTRY_LOST` 时=ego 重启丢失了该空间的注册表 | 带 HINT：先跑受管 `rebuild-space`（§6.5）再重新布防；其余：人工清空间残留标签或核对 UUID 后重启 |
 | `EGO_TASKSPACE_TAKEOVER_REQUIRED`（#25） | ego 升级后 TaskSpace 接管门阻止脚本访问 | 先 `listTaskSpaces()` 找 id，人工 `claimTaskSpace(id)`，再重跑 probe/布防双循环；不得误走死页梯子 |
 | `DISPATCH_ACCEPTED_WAKE_SUPERVISOR` / `DISPATCH_ATTEMPTED_WAKE_SUPERVISOR`（#26） | 任意 STOP 时本轮消息身份匹配且账本已 ACCEPTED 或已进入发送尝试 | 查看 `DISPATCH_LEDGER` + `STOP_CAUSE`；ACCEPTED 立即布防监控，SEND_STARTED/UNCERTAIN 先对账；都不得盲重发 |
 | `DISPATCH_UNCERTAIN_WAKE_SUPERVISOR` | 派单账本处于 UNCERTAIN，无法证明已接受 | 先对账（结构化 unit 证据）再裁定；未接受才授权重试 |
@@ -217,6 +217,22 @@ const r = await page.fetch("/backend-api/conversation/" + uuid,
 **收到唤醒后**：先读 §6.3 的具体信号和状态文件，判断是完整回复、正常长工具链、页面不可用、进程崩溃还是疑似僵尸轮（§5.2）；保留证据后选 `collect`、继续等待、有限恢复、人工停轮或迁移。完成实际诊断后执行 `ack` 并重新运行受管 `watch`；管理器在完整提取并写入校验回执后才能执行 `release`。
 
 **异常处理闭环**：脚本退出或某条 `WAKE_SUPERVISOR` 日志出现后，本地 Agent 若未实际接到通知，按“监控能力缺失”上报 §9.1，不能把写日志视为恢复成功。未能照预案恢复的实战问题同样进入 Issues；普通执行 Agent 不私改 `monitor/` 或 Skill。
+
+### 6.5 空间注册表丢失的受管重建（rebuild-space，#31）
+
+**故障形态**：ego 重启后空间注册表丢失该 Agent 的空间（`listTaskSpaces` 无此空间）→ `send/probe/watch` 全部 `TASKSPACE_RECOVERY_FAILED`、`release` 报 `TASKSPACE_NOT_FOUND`。旧自助恢复路径（agent 直接 `taskSpace("原名")` 重建）已被 dispatch-guard 以 `CHATGPT_DISPATCH_MANAGER_REQUIRED` 封死；管理器此前只能 claim 已存在空间，不能从名字重建——三方死锁（实测 B89 夜间盲试 4 轮 80 分钟，2026-11-15）。
+
+**受管恢复路径（2026-11-16 起）**：
+
+```powershell
+node monitor/dispatch-manager.mjs rebuild-space --monitor-dir <监控根目录> --agent-id <AgentID> --space <空间名>
+```
+
+- **授权证据（满足其一，均先于任何浏览器调用）**：主证据=机器级归属账本 `~/.agents/ego-taskspaces.json` 仍把该 AgentID 绑定到该空间名（`releasePending` 期间拒绝重建）；兜底=本机 `ego-profile.json` 的 `spaceRebuildAllowlist` 数组显式列出该空间名（用于账本条目也丢失、PO 预先授权的情形）。该空间被其他 Agent 占有时一律拒绝。无证据 → `SPACE_REBUILD_DENIED`（exit 2）：上报 PO，**不得改走 ad-hoc ego 调用**（守卫照常拦截是设计而非误拦）。
+- **执行内容**：授权通过后由管理器子进程（守卫按设计放行）运行 `monitor/rebuild-space.template.mjs`：按账号钉扎 `taskSpace(SPACE, { profileId })` 重建（空间已存在则按 id 复用；user-owned/未认领 → `EGO_TASKSPACE_TAKEOVER_REQUIRED`，改走 §6.3 接管流程，不得抢占）→ 复核创建结果（名称/ownership/暴露的 profileId）→ 新开页 goto chatgpt.com 以 `/api/auth/session` 核对钉扎账号（Gate 1.5 同标准；邮箱只进内存不落日志）→ **关闭该验证页**（残留落地页会让后续会话页恢复 fail-closed）。任一步不可证明即停：`SPACE_REBUILD_ACCOUNT_UNPROVEN` / `SPACE_REBUILD_PAGE_NOT_READY` 等，exit 2。
+- **审计**：每次调用（含拒绝与失败）追加一行 JSON 到 `<监控根目录>/a-space-rebuild-audit.ndjson`（ts/agentId/space/decision/outcome/result/exit），排障复盘以此为准。
+- **成功后**：`RESULT=SPACE_REBUILT`（exit 0）→ 直接重跑原 `send`/`watch`/`probe`，页面恢复仍走既有受管链路；会话归属账本由后续 probe/send 的 `claimAgentSpace` 自愈，rebuild-space 不改账本。
+- **边界**：本命令只解决「空间注册表丢失」；已知会话缺页（`CONVERSATION_PAGE_RECOVERY_REQUIRED`）仍按 #31 Test D 折衷走 reconciliation。probe/send 输出 `RECOVERY_HINT=SPACE_REGISTRY_LOST` 即提示本路径；takeover 场景不发 HINT。
 
 ## 7. 统一参数表（唯一口径）
 
