@@ -10,12 +10,13 @@ import { join, resolve } from "node:path";
 import { normalizeFastState } from "../monitor/state-schema.mjs";
 import { tick, acknowledge } from "../monitor/supervision-watchdog.mjs";
 import { shouldReviewStartupIdle } from "../monitor/supervision-policy.mjs";
-import { parseArgs, adaptTemplate, bindNewConversation, classifyManagerResult, loadAttachments, requireArmedDispatch, main, readEgoOutcome, ensureMonitor, authorizeSpaceRebuild, rebuildSpace, exitWatching, acknowledgeWake, releaseDelivered } from "../monitor/dispatch-manager.mjs";
+import { parseArgs, adaptTemplate, bindNewConversation, classifyManagerResult, loadAttachments, requireArmedDispatch, main, readEgoOutcome, ensureMonitor, authorizeSpaceRebuild, rebuildSpace, claimSpace, taskspaceOwnershipLost, announceTaskspaceOwnershipLoss, exitWatching, acknowledgeWake, releaseDelivered } from "../monitor/dispatch-manager.mjs";
 import { withAgentRegistry } from "../monitor/agent-space.mjs";
+import { taskspaceOperatorAction } from "../monitor/taskspace-takeover.mjs";
 import { checkDispatchTool } from "../plugins/chatgpt-dispatch-guard/hooks/policy.mjs";
 import { installConfig, install } from "../monitor/install-zcode-guard.mjs";
-import { extractDomReply, extractApiReply, saveReply, verifiedReply, acknowledgeReply, verifiedConsumption, sha256, visibleTextHash } from "../monitor/reply-delivery.mjs";
-import { dispatchStormGate, markCompleted, readDispatchState, verifyAttachmentEvidence } from "../monitor/dispatch-state.mjs";
+import { extractDomReply, extractApiReply, apiTailFinality, saveReply, verifiedReply, acknowledgeReply, verifiedConsumption, sha256, visibleTextHash } from "../monitor/reply-delivery.mjs";
+import { dispatchStormGate, markCompleted, markDoneCandidate, readDispatchState, validateDispatchRecord, verifyAttachmentEvidence } from "../monitor/dispatch-state.mjs";
 
 const uuid = "11111111-1111-4111-8111-111111111111";
 
@@ -975,4 +976,229 @@ test("#25: supervision-only wake ids keep the existing ack semantics", async () 
     // A supervision ack never fabricates a watch-exit marker.
     await assert.rejects(readFile(join(dir, WATCH_EXIT_FILE)), { code: "ENOENT" });
   } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+// ---- agent-kit#33: managed claim action + takeover operator guidance ----
+
+test("#33: claim parses space-level identity and rejects dispatch-only args", () => {
+  const base = ["--monitor-dir", ".monitor", "--agent-id", "gdc-a", "--space", "GDC-执行A"];
+  const p = parseArgs(["claim", ...base]);
+  assert.equal(p.action, "claim");
+  assert.throws(() => parseArgs(["claim", ...base, "--conversation", uuid]), /MANAGER_IDENTITY_INVALID/);
+  assert.throws(() => parseArgs(["claim", ...base, "--request-id", uuid]), /MANAGER_IDENTITY_INVALID/);
+  assert.throws(() => parseArgs(["claim", ...base, "--message", "msg.txt"]), /MANAGER_IDENTITY_INVALID/);
+  assert.throws(() => parseArgs(["claim", "--monitor-dir", ".monitor", "--space", "GDC-执行A"]), /MANAGER_IDENTITY_INVALID/);
+  assert.throws(() => parseArgs(["claim", ...base, "--bogus", "x"]), /MANAGER_ARG_INVALID/);
+});
+
+test("#33: claim runs the adapted template, audits CLAIMED/FAILED in the shared ledger", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ego-claim-run-"));
+  try {
+    await withAgentRegistry((registry) => {
+      registry.agents["gdc-a"] = { spaceName: "GDC-执行A", active: [], known: [] };
+      return { changed: true };
+    }, root);
+    const p = parseArgs(["claim", "--monitor-dir", root, "--agent-id", "gdc-a", "--space", "GDC-执行A"]);
+    const scripts = [];
+    assert.equal(await claimSpace(p, {
+      directory: root,
+      runScript: async (script, dir) => {
+        scripts.push({ script, dir });
+        return { code: 0, result: "SPACE_CLAIMED_ACCOUNT_VERIFIED" };
+      },
+    }), 0);
+    assert.equal(scripts.length, 1);
+    assert.equal(scripts[0].dir, root);
+    assert.match(scripts[0].script, /const SPACE = "GDC-执行A";/);
+    assert.doesNotMatch(scripts[0].script, /REPLACE_WITH_/);
+    const audit = (await readFile(join(root, "a-space-rebuild-audit.ndjson"), "utf8")).trim().split("\n");
+    assert.equal(JSON.parse(audit[0]).action, "claim");
+    assert.equal(JSON.parse(audit[0]).decision, "LEDGER_PROOF");
+    assert.equal(JSON.parse(audit[0]).outcome, "CLAIMED");
+    assert.equal(JSON.parse(audit[0]).result, "SPACE_CLAIMED_OWNERSHIP_VERIFIED");
+    assert.equal(JSON.parse(audit[0]).exit, 0);
+    // A failed browser outcome stays exit 2 and audits FAILED with the raw result.
+    assert.equal(await claimSpace(p, {
+      directory: root,
+      runScript: async () => ({ code: 1, result: "SPACE_CLAIM_OWNERSHIP_UNVERIFIED" }),
+    }), 2);
+    const lines = (await readFile(join(root, "a-space-rebuild-audit.ndjson"), "utf8")).trim().split("\n");
+    assert.equal(lines.length, 2);
+    assert.equal(JSON.parse(lines[1]).decision, "LEDGER_PROOF");
+    assert.equal(JSON.parse(lines[1]).outcome, "FAILED");
+    assert.equal(JSON.parse(lines[1]).result, "SPACE_CLAIM_OWNERSHIP_UNVERIFIED");
+    assert.equal(JSON.parse(lines[1]).exit, 1);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("#33: claim authorization three states: DENIED audited, ALLOWLIST claimed", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ego-claim-auth-"));
+  try {
+    // DENIED before any browser call, audited into the shared rebuild ledger.
+    assert.equal(await main(["claim", "--monitor-dir", root, "--agent-id", "gdc-a", "--space", "GDC-执行A"]), 2);
+    const audit = JSON.parse(await readFile(join(root, "a-space-rebuild-audit.ndjson"), "utf8"));
+    assert.equal(audit.action, "claim");
+    assert.equal(audit.decision, "DENIED");
+    assert.equal(audit.agentId, "gdc-a");
+    assert.equal(audit.space, "GDC-执行A");
+    assert.match(audit.code, /SPACE_REBUILD|AGENT_SPACE_RELEASE_PENDING/);
+    // A space-level action must not create the per-conversation layout.
+    await assert.rejects(stat(join(root, "conversations")), { code: "ENOENT" });
+    // ALLOWLIST authorization claims without any ledger entry.
+    const p = parseArgs(["claim", "--monitor-dir", root, "--agent-id", "gdc-c", "--space", "新空间"]);
+    let ran = 0;
+    assert.equal(await claimSpace(p, {
+      directory: root,
+      profileConfig: { spaceRebuildAllowlist: ["新空间"] },
+      runScript: async () => { ran++; return { code: 0, result: "SPACE_CLAIMED_ACCOUNT_VERIFIED" }; },
+    }), 0);
+    assert.equal(ran, 1);
+    const lines = (await readFile(join(root, "a-space-rebuild-audit.ndjson"), "utf8")).trim().split("\n");
+    assert.equal(JSON.parse(lines[1]).decision, "ALLOWLIST");
+    assert.equal(JSON.parse(lines[1]).outcome, "CLAIMED");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("#33: the claim template is standalone, claims by name and verifies agent ownership", async () => {
+  const source = await readFile(new URL("../monitor/claim-space.template.mjs", import.meta.url), "utf8");
+  assert.match(source, /claimTaskSpace\(target\.id\)/);
+  assert.match(source, /ownership !== "agent"/);
+  assert.match(source, /RESULT=SPACE_CLAIMED_ACCOUNT_VERIFIED/);
+  assert.match(source, /TASKSPACE_NOT_FOUND/);
+  // Standalone: no monitor-module imports, no monitor-dir adapter (space-level action).
+  assert.doesNotMatch(source, /dispatch-state\.mjs|agent-space\.mjs|REPLACE_WITH_DEPLOY_MONITOR_DIR/);
+  const p = parseArgs(["claim", "--monitor-dir", ".monitor", "--agent-id", "gdc-a", "--space", "GDC-执行A"]);
+  const adapted = adaptTemplate(source, p);
+  assert.match(adapted, /const SPACE = "GDC-执行A";/);
+  assert.doesNotMatch(adapted, /REPLACE_WITH_/);
+});
+
+test("#33: takeover-classified failures announce the hand-back/claim operator guidance", () => {
+  const takeover = { code: 1, result: "EGO_TASKSPACE_TAKEOVER_REQUIRED", output: "RESULT=EGO_TASKSPACE_TAKEOVER_REQUIRED\n" };
+  const notOwned = { code: 1, result: "TASKSPACE_RECOVERY_FAILED", detail: null,
+    output: "RECOVERY_DETAIL=TASKSPACE_NOT_AGENT_OWNED\nRESULT=TASKSPACE_RECOVERY_FAILED\n" };
+  const wrapped = { code: 2, result: null, detail: "Error: You now control this task space" };
+  const plain = { code: 1, result: "STOP", output: "RESULT=STOP\n" };
+  assert.equal(taskspaceOwnershipLost(takeover), true);
+  assert.equal(taskspaceOwnershipLost(notOwned), true);
+  assert.equal(taskspaceOwnershipLost(wrapped), true);
+  assert.equal(taskspaceOwnershipLost(plain), false);
+  assert.equal(taskspaceOwnershipLost(null), false);
+  assert.equal(taskspaceOwnershipLost({ code: 1, result: "TASKSPACE_NOT_FOUND" }), false);
+  const guidance = taskspaceOperatorAction("GDC-执行A");
+  assert.match(guidance, /^OPERATOR_ACTION=/);
+  assert.match(guidance, /交还给 Agent/);
+  assert.match(guidance, /dispatch-manager\.mjs claim 受管认领/);
+  assert.match(guidance, /GDC-执行A/);
+  const errors = [];
+  const originalError = console.error;
+  console.error = (line) => errors.push(String(line));
+  try {
+    assert.equal(announceTaskspaceOwnershipLoss(notOwned, "GDC-执行A"), true);
+    assert.equal(announceTaskspaceOwnershipLoss(plain, "GDC-执行A"), false);
+  } finally { console.error = originalError; }
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /OPERATOR_ACTION=/);
+  assert.match(errors[0], /交还/);
+  assert.match(errors[0], /claim 受管认领/);
+});
+
+test("#33: the manager wires takeover guidance into send-family and collect failures", async () => {
+  const source = await readFile(new URL("../monitor/dispatch-manager.mjs", import.meta.url), "utf8");
+  assert.match(source,
+    /if \(observation\.code !== 0 && p\.action !== "probe"\) \{\s*\n\s*announceTaskspaceOwnershipLoss\(observation, p\.space\);/);
+  const collect = source.slice(source.indexOf("async function collectCompleted"), source.indexOf("export async function releaseDelivered"));
+  assert.match(collect, /announceTaskspaceOwnershipLoss\(observation, params\.space\)/);
+  // The probe announces guidance itself at its two takeover exits; the rebuild
+  // template does the same at its EGO_TASKSPACE_TAKEOVER_REQUIRED stops.
+  const probe = await readFile(new URL("../monitor/ego-fast-probe.mjs", import.meta.url), "utf8");
+  assert.match(probe, /if \(isTaskspaceOwnershipLoss\(error\)\) console\.log\(taskspaceOperatorAction\(SPACE\)\);/);
+  assert.equal((probe.match(/taskspaceOperatorAction\(SPACE\)/g) || []).length, 2);
+  const rebuild = await readFile(new URL("../monitor/rebuild-space.template.mjs", import.meta.url), "utf8");
+  assert.equal((rebuild.match(/takeoverOperatorAction\(\);/g) || []).length, 2);
+  assert.match(rebuild, /OPERATOR_ACTION=ego 空间/);
+});
+
+test("#33: dispatch record accepts optional doneLive fields and rejects wrong types", () => {
+  const base = { schema: "ego-dispatch-state/v2", dispatchId: uuid, conversationUuid: uuid,
+    taskSpace: "GDC-执行A", pageLabel: "p1", status: "ACCEPTED", baselineTailKey: null,
+    baselineTailRole: null, baselineComposerLength: 0, attempt: 1, createdAt: Date.now(),
+    payload_sha256: sha256("任务") };
+  assert.equal(validateDispatchRecord(base), true);
+  assert.equal(validateDispatchRecord({ ...base, doneLiveBodyLen: 10338,
+    doneLiveLastMessageKey: "22222222-2222-4222-8222-222222222222" }), true);
+  assert.equal(validateDispatchRecord({ ...base, doneLiveBodyLen: 0, doneLiveLastMessageKey: null }), true);
+  assert.equal(validateDispatchRecord({ ...base, doneLiveBodyLen: -1 }), false);
+  assert.equal(validateDispatchRecord({ ...base, doneLiveBodyLen: "10338" }), false);
+  assert.equal(validateDispatchRecord({ ...base, doneLiveBodyLen: 1.5 }), false);
+  assert.equal(validateDispatchRecord({ ...base, doneLiveLastMessageKey: 42 }), false);
+});
+
+test("#33: DONE_CANDIDATE live-window evidence lands in the dispatch record only", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ego-done-candidate-"));
+  const scratch = await mkdtemp(join(tmpdir(), "ego-done-untracked-"));
+  try {
+    const record = { schema: "ego-dispatch-state/v2", dispatchId: uuid, conversationUuid: uuid,
+      taskSpace: "GDC-执行A", pageLabel: "p1", status: "ACCEPTED", baselineTailKey: null,
+      baselineTailRole: null, baselineComposerLength: 0, attempt: 1, createdAt: Date.now(),
+      payload_sha256: sha256("任务") };
+    await writeFile(join(dir, "a-dispatch-state.json"), JSON.stringify(record));
+    const next = await markDoneCandidate(dir, uuid, { bodyLen: 10338, lastMessageKey: "22222222-2222-4222-8222-222222222222" });
+    assert.equal(next.doneLiveBodyLen, 10338);
+    assert.equal(next.status, "ACCEPTED");
+    const stored = await readDispatchState(dir);
+    assert.equal(stored.doneLiveBodyLen, 10338);
+    assert.equal(stored.doneLiveLastMessageKey, "22222222-2222-4222-8222-222222222222");
+    // Missing evidence normalizes to null without failing.
+    await markDoneCandidate(dir, uuid, { bodyLen: undefined, lastMessageKey: 5 });
+    assert.equal((await readDispatchState(dir)).doneLiveBodyLen, null);
+    assert.equal((await readDispatchState(dir)).doneLiveLastMessageKey, null);
+    // An unknown dispatch id or untracked directory is skipped silently.
+    assert.equal(await markDoneCandidate(dir, "22222222-2222-4222-8222-222222222222", { bodyLen: 10 }), null);
+    assert.equal(await markDoneCandidate(scratch, uuid, { bodyLen: 10 }), null);
+    await assert.rejects(readFile(join(scratch, "a-dispatch-state.json")), { code: "ENOENT" });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+    await rm(scratch, { recursive: true, force: true });
+  }
+});
+
+test("#33: API finality evidence exposes end_turn/status without relaxing extraction", () => {
+  const payload = sha256("任务原文");
+  const message = (role, text, endTurn, status) => ({ author: { role }, content: { parts: [text] },
+    end_turn: endTurn, status });
+  const branch = { current_node: "final", mapping: {
+    root: { parent: null },
+    user: { parent: "root", message: message("user", "任务原文", true, "finished_successfully") },
+    final: { parent: "user", message: message("assistant", "死亡回复", false, "in_progress") },
+  } };
+  assert.deepEqual(apiTailFinality(branch, payload), { endTurn: false, status: "in_progress" });
+  assert.deepEqual(apiTailFinality({ ...branch, mapping: { ...branch.mapping,
+    final: { parent: "user", message: message("assistant", "完成", true, "finished_successfully") } } }, payload),
+    { endTurn: true, status: "finished_successfully" });
+  // A dead reply still never passes extraction, and an unprovable branch yields null.
+  assert.equal(extractApiReply(branch, payload), null);
+  assert.equal(apiTailFinality({ ...branch, current_node: "missing" }, payload), null);
+});
+
+test("#33: the probe freezes doneLive evidence into the dispatch record at DONE_CANDIDATE", async () => {
+  const source = await readFile(new URL("../monitor/ego-fast-probe.mjs", import.meta.url), "utf8");
+  const done = source.slice(source.indexOf('await appendEvent(MON, "DONE_CANDIDATE"'), source.indexOf("TRANSITION_GENERATING_TO_IDLE_CONFIRMED"));
+  assert.match(done, /markDoneCandidate\(MON, dispatchId, \{ bodyLen: second\.bodyLen, lastMessageKey: second\.lastMessageKey \}\)/);
+});
+
+test("#33: collect failures are classified with post-mortem details and operator guidance", async () => {
+  const source = await readFile(new URL("../monitor/collect-reply.template.mjs", import.meta.url), "utf8");
+  assert.match(source, /COLLECT_DOM_ANCHOR_MISS payloadBytes=/);
+  assert.match(source, /COLLECT_API_FETCH_NULL stage=/);
+  assert.match(source, /COLLECT_FINALITY_NOT_REACHED end_turn=/);
+  assert.match(source, /REPLY_GENERATION_DIED_SERVER_SIDE suspicion=live_had_more/);
+  assert.match(source, /record\.doneLiveBodyLen/);
+  assert.match(source, /OPERATOR_ACTION=回复疑似服务端生成中断/);
+  assert.match(source, /OPERATOR_ACTION=回复边界或终态未获证明/);
+  // The in-page fetch catch must log a diagnostic line instead of returning null silently.
+  assert.match(source, /catch \(error\) \{\s*\n\s*\/\/ Surface the failure through the page console[\s\S]*?console\.error\("COLLECT_API_FETCH stage=exception/);
+  // The boundary failure exits through a classified RESULT, never a bare throw.
+  assert.match(source, /console\.log\("RESULT=COLLECT_BOUNDARY_OR_FINALITY_UNVERIFIED"\)/);
+  assert.doesNotMatch(source, /throw new Error\("COLLECT_BOUNDARY_OR_FINALITY_UNVERIFIED"\)/);
 });

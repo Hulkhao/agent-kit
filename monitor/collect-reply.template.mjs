@@ -8,7 +8,7 @@ if ([MON, AGENT_ID, SPACE, CONV].some((value) => value.startsWith("REPLACE_"))) 
 import { readFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 const { readDispatchState, readComposerSurface } = await import(pathToFileURL(MON + "/dispatch-state.mjs").href);
-const { extractDomReply, extractApiReply, saveReply } = await import(pathToFileURL(MON + "/reply-delivery.mjs").href);
+const { extractDomReply, extractApiReply, apiTailFinality, saveReply } = await import(pathToFileURL(MON + "/reply-delivery.mjs").href);
 const { assertAgentOwnedTaskSpace } = await import(pathToFileURL(MON + "/taskspace-takeover.mjs").href);
 const { withAgentRegistry } = await import(pathToFileURL(MON + "/agent-space.mjs").href);
 const { isConversationUrl } = await import(pathToFileURL(MON + "/page-recovery.mjs").href);
@@ -61,24 +61,93 @@ if (!stable || first.lastMessageTextLength !== second.lastMessageTextLength) thr
 let reply = extractDomReply(units, record.payload_sha256, fast.lastMessageKey, {
   displayHash: record.payload_display_sha256, baselineTailKey: record.baselineTailKey,
 });
+// agent-kit#33 post-mortem evidence: the live body length at extraction time.
+// Long threads virtualize turns out of the DOM, so this can legitimately shrink
+// after a CALIBRATE refresh — the recorded doneLive* fields separate that from
+// a server-side dead reply.
+const domAnchorMissed = !reply;
+const liveBodyLen = await page.evaluate(() => (document.body ? document.body.innerText.length : 0));
+let apiFailure = null;
+let finality = null;
 if (!reply) {
   // Conversation API can lag or return 404. Its failure is never proof of a dead page.
-  const mapping = await page.evaluate(async (conversation) => {
+  const api = await page.evaluate(async (conversation) => {
     try {
       const session = await fetch("/api/auth/session", { credentials: "include" });
-      if (!session.ok) return null;
+      if (!session.ok) {
+        console.error("COLLECT_API_FETCH stage=session status=" + session.status);
+        return { ok: false, stage: "session", httpStatus: session.status };
+      }
       const token = (await session.json())?.accessToken;
-      if (!token) return null;
+      if (!token) {
+        console.error("COLLECT_API_FETCH stage=session-token status=" + session.status);
+        return { ok: false, stage: "session-token", httpStatus: session.status };
+      }
       const response = await fetch("/backend-api/conversation/" + conversation, {
         credentials: "include", headers: { Authorization: "Bearer " + token },
       });
-      if (!response.ok) return null;
+      if (!response.ok) {
+        console.error("COLLECT_API_FETCH stage=conversation status=" + response.status);
+        return { ok: false, stage: "conversation", httpStatus: response.status };
+      }
       const data = await response.json();
-      return { mapping: data?.mapping, current_node: data?.current_node };
-    } catch { return null; }
+      return { ok: true, mapping: data?.mapping, current_node: data?.current_node };
+    } catch (error) {
+      // Surface the failure through the page console; the manager's stderr tail
+      // carries it when the wrapper relays page output (523ed50 channel).
+      console.error("COLLECT_API_FETCH stage=exception error=" + String(error && error.name || error));
+      return { ok: false, stage: "exception", errorName: String(error && error.name || error) };
+    }
   }, CONV);
-  reply = extractApiReply(mapping, record.payload_sha256, { displayHash: record.payload_display_sha256 });
+  if (api && api.ok) {
+    reply = extractApiReply(api, record.payload_sha256, { displayHash: record.payload_display_sha256 });
+    if (!reply) finality = apiTailFinality(api, record.payload_sha256, { displayHash: record.payload_display_sha256 });
+  } else {
+    // Node-level copy of the fetch failure: reaches the manager's stderr tail
+    // even when the page console is not relayed.
+    apiFailure = api || { ok: false, stage: "exception", errorName: "UnknownError" };
+    console.error("COLLECT_API_FETCH_NULL stage=" + apiFailure.stage +
+      (apiFailure.httpStatus !== undefined ? " httpStatus=" + apiFailure.httpStatus : "") +
+      (apiFailure.errorName ? " errorName=" + apiFailure.errorName : ""));
+  }
 }
-if (!reply) throw new Error("COLLECT_BOUNDARY_OR_FINALITY_UNVERIFIED");
+if (!reply) {
+  // agent-kit#33: never a bare failure — classify why the boundary/finality could
+  // not be proven. Diagnostics and operator guidance only; no auto-remediation
+  // (a dead reply must not be "repaired" by relaxing finality semantics).
+  const details = [];
+  if (domAnchorMissed) {
+    details.push("COLLECT_DOM_ANCHOR_MISS payloadBytes=" + (record.payload_bytes ?? "null") +
+      " liveBodyLen=" + liveBodyLen +
+      (record.doneLiveBodyLen != null ? " doneLiveBodyLen=" + record.doneLiveBodyLen : ""));
+  }
+  if (apiFailure) {
+    details.push("COLLECT_API_FETCH_NULL stage=" + apiFailure.stage +
+      (apiFailure.httpStatus !== undefined ? " httpStatus=" + apiFailure.httpStatus : "") +
+      (apiFailure.errorName ? " errorName=" + apiFailure.errorName : ""));
+  } else if (finality) {
+    details.push("COLLECT_FINALITY_NOT_REACHED end_turn=" + String(finality.endTurn) +
+      " status=" + String(finality.status));
+  }
+  // A live window that shrank well below the DONE_CANDIDATE size (or a changed
+  // tail identity) means the live page had more than the API/DOM can prove now:
+  // the reply most likely died mid-generation on the server side.
+  const shrank = Number.isFinite(record.doneLiveBodyLen) &&
+    liveBodyLen * 1.25 < record.doneLiveBodyLen;
+  const tailMoved = Boolean(record.doneLiveLastMessageKey &&
+    fast.lastMessageKey !== record.doneLiveLastMessageKey);
+  const diedServerSide = shrank || tailMoved;
+  if (diedServerSide) {
+    details.push("REPLY_GENERATION_DIED_SERVER_SIDE suspicion=live_had_more" +
+      " doneLiveBodyLen=" + (record.doneLiveBodyLen ?? "null") + " liveBodyLen=" + liveBodyLen +
+      (tailMoved ? " doneLiveLastMessageKey=" + record.doneLiveLastMessageKey : ""));
+  }
+  for (const detail of details) console.log("RECOVERY_DETAIL=" + detail);
+  console.log(diedServerSide
+    ? "OPERATOR_ACTION=回复疑似服务端生成中断，请到网页端确认后半段是否缺失；确认后可用 send-new 重派或人工收尾。"
+    : "OPERATOR_ACTION=回复边界或终态未获证明，请到网页端人工核对该会话回复是否完整；确认完整可重试 collect，回复缺失可用 send-new 重派或人工收尾。");
+  console.log("RESULT=COLLECT_BOUNDARY_OR_FINALITY_UNVERIFIED");
+  process.exit(1);
+}
 const receipt = await saveReply(MON, record, reply, fast.lastMessageKey);
 console.log("RESULT=REPLY_COLLECTED dispatchId=" + receipt.dispatchId + " bytes=" + receipt.bytes + " source=" + receipt.source);

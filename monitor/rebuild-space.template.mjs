@@ -27,6 +27,11 @@ const isTaskSpaceTakeover = (error) => {
   }
   return false;
 };
+// Standalone template: no module imports, so the guidance text is inlined here
+// (agent-kit#33: the takeover stop must tell the operator how to hand the space
+// back or reclaim it; reminder only, never an automatic claim).
+const takeoverOperatorAction = () =>
+  console.log("OPERATOR_ACTION=ego 空间 " + SPACE + " 已不在 Agent 所有态。请在 Ego UI 将该空间交还给 Agent 或运行 dispatch-manager.mjs claim 受管认领。常见诱因：用户误点「接管」、关闭空间内最后一个标签页、Ego 升级。");
 
 // Machine-local account pin (PO 令 2026-11-08, issue #7): profileId only applies at
 // space CREATION, so the pin drives creation and the page session proves the result.
@@ -43,7 +48,10 @@ try {
   if (target) {
     // Reuse an existing space only when ego still reports it as agent-owned.
     // A user-owned or unclaimed name is a takeover situation, not a rebuild.
-    if (target.ownership !== "agent") stop("EGO_TASKSPACE_TAKEOVER_REQUIRED");
+    if (target.ownership !== "agent") {
+      takeoverOperatorAction();
+      stop("EGO_TASKSPACE_TAKEOVER_REQUIRED");
+    }
     task = await taskSpace(target.id);
   } else {
     const knownProfiles = await profiles();
@@ -56,7 +64,10 @@ try {
     }
   }
 } catch (error) {
-  if (isTaskSpaceTakeover(error)) stop("EGO_TASKSPACE_TAKEOVER_REQUIRED");
+  if (isTaskSpaceTakeover(error)) {
+    takeoverOperatorAction();
+    stop("EGO_TASKSPACE_TAKEOVER_REQUIRED");
+  }
   stop("SPACE_REBUILD_TASKSPACE_FAILED", error && error.message || error);
 }
 

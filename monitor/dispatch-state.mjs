@@ -141,7 +141,13 @@ export function validateDispatchRecord(record) {
     (record.payload_bytes === null || record.payload_bytes === undefined ||
       Number.isInteger(record.payload_bytes)) &&
     (record.composer_baseline === null || record.composer_baseline === undefined ||
-      typeof record.composer_baseline === "string"));
+      typeof record.composer_baseline === "string") &&
+    // agent-kit#33 DONE_CANDIDATE post-mortem evidence: optional live-window
+    // fields, same absent-or-null-is-legal contract as the R2.5 fields above.
+    (record.doneLiveBodyLen === undefined || record.doneLiveBodyLen === null ||
+      (Number.isInteger(record.doneLiveBodyLen) && record.doneLiveBodyLen >= 0)) &&
+    (record.doneLiveLastMessageKey === undefined || record.doneLiveLastMessageKey === null ||
+      typeof record.doneLiveLastMessageKey === "string"));
 }
 
 export async function readDispatchState(dir) {
@@ -279,6 +285,24 @@ export async function markUncertain(monitorDir, dispatchId, reasonCode = "SEND_A
     uncertainAt: Date.now(),
     reasonCode,
   });
+}
+
+// agent-kit#33: freeze the live-window evidence (body length + tail identity) at
+// the moment the probe judged the turn DONE_CANDIDATE, so a later collect failure
+// can distinguish a server-side dead reply from an ordinary extraction failure.
+// Untracked conversations (no matching record) are skipped silently; this never
+// changes dispatch status or finality semantics.
+export async function markDoneCandidate(dir, dispatchId, { bodyLen, lastMessageKey } = {}) {
+  const record = await readDispatchState(dir);
+  if (!record || record.dispatchId !== dispatchId) return null;
+  const next = {
+    ...record,
+    doneLiveBodyLen: Number.isFinite(bodyLen) && bodyLen >= 0 ? bodyLen : null,
+    doneLiveLastMessageKey: typeof lastMessageKey === "string" ? lastMessageKey : null,
+    updatedAt: Date.now(),
+  };
+  await writeJsonAtomic(fileOf(dir), next);
+  return next;
 }
 
 export async function markCompleted(monitorDir, dispatchId) {

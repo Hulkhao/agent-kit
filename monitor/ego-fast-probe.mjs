@@ -23,6 +23,7 @@ const {
   findUnconsumedComposerFreeze,
   hasResponseTailAdvanced,
   lastConsumedFreezeDeadline,
+  markDoneCandidate,
   reconcileDispatch,
   readComposerSurface,
   writeJsonAtomic,
@@ -44,7 +45,8 @@ const {
   validateFastState,
 } = await import(pathToFileURL(MON + "/state-schema.mjs").href);
 const { selectUniqueConversationPage, isConversationUrl, probeOriginVerdict } = await import(pathToFileURL(MON + "/page-recovery.mjs").href);
-const { TASKSPACE_TAKEOVER_SIGNAL, isTaskSpaceTakeover, assertAgentOwnedTaskSpace } =
+const { TASKSPACE_TAKEOVER_SIGNAL, isTaskSpaceTakeover, isTaskspaceOwnershipLoss,
+  assertAgentOwnedTaskSpace, taskspaceOperatorAction } =
   await import(pathToFileURL(MON + "/taskspace-takeover.mjs").href);
 const { claimAgentSpace, reserveAgentPage } = await import(pathToFileURL(MON + "/agent-space.mjs").href);
 const { shouldReviewStartupIdle } = await import(pathToFileURL(MON + "/supervision-policy.mjs").href);
@@ -208,6 +210,7 @@ try {
   if (spaceRegistryMissing && !isTaskSpaceTakeover(error)) {
     console.log('RECOVERY_HINT=SPACE_REGISTRY_LOST command="dispatch-manager.mjs rebuild-space --monitor-dir <monitor-dir> --agent-id <agent-id> --space <space>"');
   }
+  if (isTaskspaceOwnershipLoss(error)) console.log(taskspaceOperatorAction(SPACE));
   console.log("RESULT=" + code);
   process.exit(0);
 }
@@ -332,6 +335,7 @@ try {
   await writeState({ spaceId, probeFailed: true, recoveryFailed: true, errorCode: code, ...safeError(error) });
   await appendEvent(MON, code, { spaceId, ...safeError(error) });
   console.log("RECOVERY_DETAIL=" + String(error && error.message || error).slice(0, 200));
+  if (isTaskspaceOwnershipLoss(error)) console.log(taskspaceOperatorAction(SPACE));
   console.log("RESULT=" + (takeover ? TASKSPACE_TAKEOVER_SIGNAL : "TASKSPACE_RECOVERY_FAILED"));
   process.exit(0);
 }
@@ -753,6 +757,11 @@ if (!probe.generating && (everGenerating || responseTailAdvanced)) {
       stableTailId: true, composerEmpty: true,
       bodyLen: second.bodyLen,
     });
+    // agent-kit#33: freeze the live-window evidence into the dispatch record so a
+    // later collect failure can tell a server-side dead reply from virtualization.
+    // A record-write failure is diagnostic only — the wake must still go out.
+    try { await markDoneCandidate(MON, dispatchId, { bodyLen: second.bodyLen, lastMessageKey: second.lastMessageKey }); }
+    catch (error) { await appendEvent(MON, "DONE_CANDIDATE_RECORD_FAILED", safeError(error)).catch(() => {}); }
     console.log("TRANSITION_GENERATING_TO_IDLE_CONFIRMED");
     console.log("RESULT=DONE_CANDIDATE");
   }

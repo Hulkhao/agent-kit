@@ -12,6 +12,30 @@ function matchesPayload(text, payloadHash, displayHash) {
     (typeof displayHash === "string" && visibleTextHash(text) === displayHash);
 }
 
+// Walk the active conversation branch from current_node back to the root.
+// Returns null when the branch structure itself is unprovable.
+function activeBranchNodes(conversation) {
+  if (!conversation?.mapping || typeof conversation.current_node !== "string") return null;
+  const nodes = [];
+  const visited = new Set();
+  let cursor = conversation.current_node;
+  while (cursor) {
+    if (visited.has(cursor)) return null;
+    visited.add(cursor);
+    const item = conversation.mapping[cursor];
+    if (!item) return null;
+    if (item.message) nodes.push(item.message);
+    cursor = item.parent;
+  }
+  nodes.reverse();
+  return nodes;
+}
+
+function branchContent(node) {
+  return (node.content?.parts || []).map((part) =>
+    typeof part === "string" ? part : typeof part?.text === "string" ? part.text : "").filter(Boolean).join("\n");
+}
+
 export function extractDomReply(units, payloadHash, expectedTailKey, { displayHash, baselineTailKey } = {}) {
   if (!Array.isArray(units) || !/^[\da-f]{64}$/i.test(payloadHash || "") || !isUuid(expectedTailKey)) return null;
   const anchor = units.findLastIndex((unit) => unit.role === "user" && matchesPayload(unit.text || "", payloadHash, displayHash));
@@ -28,30 +52,35 @@ export function extractDomReply(units, payloadHash, expectedTailKey, { displayHa
 }
 
 export function extractApiReply(conversation, payloadHash, { displayHash } = {}) {
-  if (!conversation?.mapping || typeof conversation.current_node !== "string" ||
-      !/^[\da-f]{64}$/i.test(payloadHash || "")) return null;
-  const nodes = [];
-  const visited = new Set();
-  let cursor = conversation.current_node;
-  while (cursor) {
-    if (visited.has(cursor)) return null;
-    visited.add(cursor);
-    const item = conversation.mapping[cursor];
-    if (!item) return null;
-    if (item.message) nodes.push(item.message);
-    cursor = item.parent;
-  }
-  nodes.reverse();
-  const content = (node) => (node.content?.parts || []).map((part) =>
-    typeof part === "string" ? part : typeof part?.text === "string" ? part.text : "").filter(Boolean).join("\n");
-  const anchor = nodes.findLastIndex((node) => node.author?.role === "user" && matchesPayload(content(node), payloadHash, displayHash));
+  if (!/^[\da-f]{64}$/i.test(payloadHash || "")) return null;
+  const nodes = activeBranchNodes(conversation);
+  if (!nodes) return null;
+  const anchor = nodes.findLastIndex((node) => node.author?.role === "user" && matchesPayload(branchContent(node), payloadHash, displayHash));
   if (anchor < 0 || nodes.slice(anchor + 1).some((node) => node.author?.role === "user")) return null;
   const after = nodes.slice(anchor + 1);
   const assistants = after.filter((node) => node.author?.role === "assistant");
   const last = assistants.at(-1);
   if (!last || last.end_turn !== true || last.status !== "finished_successfully") return null;
-  const text = assistants.map(content).filter(Boolean).join("\n\n");
+  const text = assistants.map(branchContent).filter(Boolean).join("\n\n");
   return text.trim() ? { text, source: "API_FINAL_VERIFIED" } : null;
+}
+
+// Post-mortem finality evidence for a collect failure (agent-kit#33): the raw
+// end_turn/status of the last assistant node after the payload boundary, so the
+// operator can tell a server-side dead reply from an unprovable structure.
+// Never used to relax extraction: null everywhere the structure is unprovable.
+export function apiTailFinality(conversation, payloadHash, { displayHash } = {}) {
+  if (!/^[\da-f]{64}$/i.test(payloadHash || "")) return null;
+  const nodes = activeBranchNodes(conversation);
+  if (!nodes) return null;
+  const anchor = nodes.findLastIndex((node) => node.author?.role === "user" && matchesPayload(branchContent(node), payloadHash, displayHash));
+  if (anchor < 0 || nodes.slice(anchor + 1).some((node) => node.author?.role === "user")) return null;
+  const last = nodes.slice(anchor + 1).filter((node) => node.author?.role === "assistant").at(-1);
+  if (!last) return { endTurn: null, status: null };
+  return {
+    endTurn: last.end_turn === undefined ? null : last.end_turn,
+    status: typeof last.status === "string" ? last.status : null,
+  };
 }
 
 export function replyPath(dir, dispatchId) {

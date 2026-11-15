@@ -12,6 +12,7 @@ import { tick, acknowledge } from "./supervision-watchdog.mjs";
 import { readDispatchState, markCompleted, writeJsonAtomic, validateDispatchRecord } from "./dispatch-state.mjs";
 import { verifiedReply, acknowledgeReply, verifiedConsumption, sha256 } from "./reply-delivery.mjs";
 import { withAgentRegistry } from "./agent-space.mjs";
+import { taskspaceOperatorAction } from "./taskspace-takeover.mjs";
 
 const sourceDir = dirname(fileURLToPath(import.meta.url));
 const kitDir = dirname(sourceDir);
@@ -32,9 +33,10 @@ const templates = {
   release: join(sourceDir, "release-agent-space.template.mjs"),
   collect: join(sourceDir, "collect-reply.template.mjs"),
   "rebuild-space": join(sourceDir, "rebuild-space.template.mjs"),
+  claim: join(sourceDir, "claim-space.template.mjs"),
 };
 const modules = ["agent-space.mjs", "dispatch-state.mjs", "reply-delivery.mjs", "page-recovery.mjs", "state-schema.mjs", "taskspace-takeover.mjs", "supervision-policy.mjs"];
-const allowed = new Set(["send", "send-new", "recover-draft", "probe", "watch", "collect", "consume", "release", "ack", "rebuild-space"]);
+const allowed = new Set(["send", "send-new", "recover-draft", "probe", "watch", "collect", "consume", "release", "ack", "rebuild-space", "claim"]);
 const uuid = /^[a-f\d]{8}-[a-f\d]{4}-[1-8][a-f\d]{3}-[89ab][a-f\d]{3}-[a-f\d]{12}$/i;
 
 export function parseArgs(args) {
@@ -54,9 +56,10 @@ export function parseArgs(args) {
   params.newChat = action === "send-new";
   params.recoverOnly = action === "recover-draft";
   if (params.newChat && !params.conversation && uuid.test(params.requestId || "")) params.conversation = params.requestId;
-  // Space-level rebuild is authorized by agent+space identity alone; a conversation
-  // or payload would mean this is really a dispatch action, not a registry rebuild.
-  if (action === "rebuild-space") {
+  // Space-level rebuild/claim is authorized by agent+space identity alone; a
+  // conversation or payload would mean this is really a dispatch action, not a
+  // registry-level operation.
+  if (action === "rebuild-space" || action === "claim") {
     if (["conversation", "requestId", "message", "attachmentsFile", "wakeId", "ackAction", "replySha256", "archivedRecord"]
         .some((key) => params[key])) throw new Error("MANAGER_IDENTITY_INVALID");
     if (!params.agentId || !/^[a-z0-9][a-z0-9_.-]{1,63}$/i.test(params.agentId) ||
@@ -271,6 +274,8 @@ export async function acknowledgeWake(id, action, dir, now = Date.now()) {
 
 export function classifyManagerResult(action, observation, record, params) {
   if (action === "release") return observation.code === 0 && observation.result === "AGENT_SPACE_RELEASED" ? 0 : 2;
+  // Managed claim: the template must prove the post-claim agent ownership.
+  if (action === "claim") return observation.code === 0 && observation.result === "SPACE_CLAIMED_ACCOUNT_VERIFIED" ? 0 : 2;
   if (action !== "send") return 2;
   const sameDispatch = record && record.conversationUuid.toLowerCase() === params.conversation.toLowerCase() &&
     record.taskSpace === params.space;
@@ -300,7 +305,12 @@ async function collectCompleted(params, dir) {
   if (!receipt) {
     const template = await readFile(templates.collect, "utf8");
     const observation = await runEgo(adaptTemplate(template, params), dir, "collect");
-    if (observation.code !== 0 || observation.result !== "REPLY_COLLECTED") return 2;
+    if (observation.code !== 0 || observation.result !== "REPLY_COLLECTED") {
+      // agent-kit#33: a takeover signal surfacing from collect must carry the
+      // operator guidance; other failures keep their bare exit.
+      announceTaskspaceOwnershipLoss(observation, params.space);
+      return 2;
+    }
     receipt = await verifiedReply(dir, record);
   }
   await markCompleted(dir, record.dispatchId);
@@ -397,6 +407,62 @@ export async function rebuildSpace(p, { directory, profileConfig, runScript } = 
   return 2;
 }
 
+// TaskSpace ownership evidence may appear anywhere in the captured streams: the
+// takeover RESULT codes, a RECOVERY_DETAIL line carrying TASKSPACE_NOT_AGENT_OWNED
+// from assertAgentOwnedTaskSpace, or the wrapped ego error text.
+const TASKSPACE_OWNERSHIP_LOSS = /TASKSPACE_NOT_AGENT_OWNED|EGO_TASKSPACE_TAKEOVER_REQUIRED|You now control this task space/i;
+
+export function taskspaceOwnershipLost(observation) {
+  const evidence = [observation?.result, observation?.detail, observation?.output]
+    .filter(Boolean).join("\n");
+  return TASKSPACE_OWNERSHIP_LOSS.test(evidence);
+}
+
+// Guidance only (agent-kit#33, PO requirement): a space that left the agent-owned
+// state is announced to the operator with the hand-back / claim instruction. The
+// takeover gate itself stays fail-closed and claim is never run automatically.
+export function announceTaskspaceOwnershipLoss(observation, space) {
+  if (!taskspaceOwnershipLost(observation)) return false;
+  console.error(taskspaceOperatorAction(space));
+  return true;
+}
+
+// Managed, audited re-claim of a TaskSpace ego handed back to the user
+// (agent-kit#33). Same authorization bar and audit ledger as rebuildSpace; the
+// action exists only because an operator-initiated recovery path was missing —
+// it is never triggered by the takeover signal itself.
+export async function claimSpace(p, { directory, profileConfig, runScript } = {}) {
+  await mkdir(p.monitorDir, { recursive: true });
+  const auditFile = join(p.monitorDir, "a-space-rebuild-audit.ndjson");
+  const audit = (entry) => appendFile(auditFile, JSON.stringify({
+    ts: new Date().toISOString(), action: "claim", agentId: p.agentId, space: p.space, ...entry,
+  }) + "\n", "utf8");
+  let decision;
+  try { decision = await authorizeSpaceRebuild(p.agentId, p.space, { directory, profileConfig }); }
+  catch (error) {
+    const code = error.message || "SPACE_REBUILD_NOT_AUTHORIZED";
+    await audit({ decision: "DENIED", code }).catch(() => {});
+    console.log("RESULT=SPACE_CLAIM_DENIED code=" + code);
+    return 2;
+  }
+  const template = await readFile(templates.claim, "utf8");
+  const source = adaptTemplate(template, p);
+  const observation = runScript
+    ? await runScript(source, p.monitorDir)
+    : await runEgo(source, p.monitorDir, "claim");
+  const claimed = classifyManagerResult("claim", observation) === 0;
+  // The audit row records the verified-ownership verdict, not the raw template code.
+  await audit({ decision, outcome: claimed ? "CLAIMED" : "FAILED",
+    result: claimed ? "SPACE_CLAIMED_OWNERSHIP_VERIFIED" : (observation.result || "MISSING"),
+    exit: observation.code });
+  if (claimed) {
+    console.log("RESULT=SPACE_CLAIMED space=" + p.space);
+    return 0;
+  }
+  console.log("RESULT=SPACE_CLAIM_FAILED result=" + (observation.result || "MISSING") + " exit=" + observation.code);
+  return 2;
+}
+
 export async function ensureMonitor(dir) {
   await mkdir(dir, { recursive: true });
   for (const name of modules) {
@@ -463,13 +529,20 @@ export function readEgoOutcome(child, emitOutput) {
 
 // Official Windows CLI contract is nodejs -e with an imported UTF-8 script.
 // The file is unique for each invocation and removed after its process exits.
+// The captured stream tail rides along as `output` (manager-side consumers only;
+// readEgoOutcome's own contract stays exactly { code, result, detail }).
 async function runEgo(source, dir, name) {
   const outputPath = join(dir, name + "." + randomUUID() + ".mjs");
   await writeFile(outputPath, source, "utf8");
+  let output = "";
   try {
     const expression = "await import(" + JSON.stringify(pathToFileURL(outputPath).href) + ")";
     const child = spawn("ego-browser", ["nodejs", "-e", expression], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
-    return await readEgoOutcome(child, (output) => process.stdout.write(output));
+    const outcome = await readEgoOutcome(child, (chunk) => {
+      output = (output + chunk).slice(-16384);
+      process.stdout.write(chunk);
+    });
+    return { ...outcome, output };
   } finally {
     await unlink(outputPath).catch(() => {});
   }
@@ -484,8 +557,9 @@ export async function main(args = process.argv.slice(2)) {
     catch (error) { if (error.code !== "ENOENT") throw error; }
   }
   // A space-level rebuild owns no conversation ledger; route it before the
-  // per-conversation directory layout is touched at all.
+  // per-conversation directory layout is touched at all. Same for claim.
   if (p.action === "rebuild-space") return rebuildSpace(p);
+  if (p.action === "claim") return claimSpace(p);
   const dir = conversationDir(p);
   p.rootMonitorDir = p.monitorDir;
   if (p.newChat) {
@@ -637,6 +711,11 @@ export async function main(args = process.argv.slice(2)) {
   }
   if (p.action === "probe") await writeFile(join(dir, "a-watch-uuid.txt"), p.conversation + "\n", "utf8");
   const observation = await runEgo(adaptTemplate(template, p), dir, p.action);
+  // agent-kit#33: takeover guidance on send-family failures. The probe announces
+  // it at its own takeover exits, so it is not repeated here for probe runs.
+  if (observation.code !== 0 && p.action !== "probe") {
+    announceTaskspaceOwnershipLoss(observation, p.space);
+  }
   if (p.recoverOnly) {
     const recovered = await readDispatchState(dir);
     return observation.code === 0 && observation.result === "OWNED_DRAFT_CLEARED" &&
