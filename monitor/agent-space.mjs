@@ -142,6 +142,17 @@ export async function markAgentSweepPending({ agentId, spaceName, conversationUu
   return withAgentRegistry((registry) => {
     const entry = registry.agents[agentId];
     if (!entry || entry.spaceName !== spaceName) throw fail("AGENT_SPACE_NOT_REGISTERED");
+    // #27 re-review② P1-B: a leftover releasePending for a DIFFERENT
+    // conversation (legacy registry state from before sweepPending existed)
+    // must block the new intent — otherwise release A would mark
+    // sweepPending(A), then releaseAgentConversation(A) throws
+    // AGENT_SPACE_RELEASE_PENDING on B's pending, leaving sweepPending=A that
+    // blocks B's own recovery (A deadlocks B, and B is the release that must
+    // recover first). Same-conversation releasePending is the normal recovery
+    // shape and proceeds. No migration mechanism is introduced.
+    if (entry.releasePending && entry.releasePending.conversationUuid !== conversationUuid) {
+      throw fail("AGENT_SPACE_RELEASE_PENDING");
+    }
     if (entry.sweepPending && entry.sweepPending.conversationUuid !== conversationUuid) {
       throw fail("AGENT_SPACE_SWEEP_PENDING");
     }

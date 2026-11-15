@@ -34,12 +34,16 @@
 ```
 release(CONV)
   ├─ 无 active、无 releasePending、无 sweepPending → 早退成功（零浏览器副作用，幂等）
-  ├─ 置 sweepPending（intent-first，浏览器动作之前；他话会话已有 pending → AGENT_SPACE_SWEEP_PENDING 拒绝）
+  ├─ 置 sweepPending（intent-first，浏览器动作之前）
+  │    ├─ 他话会话已有 sweepPending → AGENT_SPACE_SWEEP_PENDING 拒绝
+  │    └─ 旧版遗留 releasePending（他话会话，升级兼容场景）→ AGENT_SPACE_RELEASE_PENDING 拒绝，
+  │       不写任何标志（复审② P1-B：先恢复旧 releasePending 那笔，否则 A 阻 B、B 阻 A 死锁）；
+  │       同会话的 releasePending 属正常恢复形态，放行
   ├─ releaseAgentConversation：目标页关闭 / 最后会话 finish 分支 / releasePending 恢复
-  ├─ sweepTaskPages：逐页分类（见 3.2）
+  ├─ sweepTaskPages：逐页分类（见 3.2；close-intent 见 3.3）
   ├─ space-finish 决策：仅「最后会话 + 零保留页 + 零失败」才 finish 空间
-  ├─ 全部成功 → 清 sweepPending → RESULT=AGENT_SPACE_RELEASED
-  └─ 任一失败 → sweepPending 保留 → RESULT=AGENT_SPACE_RELEASE_SWEEP_FAILED（exit 2）
+  ├─ 全部成功（failed=0 且全部 intent 有处置确认）→ 清 sweepPending → RESULT=AGENT_SPACE_RELEASED
+  └─ 任一失败或存在未确认 intent → sweepPending 保留 → RESULT=AGENT_SPACE_RELEASE_SWEEP_FAILED（exit 2）
        └─ 重跑 release：命中 sweepPending → 不走早退 → 真实重扫（需要浏览器）→ 成功才清标志
 ```
 
@@ -64,11 +68,25 @@ release(CONV)
 - **逐页审计**：每页一行 `{ts, action:"release-sweep", agentId, space, conversation, page:{label,uuid}, decision, reason}`（decision = closed / kept / close-failed / sweep-failed）。只记录 id 类字段与理由，不含任务/回复正文。
 - **幂等**：无临时页 → zero-close 也算成功（`RESULT=AGENT_SPACE_RELEASED`）；完整成功后的重复 release 走注册表早退，零浏览器调用。
 
-### 3.3 两种审计文件的写失败策略表
+### 3.3 close-intent 与审计恢复（复审② P1-A）+ 两种审计文件的写失败策略表
+
+**intent 存储位置**：与最终审计行同文件——`<监控根>/a-release-sweep-audit.ndjson`（单一证据文件，不新增第二写失败面）。行形态：
+- intent 行：`{..., page:{label,uuid}, decision:"close-intent", intentId, reason}`——**必须在 page.close() 之前写入**；
+- 处置行：`{..., page:{label,uuid}, decision, reason, intentId}`——intentId 回指其 intent（decision = closed / close-failed / closed-backfilled / kept）；
+- 补齐行：`{..., decision:"closed-backfilled", intentId, note:"PAGE_GONE_CLOSE_CONFIRMED_BY_BACKFILL"}`——与实时 `closed` 行靠 decision 字段区分。
+
+**intent 与最终审计行的关系**：intentId 把两者配对；扫描文件中「有 intent 行、无任何处置行回指」即为未确认 intent（机器可独立发现）。intent 写失败 → **该页禁止关闭**（跳过、failed++，走 SWEEP_FAILED）；审计写失败后**停止后续一切关页**（保留页照常审计 kept，但不再 close 任何页，页行 reason=`AUDIT_UNAVAILABLE_NO_CLOSE`）。
+
+**审计恢复成功判定**：重跑时（同一 task/页面集合贯穿）逐页重扫——
+- 页面仍存在 → 重新执行关闭（intent 已持久化的复用原 intentId）；
+- 页面已消失且本跑无身份不可知页 → 依据持久化 intent 写 `closed-backfilled` 补齐行（仅补**上轮遗留** intent；本轮新产生且处置行写失败的 intent 保留到下轮，不在自身写失败的同跑内自证）；
+- 枚举失败或存在 URL 不可读页 → 无法证明缺席，不补齐（fail-closed）。
+
+**sweepPending 最终清除条件**：`failed === 0` **且** `unconfirmed === 0`（每个 intent 都有处置行确认）且审计链可校验（文件可解析）。任一不满足 → SWEEP_FAILED exit 2，sweepPending 保留，重跑真实重扫。
 
 | 审计文件 | 写失败语义 |
 |---|---|
-| `a-release-sweep-audit.ndjson`（release sweep） | **计入清理失败**：任一页审计写失败 → `failed++` → `RESULT=AGENT_SPACE_RELEASE_SWEEP_FAILED` exit 2，sweepPending 保留，重跑真实重扫可补齐审计与未完成的关页。审计是本机制的验收证据，写不出证据必须如实上报，不得静默。 |
+| `a-release-sweep-audit.ndjson`（release sweep） | **计入清理失败**：每次写失败 = 一条缺失证据行 = `failed++` → SWEEP_FAILED exit 2，sweepPending 保留；关闭动作有 intent 先行持久化，缺失的最终行可由重跑按 intent 补齐（见上）。审计是本机制的验收证据，写不出证据必须如实上报，不得静默。 |
 | `a-wake-ack-audit.ndjson`（受管 ack，Batch 1） | **尽力写入**：写失败输出 `ACK_AUDIT_WRITE_FAILED`（stderr），不改变 ack 业务结果；审计文件不可写时不能保证该次操作留下审计行（规划师 r5 澄清，Batch 1 已验收口径，零改动）。 |
 | `a-space-rebuild-audit.ndjson`（rebuild-space） | DENIED 行尽力写入（失败不掩盖拒绝结果）；授权决策行与 outcome 行写失败以异常浮出（manager exit 2），不静默、不伪装成功。 |
 

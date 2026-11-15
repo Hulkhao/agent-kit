@@ -150,10 +150,17 @@ test("#27 re-review P1-2/P1-4: valid terminal-ledger pages close; an empty space
     assert.equal(sweep.closed, 2);
     assert.deepEqual(closed.sort(), [chatUrl(OTHER), chatUrl(THIRD)].sort());
     const lines = (await readFile(auditFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
-    for (const line of lines) {
-      assert.equal(line.decision, "closed");
-      assert.equal(line.reason, "TEMP_RESULT_PAGE_FINISHED_DISPATCH");
-      assert.equal(line.action, "release-sweep");
+    // P1-A: every closed page leaves a persisted close-intent line first and a
+    // final "closed" disposition referencing that intentId.
+    const intents = lines.filter((line) => line.decision === "close-intent");
+    const finals = lines.filter((line) => line.decision === "closed");
+    assert.equal(intents.length, 2);
+    assert.equal(finals.length, 2);
+    for (const final of finals) {
+      assert.equal(final.reason, "TEMP_RESULT_PAGE_FINISHED_DISPATCH");
+      assert.equal(final.action, "release-sweep");
+      assert.ok(intents.some((intent) => intent.intentId === final.intentId && intent.page.uuid === final.page.uuid),
+        "each final line must reference its persisted close-intent");
     }
     // Last conversation, nothing kept, no failures → the provably empty space
     // may be finished (documented finish({keep:[]}) form).
@@ -215,6 +222,9 @@ test("#27 re-review P1-3: a close failure keeps sweepPending; the rerun really r
     const firstLine = JSON.parse((await readFile(auditFile, "utf8")).trim().split("\n").at(-1));
     assert.equal(firstLine.decision, "close-failed");
     assert.match(firstLine.reason, /PAGE_CLOSE_FAILED:ECONNRESET/);
+    const run1Lines = (await readFile(auditFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    assert.ok(run1Lines.some((line) => line.decision === "close-intent" && line.intentId === firstLine.intentId),
+      "the close-failed disposition references its persisted close-intent");
     assert.equal(shouldFinishSpace({ finished: true, hasTask: true, kept: 0, failed: first.failed }), false);
     // Manager classification: the incomplete cleanup is exit 2, never success.
     assert.equal(classifyManagerResult("release", { code: 0, result: "AGENT_SPACE_RELEASE_SWEEP_FAILED" }, null, {}), 2);
@@ -275,39 +285,53 @@ test("#27 re-review P1-3: an enumeration failure is recoverable and never overwr
       task: fakeTask([]), monitorDir: root, agentId: AGENT, space: SPACE,
       conversationUuid: CONV, known: [CONV], auditFile,
     });
-    assert.deepEqual(recovered, { closed: 0, kept: 0, failed: 0 }); // zero-close success
+    assert.deepEqual(recovered, { closed: 0, kept: 0, failed: 0, backfilled: 0, unconfirmed: 0 }); // zero-close success
     await clearAgentSweepPending({ agentId: AGENT, spaceName: SPACE, conversationUuid: CONV, directory: root });
     const clean = await withAgentRegistry((registry) => ({ changed: false, value: registry.agents[AGENT] }), root);
     assert.equal(releaseHasNothingOutstanding(clean, CONV), true);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
-test("#27 re-review: an audit-write failure counts as incomplete cleanup and is recoverable on rerun", async () => {
+test("#27 re-review② P1-A: an audit-write failure forbids the close; recovery reruns really clean", async () => {
   const root = await mkdtemp(join(tmpdir(), "ego-sweep-audit-"));
   try {
     await claimAgentSpace({ agentId: AGENT, spaceName: SPACE, directory: root });
     await writeLedger(root, OTHER, validLedger(OTHER, "COMPLETED"));
+    // ONE page across both runs (same task/set semantics); a successful close
+    // removes it from the set.
+    const pages = [];
+    const page = {
+      label: "L-target",
+      url: async () => chatUrl(OTHER),
+      close: async () => { pages.splice(pages.indexOf(page), 1); },
+    };
+    pages.push(page);
+    const task = { pages: async () => pages };
     // The audit target is a directory → every appendFile fails (EISDIR).
     const first = await sweepTaskPages({
-      task: fakeTask([fakePage(chatUrl(OTHER), null)]),
-      monitorDir: root, agentId: AGENT, space: SPACE,
+      task, monitorDir: root, agentId: AGENT, space: SPACE,
       conversationUuid: CONV, known: [CONV, OTHER], auditFile: root, // directory!
     });
-    assert.equal(first.closed, 1); // the close itself succeeded…
-    assert.equal(first.failed, 1); // …but the unauditable cleanup is incomplete
+    assert.equal(first.closed, 0);  // P1-A.2: no persistable intent → NO close
+    assert.deepEqual(pages, [pages[0]]); // the page survived
+    assert.equal(first.unconfirmed, 0); // the intent line never made it to disk
+    assert.ok(first.failed >= 2); // missing intent line + missing disposition line
     // Real failure shape of the default writer.
     const audit = makeSweepAudit({ auditFile: root, agentId: AGENT, space: SPACE, conversationUuid: CONV });
     await assert.rejects(audit({ decision: "kept", reason: "X" }));
-    // Recovery rerun with a writable audit file: zero failures, lines written.
+    // Recovery rerun with a writable audit file: the SAME page is now really
+    // closed under a persisted intent, zero failures.
     const auditFile = join(root, "a-release-sweep-audit.ndjson");
     const second = await sweepTaskPages({
-      task: fakeTask([fakePage(chatUrl(OTHER), null)]),
-      monitorDir: root, agentId: AGENT, space: SPACE,
+      task, monitorDir: root, agentId: AGENT, space: SPACE,
       conversationUuid: CONV, known: [CONV, OTHER], auditFile,
     });
-    assert.deepEqual({ closed: second.closed, failed: second.failed }, { closed: 1, failed: 0 });
+    assert.deepEqual({ closed: second.closed, failed: second.failed, unconfirmed: second.unconfirmed },
+      { closed: 1, failed: 0, unconfirmed: 0 });
+    assert.deepEqual(pages, []);
     const lines = (await readFile(auditFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
-    assert.equal(lines.length, 1);
+    assert.equal(lines.filter((line) => line.decision === "close-intent").length, 1);
+    assert.equal(lines.filter((line) => line.decision === "closed").length, 1);
     assert.equal(lines[0].page.uuid, OTHER);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
@@ -335,8 +359,9 @@ test("#27 re-review: sweepPending coexists with the release state machine; full 
     const sweep = await sweepTaskPages({
       task: null, monitorDir: root, agentId: AGENT, space: SPACE,
       conversationUuid: CONV, known: [CONV],
+      auditFile: join(root, "a-release-sweep-audit.ndjson"), // no trail yet → no open intents
     });
-    assert.deepEqual(sweep, { closed: 0, kept: 0, failed: 0 });
+    assert.deepEqual(sweep, { closed: 0, kept: 0, failed: 0, backfilled: 0, unconfirmed: 0 });
     // Full success clears the flag; afterwards the repeat release takes the
     // zero-browser early exit (no active, no releasePending, no sweepPending).
     await clearAgentSweepPending({ agentId: AGENT, spaceName: SPACE, conversationUuid: CONV, directory: root });
@@ -350,5 +375,156 @@ test("#27 re-review: sweepPending coexists with the release state machine; full 
     // Boundary: sweepPending does NOT change the #33 rebuild chain — the
     // authorized rebuild decision stays LEDGER_PROOF (chain untouched).
     assert.equal(await authorizeSpaceRebuild(AGENT, SPACE, { directory: root }), "LEDGER_PROOF");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("#27 re-review② P1-A: a lost audit line is backfilled from the persisted intent; the flag clears only after backfill", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ego-sweep-backfill-"));
+  try {
+    await claimAgentSpace({ agentId: AGENT, spaceName: SPACE, directory: root });
+    await writeLedger(root, OTHER, validLedger(OTHER, "COMPLETED"));
+    // ONE task and ONE page set across both runs; a successful close removes
+    // the page from the set (no per-run page rebuilds).
+    const pages = [];
+    const closedUrls = [];
+    const page = {
+      label: "L-target",
+      url: async () => chatUrl(OTHER),
+      close: async () => { pages.splice(pages.indexOf(page), 1); closedUrls.push(chatUrl(OTHER)); },
+    };
+    pages.push(page);
+    const task = { pages: async () => pages };
+    const auditFile = join(root, "a-release-sweep-audit.ndjson");
+    const realAudit = makeSweepAudit({ auditFile, agentId: AGENT, space: SPACE, conversationUuid: CONV });
+    // Run 1: the intent persists, page.close() succeeds, but the final "closed"
+    // line write fails → the intent stays unconfirmed, the missing audit line
+    // must be recoverable, never silently dropped.
+    const run1 = await sweepTaskPages({
+      task, monitorDir: root, agentId: AGENT, space: SPACE,
+      conversationUuid: CONV, known: [CONV, OTHER], auditFile,
+      audit: async (entry) => {
+        if (entry.decision === "closed") throw new Error("EIO"); // final lines only
+        return realAudit(entry);
+      },
+    });
+    assert.equal(run1.closed, 1); // the close really happened
+    assert.deepEqual(closedUrls, [chatUrl(OTHER)]);
+    assert.deepEqual(pages, []); // the page is gone from the SAME set
+    assert.equal(run1.failed, 1); // the missing final line counts
+    assert.equal(run1.unconfirmed, 1); // the intent is open
+    const run1Lines = (await readFile(auditFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    const intent = run1Lines.find((line) => line.decision === "close-intent");
+    assert.ok(intent, "the close-intent line persisted before the close");
+    assert.equal(run1Lines.some((line) => line.decision === "closed"), false); // final missing
+    // Until the intent is confirmed, the recoverable state must NOT be cleared.
+    assert.equal(releaseHasNothingOutstanding({ active: [], sweepPending: { conversationUuid: CONV } }, CONV), false);
+    // Run 2 on the SAME task: the page is positively absent → the earlier
+    // close is confirmed by a distinguishable backfill line referencing the
+    // persisted intent.
+    const run2 = await sweepTaskPages({
+      task, monitorDir: root, agentId: AGENT, space: SPACE,
+      conversationUuid: CONV, known: [CONV, OTHER], auditFile, // healthy default writer
+    });
+    assert.deepEqual({ closed: run2.closed, backfilled: run2.backfilled, failed: run2.failed, unconfirmed: run2.unconfirmed },
+      { closed: 0, backfilled: 1, failed: 0, unconfirmed: 0 });
+    const run2Lines = (await readFile(auditFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    const backfill = run2Lines.find((line) => line.decision === "closed-backfilled");
+    assert.ok(backfill, "the missing result line is backfilled");
+    assert.equal(backfill.intentId, intent.intentId); // references the persisted intent
+    assert.equal(backfill.page.uuid, OTHER);
+    assert.notEqual(backfill.decision, "closed"); // distinguishable from a live close
+    // After the backfill the zero-browser early exit becomes legal again.
+    assert.equal(releaseHasNothingOutstanding({ active: [], sweepPending: { conversationUuid: CONV } }, CONV), false);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("#27 re-review② P1-A: a close-intent write failure forbids closing that page", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ego-sweep-nointent-"));
+  try {
+    await claimAgentSpace({ agentId: AGENT, spaceName: SPACE, directory: root });
+    await writeLedger(root, OTHER, validLedger(OTHER, "COMPLETED"));
+    const pages = [fakePage(chatUrl(OTHER))];
+    const task = { pages: async () => pages };
+    const auditFile = join(root, "a-release-sweep-audit.ndjson");
+    const realAudit = makeSweepAudit({ auditFile, agentId: AGENT, space: SPACE, conversationUuid: CONV });
+    const run = await sweepTaskPages({
+      task, monitorDir: root, agentId: AGENT, space: SPACE,
+      conversationUuid: CONV, known: [CONV, OTHER], auditFile,
+      audit: async (entry) => {
+        if (entry.decision === "close-intent") throw new Error("EIO"); // intent cannot persist
+        return realAudit(entry);
+      },
+    });
+    assert.equal(run.closed, 0);              // the page was NOT closed
+    assert.deepEqual(pages, pages);           // still in the set (same object)
+    assert.ok(run.failed >= 1);               // SWEEP_FAILED territory
+    const lines = (await readFile(auditFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    assert.equal(lines.some((line) => line.decision === "close-intent"), false); // nothing persisted
+    const disposition = lines.find((line) => line.decision === "kept");
+    assert.equal(disposition.reason, "AUDIT_UNAVAILABLE_NO_CLOSE");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("#27 re-review② P1-A: after an audit write failure no further page is closed", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ego-sweep-stopclose-"));
+  try {
+    await claimAgentSpace({ agentId: AGENT, spaceName: SPACE, directory: root });
+    await writeLedger(root, OTHER, validLedger(OTHER, "COMPLETED"));
+    await writeLedger(root, THIRD, validLedger(THIRD, "COMPLETED"));
+    const pages = [];
+    const makePage = (uuid) => {
+      const p = { label: "L-" + uuid.slice(0, 6), url: async () => chatUrl(uuid),
+        close: async () => { pages.splice(pages.indexOf(p), 1); } };
+      pages.push(p);
+      return p;
+    };
+    makePage(OTHER);
+    const thirdPage = makePage(THIRD);
+    const task = { pages: async () => pages };
+    const auditFile = join(root, "a-release-sweep-audit.ndjson");
+    const realAudit = makeSweepAudit({ auditFile, agentId: AGENT, space: SPACE, conversationUuid: CONV });
+    const run = await sweepTaskPages({
+      task, monitorDir: root, agentId: AGENT, space: SPACE,
+      conversationUuid: CONV, known: [CONV, OTHER, THIRD], auditFile,
+      audit: async (entry) => {
+        if (entry.decision === "closed") throw new Error("EIO"); // page 1's final line fails
+        return realAudit(entry);
+      },
+    });
+    assert.equal(run.closed, 1);          // only the first page closed…
+    assert.deepEqual(pages, [thirdPage]);  // …the second page was NOT touched
+    assert.equal(run.unconfirmed, 1);     // page 1's intent stays open
+    const lines = (await readFile(auditFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    const stop = lines.find((line) => line.decision === "kept" && line.reason === "AUDIT_UNAVAILABLE_NO_CLOSE");
+    assert.ok(stop, "the not-closed page is audited as kept with the stop reason");
+    assert.equal(stop.page.uuid, THIRD);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("#27 re-review② P1-B: a legacy releasePending blocks other conversations' sweep intents without deadlock", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ego-sweep-legacy-"));
+  try {
+    // Legacy leftover state (pre-sweepPending registry shape): releasePending
+    // for B, no sweepPending field at all. No migration mechanism.
+    await withAgentRegistry((registry) => {
+      registry.agents[AGENT] = {
+        spaceName: SPACE, active: [], known: [OTHER],
+        releasePending: { conversationUuid: OTHER, finished: true },
+      };
+      return { changed: true };
+    }, root);
+    // Releasing A: markAgentSweepPending(A) is rejected BEFORE any flag write…
+    await assert.rejects(
+      markAgentSweepPending({ agentId: AGENT, spaceName: SPACE, conversationUuid: CONV, directory: root }),
+      (error) => error.code === "AGENT_SPACE_RELEASE_PENDING");
+    let entry = await withAgentRegistry((registry) => ({ changed: false, value: registry.agents[AGENT] }), root);
+    assert.equal(entry.sweepPending, undefined);   // no sweepPending=A written
+    assert.equal(entry.releasePending.conversationUuid, OTHER); // B's state untouched
+    // …and release B (the recovery that must go first) proceeds normally:
+    await markAgentSweepPending({ agentId: AGENT, spaceName: SPACE, conversationUuid: OTHER, directory: root });
+    entry = await withAgentRegistry((registry) => ({ changed: false, value: registry.agents[AGENT] }), root);
+    assert.equal(entry.sweepPending.conversationUuid, OTHER);
+    // Same-conversation releasePending + sweepPending coexist (recovery shape).
+    assert.equal(entry.releasePending.conversationUuid, entry.sweepPending.conversationUuid);
   } finally { await rm(root, { recursive: true, force: true }); }
 });

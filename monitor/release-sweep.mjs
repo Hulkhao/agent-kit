@@ -3,6 +3,7 @@
 // behavioral tests inject fake task/pages/ledger/audit doubles instead of
 // matching source text. Plain Node only — no browser globals here.
 import { readFile, appendFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { validateDispatchRecord } from "./dispatch-state.mjs";
 import { conversationIdFromUrl } from "./page-recovery.mjs";
 
@@ -59,14 +60,64 @@ export function classifySweepPage({ uuid, conversationUuid, known, status }) {
   return { decision: "kept", reason: "LEDGER_UNPROVEN" };
 }
 
+// ---------------------------------------------------------------------------
+// P1-A close-intent design. Storage form: intents live in the SAME
+// a-release-sweep-audit.ndjson as the final results — one designated evidence
+// file (no second write-failure surface, no evidence split across files),
+// distinguishable by decision:"close-intent" plus a unique intentId that every
+// disposition line references. "Intent without confirmation" is independently
+// discoverable by scanning the file for intents whose intentId no later
+// disposition line references. Rationale mirrored in docs/OPERATIONS.md §3.3.
+// ---------------------------------------------------------------------------
+
+// Load this release's open (unconfirmed) close-intents from the audit trail.
+// ENOENT = the trail does not exist yet = no intents (trustworthy). A corrupt
+// line makes the trail unverifiable → untrustworthy → the caller must NOT
+// clear sweepPending this run (fail-closed). Any later line that references an
+// intentId with a decision other than "close-intent" is a disposition of that
+// intent (closed / close-failed / closed-backfilled / kept-superseded) and
+// confirms it.
+export async function loadSweepIntents(auditFile, { agentId, space, conversationUuid }) {
+  let raw;
+  try { raw = await readFile(auditFile, "utf8"); }
+  catch (error) {
+    if (error.code === "ENOENT") return { unconfirmed: new Map(), trustworthy: true };
+    return { unconfirmed: new Map(), trustworthy: false };
+  }
+  const open = new Map(); // uuid(lower) -> intent line
+  const confirmed = new Set();
+  try {
+    for (const line of raw.split("\n")) {
+      if (!line.trim()) continue;
+      const entry = JSON.parse(line);
+      if (entry?.action !== "release-sweep" || entry.agentId !== agentId ||
+          entry.space !== space || entry.conversation !== conversationUuid) continue;
+      if (entry.decision === "close-intent" && entry.intentId && entry.page?.uuid) {
+        open.set(String(entry.page.uuid).toLowerCase(), entry);
+      } else if (entry.intentId && entry.decision !== "close-intent") {
+        confirmed.add(entry.intentId);
+      }
+    }
+  } catch { return { unconfirmed: new Map(), trustworthy: false }; }
+  for (const [uuidLower, intent] of [...open]) {
+    if (confirmed.has(intent.intentId)) open.delete(uuidLower);
+  }
+  return { unconfirmed: open, trustworthy: true };
+}
+
 // Sweep every page of the TaskSpace. Dependencies are injectable: `task` (with
 // async pages()), `ledgerStatusOf(monitorDir, uuid, space)` and `audit(entry)`
 // can be replaced by test doubles; defaults use the real ledger files and the
-// ndjson audit writer. A page.close() failure, an enumeration failure or an
-// audit-write failure all increment `failed` — the caller reports
-// RESULT=AGENT_SPACE_RELEASE_SWEEP_FAILED and leaves the recoverable
-// sweepPending flag in the registry (re-review P1-3). Idempotent: zero pages
-// to close is a zero-close success.
+// ndjson audit writer.
+//
+// Failure accounting (documented in docs/OPERATIONS.md §3.3): every page.close()
+// failure, every audit WRITE failure (= one missing evidence line) and every
+// page forbidden from closing because its intent could not be persisted counts
+// into `failed`; `unconfirmed` counts intents still lacking a disposition.
+// The caller reports RESULT=AGENT_SPACE_RELEASE_SWEEP_FAILED when either is
+// non-zero and leaves sweepPending in the registry (re-review P1-A/P1-3).
+// Idempotent: zero pages to close with a fully confirmed trail is a zero-close
+// success.
 export async function sweepTaskPages({
   task, monitorDir, agentId, space, conversationUuid, known, auditFile,
   ledgerStatusOf = anchoredLedgerStatus,
@@ -75,34 +126,103 @@ export async function sweepTaskPages({
   let closed = 0;
   let kept = 0;
   let failed = 0;
-  if (!task) return { closed, kept, failed };
+  let backfilled = 0;
+  const prior = await loadSweepIntents(auditFile, { agentId, space, conversationUuid });
+  if (!prior.trustworthy) failed++; // unverifiable trail: fail closed this run
+  let auditBroken = !prior.trustworthy;
+  const open = prior.unconfirmed; // uuid(lower) -> open intent (intentId reused)
+  // Intents carried over from a PRIOR run are backfillable when their page is
+  // positively absent. An intent born in THIS run whose disposition write just
+  // failed stays open instead (P1-A.4): the rerun re-proves absence and
+  // backfills it (P1-A.5) — never fabricate a confirmation inside the run
+  // whose own writer is failing.
+  const carried = new Set(prior.unconfirmed.keys());
+
+  // An audit write failure = one missing evidence line. It also switches the
+  // run into no-close mode: without a persistable intent, a destructive close
+  // must not happen (P1-A.2/.6).
+  const write = async (entry) => {
+    try { await audit(entry); return true; }
+    catch { auditBroken = true; failed++; return false; }
+  };
+
+  const pageId = (page, uuid) => ({ label: page?.label ?? null, uuid: uuid ?? null });
   let remaining = [];
-  try { remaining = await task.pages(); }
-  catch (error) {
-    failed++;
-    await audit({ page: null, decision: "sweep-failed", reason: "PAGE_ENUMERATION_FAILED",
-      code: String(error?.code || error?.message || "UNKNOWN").slice(0, 80) }).catch(() => { failed++; });
-    return { closed, kept, failed };
+  let enumerated = false;
+  let sawUnknownPage = false; // a page whose URL READ threw: its identity is unknowable
+  if (task) {
+    try { remaining = [...await task.pages()]; enumerated = true; }
+    catch (error) {
+      failed++;
+      await write({ page: null, decision: "sweep-failed", reason: "PAGE_ENUMERATION_FAILED",
+        code: String(error?.code || error?.message || "UNKNOWN").slice(0, 80) });
+    }
   }
-  for (const page of remaining) {
+
+  for (const page of enumerated ? remaining : []) {
     let uuid = null;
-    try { uuid = conversationIdFromUrl(await page.url(), true); } catch { uuid = null; }
+    try { uuid = conversationIdFromUrl(await page.url(), true); }
+    catch { uuid = null; sawUnknownPage = true; }
     const status = uuid ? await ledgerStatusOf(monitorDir, uuid, space) : null;
     const verdict = classifySweepPage({ uuid, conversationUuid, known, status });
+    const priorIntent = uuid ? open.get(uuid.toLowerCase()) : null;
     let decision = verdict.decision;
     let reason = verdict.reason;
+    let intentId = priorIntent ? priorIntent.intentId : null;
+
+    let dispositionWritten = false;
     if (decision === "closed") {
-      try { await page.close(); closed++; }
-      catch (error) {
-        decision = "close-failed";
-        failed++;
-        reason = "PAGE_CLOSE_FAILED:" + String(error?.code || error?.message || "UNKNOWN").slice(0, 80);
+      if (auditBroken) {
+        // P1-A.2/.6: persistable intent unavailable → the page stays open.
+        decision = "kept";
+        reason = "AUDIT_UNAVAILABLE_NO_CLOSE";
+      } else {
+        if (!intentId) {
+          intentId = randomUUID();
+          const persisted = await write({ page: pageId(page, uuid), decision: "close-intent", intentId, reason });
+          if (!persisted) { intentId = null; decision = "kept"; reason = "AUDIT_UNAVAILABLE_NO_CLOSE"; }
+          else open.set(uuid.toLowerCase(), { intentId, page: pageId(page, uuid), reason });
+        }
+        if (decision === "closed") {
+          try { await page.close(); closed++; }
+          catch (error) {
+            decision = "close-failed";
+            reason = "PAGE_CLOSE_FAILED:" + String(error?.code || error?.message || "UNKNOWN").slice(0, 80);
+            failed++;
+          }
+          const confirmed = await write({ page: pageId(page, uuid), decision, reason, intentId });
+          if (confirmed && intentId) open.delete(uuid.toLowerCase());
+          dispositionWritten = true;
+        }
       }
-    } else kept++;
-    try { await audit({ page: { label: page.label ?? null, uuid: uuid ?? null }, decision, reason }); }
-    catch { failed++; } // an unauditable cleanup counts as incomplete, never silent
+    }
+    if (!dispositionWritten) {
+      // Kept pages (and forbidden closes) are audited too; a disposition line
+      // carrying a prior intent id resolves that intent as superseded.
+      const confirmed = await write({ page: pageId(page, uuid), decision, reason, intentId });
+      if (confirmed && intentId) open.delete(uuid.toLowerCase());
+    }
+    if (decision === "kept") kept++;
   }
-  return { closed, kept, failed };
+
+  // P1-A.5: an intent still open whose page is positively absent (the space is
+  // gone, or this run's enumeration proves absence) means the earlier close
+  // actually succeeded — backfill the missing result line, distinguishable
+  // from a live "closed" line (decision:"closed-backfilled" + intent
+  // reference). When any page's identity was unknowable this run, absence
+  // cannot be proven → the intents stay open (fail-closed; SWEEP_FAILED, the
+  // flag is not cleared).
+  const absenceProvable = !task || (enumerated && !sawUnknownPage);
+  if (absenceProvable) {
+    for (const [uuidLower, intent] of [...open]) {
+      if (!carried.has(uuidLower)) continue; // born this run → waits for the rerun
+      const ok = await write({ page: { label: intent.page?.label ?? null, uuid: intent.page?.uuid ?? null },
+        decision: "closed-backfilled", reason: intent.reason ?? "TEMP_RESULT_PAGE_FINISHED_DISPATCH",
+        intentId: intent.intentId, note: "PAGE_GONE_CLOSE_CONFIRMED_BY_BACKFILL" });
+      if (ok) { backfilled++; open.delete(uuidLower); }
+    }
+  }
+  return { closed, kept, failed, backfilled, unconfirmed: open.size };
 }
 
 // P1-2 space-fate decision: ego's finish `keep` semantics are undocumented

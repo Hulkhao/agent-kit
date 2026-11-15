@@ -88,7 +88,7 @@ const sweep = await sweepTaskPages({
   task, monitorDir: MON, agentId: AGENT_ID, space: SPACE, conversationUuid: CONV,
   known: assigned.known, auditFile: sweepAuditFile,
 });
-console.log(`RELEASE_SWEEP closed=${sweep.closed} kept=${sweep.kept} failed=${sweep.failed}`);
+console.log(`RELEASE_SWEEP closed=${sweep.closed} kept=${sweep.kept} backfilled=${sweep.backfilled} failed=${sweep.failed} unconfirmed=${sweep.unconfirmed}`);
 
 // Space fate (P1-2): finish ONLY a provably empty space. When the sweep kept
 // any page (active dispatch, unproven ledger, blank, unattributable), the
@@ -105,13 +105,15 @@ if (shouldFinishSpace({ finished: result.finished, hasTask: Boolean(task), kept:
   }
 }
 
-if (sweep.failed > 0) {
+if (sweep.failed > 0 || sweep.unconfirmed > 0) {
   // sweepPending intentionally stays: the rerun release performs a real
-  // re-sweep (this is the recoverable state, re-review P1-3).
+  // re-sweep (recoverable state, re-review P1-3) and unconfirmed close-intents
+  // are backfilled from the persisted intent record (re-review② P1-A.5/.7).
   console.log(`RESULT=AGENT_SPACE_RELEASE_SWEEP_FAILED closed=${sweep.closed} kept=${sweep.kept} failed=${sweep.failed}`);
 } else {
-  // The sweep (and, when applicable, the empty-space finish) succeeded: only
-  // now is the release complete and the recoverable flag cleared. Repeat
+  // The sweep (and, when applicable, the empty-space finish) succeeded AND
+  // every close-intent has an audit disposition: only now is the release
+  // complete and the recoverable flag cleared (re-review② P1-A.7). Repeat
   // calls take the zero-browser early exit at the top.
   await clearAgentSweepPending({ agentId: AGENT_ID, spaceName: SPACE, conversationUuid: CONV });
   console.log(`RESULT=AGENT_SPACE_RELEASED finished=${result.finished} remaining=${result.active.length}`);

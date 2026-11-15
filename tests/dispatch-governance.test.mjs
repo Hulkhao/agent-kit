@@ -1672,7 +1672,7 @@ test("#27 B2: the release sweep keeps the conservative boundary and reports trut
   // and cleared only in the all-success branch; the failure branch keeps it.
   assert.ok(template.indexOf("await markAgentSweepPending(") < template.indexOf("const result = await releaseAgentConversation("),
     "sweepPending must be marked before the browser release");
-  const tail = template.slice(template.indexOf("if (sweep.failed > 0) {"));
+  const tail = template.slice(template.indexOf("if (sweep.failed > 0 || sweep.unconfirmed > 0) {"));
   assert.match(tail, /RESULT=AGENT_SPACE_RELEASE_SWEEP_FAILED closed=\$\{sweep\.closed\} kept=\$\{sweep\.kept\} failed=\$\{sweep\.failed\}/);
   assert.ok(tail.indexOf("await clearAgentSweepPending(") > tail.indexOf("} else {"),
     "clearAgentSweepPending must live in the success branch only");
