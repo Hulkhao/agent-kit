@@ -16,8 +16,8 @@
 **前置**：某 agent 的派单空间已在账本（跑过至少一次 `send`/`probe`）；monitor 目录干净。
 
 1. 正常 `send` 一条短任务并 `watch` 布防（建立基线）。
-2. `taskkill` ego 主进程 → 手工删除 ego 内该空间（或用 ego 提供的清理路径），确保 `listTaskSpaces` 无此空间。
-3. 重启 ego → 跑 `probe`：期望 `TASKSPACE_RECOVERY_FAILED` 且 stdout 含 `RECOVERY_HINT=SPACE_REGISTRY_LOST`。
+2. **[PO 手工步骤]** Agent 禁止终止或重启 Ego Lite 宿主 `ego.exe` 及其进程树（skill 1.7.1 硬禁令，PR#32）。由 PO 手工杀 ego 主进程 → 手工删除 ego 内该空间（或用 ego 提供的清理路径），确保 `listTaskSpaces` 无此空间；Agent 只保留 PO 操作前后的脱敏现场记录。
+3. **[PO 手工]** PO 重启 ego，完成后 Agent 接手：跑 `probe`，期望 `TASKSPACE_RECOVERY_FAILED` 且 stdout 含 `RECOVERY_HINT=SPACE_REGISTRY_LOST`。
 4. 跑 `node monitor/dispatch-manager.mjs rebuild-space --monitor-dir <根> --agent-id <ID> --space <空间>`：期望 `RESULT=SPACE_REBUILT`、exit 0；`<根>/a-space-rebuild-audit.ndjson` 出现 `decision=LEDGER_PROOF, outcome=REBUILT` 行。
 5. 重跑 `probe`/`watch`：期望空间恢复、页面恢复走既有链路（`SPACE_BOOTSTRAPPED` 不再出现，`AGENT_OWNED_BLANK_PAGE`/`NEW_PAGE_FOR_EXISTING_CONVERSATION` 任一恢复路径），任务继续到 DONE → collect/consume/release 全链。
 6. **allowlist 兜底一次**：另取一个未入账本的空间名，加入本机 `ego-profile.json` `spaceRebuildAllowlist` → rebuild-space：期望 `decision=ALLOWLIST`；对不在白名单且无账本的第三个名字：期望 `SPACE_REBUILD_DENIED code=SPACE_REBUILD_NOT_AUTHORIZED`（审计行 decision=DENIED）。
