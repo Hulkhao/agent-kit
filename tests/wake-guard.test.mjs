@@ -299,6 +299,11 @@ test("structurally invalid state files violate their contract and yield WAKE_STA
     [{ "a-dispatch-state.json": dispatchRecord(now - 60 * 60_000, { status: "COMPLETED", baselineComposerLength: -1 }) }, "DISPATCH_BASELINE_LENGTH_INVALID"],
     [{ "a-dispatch-state.json": dispatchRecord(now - 60 * 60_000, { status: "COMPLETED", baselineTailRole: 5 }) }, "DISPATCH_BASELINE_ROLE_INVALID"],
     [{ "a-dispatch-state.json": dispatchRecord(now - 60 * 60_000, { status: "COMPLETED", baselineTailKey: 5 }) }, "DISPATCH_BASELINE_KEY_INVALID"],
+    // Optional-field type contract, verbatim from validateDispatchRecord():
+    // null/undefined is legal, any other wrong type is corruption.
+    [{ "a-dispatch-state.json": dispatchRecord(now - 60 * 60_000, { status: "COMPLETED", payload_sha256: 123 }) }, "DISPATCH_PAYLOAD_SHA_INVALID"],
+    [{ "a-dispatch-state.json": dispatchRecord(now - 60 * 60_000, { status: "COMPLETED", payload_bytes: "invalid" }) }, "DISPATCH_PAYLOAD_BYTES_INVALID"],
+    [{ "a-dispatch-state.json": dispatchRecord(now - 60 * 60_000, { status: "COMPLETED", composer_baseline: 123 }) }, "DISPATCH_COMPOSER_BASELINE_INVALID"],
   ];
   for (const [files, expectedDetail] of cases) {
     const { root } = await makeRoot(now, files);
@@ -307,6 +312,32 @@ test("structurally invalid state files violate their contract and yield WAKE_STA
     assert.equal(events.length, 1, expectedDetail);
     assert.equal(events[0].type, "WAKE_STATUS_UNKNOWN", expectedDetail);
     assert.equal(events[0].detail, expectedDetail, expectedDetail);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("optional dispatch ledger fields: null and absent both pass validation with no events", async () => {
+  const now = 1_800_000_000_000;
+  // The writer's normal shape carries the optional fields as null -> healthy.
+  {
+    const { root } = await makeRoot(now, {
+      "a-dispatch-state.json": dispatchRecord(now - 60 * 60_000, { status: "COMPLETED" }),
+    });
+    const { healthy, events } = await detectWakeAnomalies([root], now);
+    assert.equal(healthy, true);
+    assert.deepEqual(events, []);
+    await rm(root, { recursive: true, force: true });
+  }
+  // Older ledgers without the optional keys at all are equally valid.
+  {
+    const record = dispatchRecord(now - 60 * 60_000, { status: "COMPLETED" });
+    delete record.payload_sha256;
+    delete record.payload_bytes;
+    delete record.composer_baseline;
+    const { root } = await makeRoot(now, { "a-dispatch-state.json": record });
+    const { healthy, events } = await detectWakeAnomalies([root], now);
+    assert.equal(healthy, true);
+    assert.deepEqual(events, []);
     await rm(root, { recursive: true, force: true });
   }
 });

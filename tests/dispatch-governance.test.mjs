@@ -837,8 +837,12 @@ test("#25 WG-03A: ensureMonitor failure after watch identity confirmation exits 
     assert.equal(marker.exitCode, 2);
     assert.equal(marker.acknowledgedAt, null);
     assert.equal(marker.ackAction, null);
-    assert.ok(logs.some((line) => line.startsWith("RESULT=WATCH_EXCEPTION code=EISDIR wakeId=")),
-      "wake line must announce WATCH_EXCEPTION with the failing ensureMonitor code: " + JSON.stringify(logs));
+    // The frozen schema: exactly these seven fields, no task or reply body.
+    assert.deepEqual(Object.keys(marker).sort(),
+      ["ackAction", "acknowledgedAt", "exitCode", "issuedAt", "reason", "schema", "wakeId"]);
+    // The announced wakeId matches the persisted marker byte-for-byte.
+    assert.ok(logs.includes(`RESULT=WATCH_EXCEPTION code=EISDIR wakeId=${marker.wakeId}`),
+      "wake line must announce WATCH_EXCEPTION with the ledger wakeId: " + JSON.stringify(logs));
   } finally {
     console.log = originalLog;
     await rm(root, { recursive: true, force: true });

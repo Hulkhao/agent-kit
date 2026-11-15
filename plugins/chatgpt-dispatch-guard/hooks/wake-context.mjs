@@ -136,6 +136,14 @@ function dispatchStructureError(record) {
   if (typeof record.baselineTailKey !== "string" && record.baselineTailKey !== null) return "DISPATCH_BASELINE_KEY_INVALID";
   if (!Number.isFinite(record.baselineComposerLength) || record.baselineComposerLength < 0) return "DISPATCH_BASELINE_LENGTH_INVALID";
   if (!Number.isInteger(record.attempt) || record.attempt < 1) return "DISPATCH_ATTEMPT_INVALID";
+  // Optional R2.5 fields, type contract copied verbatim from
+  // validateDispatchRecord(): absent or null is legal, a wrong type is corruption.
+  if (!(record.payload_sha256 === null || record.payload_sha256 === undefined ||
+        typeof record.payload_sha256 === "string")) return "DISPATCH_PAYLOAD_SHA_INVALID";
+  if (!(record.payload_bytes === null || record.payload_bytes === undefined ||
+        Number.isInteger(record.payload_bytes))) return "DISPATCH_PAYLOAD_BYTES_INVALID";
+  if (!(record.composer_baseline === null || record.composer_baseline === undefined ||
+        typeof record.composer_baseline === "string")) return "DISPATCH_COMPOSER_BASELINE_INVALID";
   if (("updatedAt" in record) && !Number.isFinite(record.updatedAt)) return "DISPATCH_UPDATED_AT_INVALID";
   if (!Number.isFinite(record.createdAt)) return "DISPATCH_CREATED_AT_INVALID";
   return null;
