@@ -16,6 +16,20 @@ export function isConversationUrl(rawUrl, conversationUuid, exactHost = false) {
     conversationIdFromUrl(rawUrl, exactHost) === conversationUuid.toLowerCase();
 }
 
+// Issue #25 gap 1: origin verdicts for a managed Page URL, used by the probe's self-check.
+// OK         — the watched conversation page (https chatgpt.com host, path ends /c/<uuid>).
+// TRANSITION — blank navigation intermediates (about:blank, chrome://new-tab-page/); their
+//              legality is judged by the caller against its round context (fresh Page before
+//              navigation, blank reuse, RECOVER-round blank all stay on the existing ladder).
+// INVALID    — every other source (chrome:// inner pages, foreign hosts, unreadable URLs).
+//              In-page requests from such a source all fail while the probe still "looks
+//              alive"; fail-closed means report it, never treat it as ordinary unavailability.
+export function probeOriginVerdict(rawUrl, conversationUuid) {
+  if (typeof rawUrl !== "string") return "INVALID";
+  if (blankPageUrl(rawUrl)) return "TRANSITION";
+  return isConversationUrl(rawUrl, conversationUuid) ? "OK" : "INVALID";
+}
+
 export async function selectUniqueConversationPage(pages, conversationUuid) {
   if (!Array.isArray(pages) || pages.length < 2) {
     throw new TypeError("PAGE_URL_SELECTION_REQUIRES_MULTIPLE_PAGES");

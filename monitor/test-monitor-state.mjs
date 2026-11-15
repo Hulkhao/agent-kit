@@ -16,7 +16,7 @@ import {
   reconcileDispatch,
 } from "./dispatch-state.mjs";
 import { isTaskSpaceTakeover, taskSpaceNeedsClaim, assertAgentOwnedTaskSpace, TASKSPACE_TAKEOVER_SIGNAL } from "./taskspace-takeover.mjs";
-import { selectUniqueConversationPage, isConversationUrl, conversationIdFromUrl } from "./page-recovery.mjs";
+import { selectUniqueConversationPage, isConversationUrl, conversationIdFromUrl, probeOriginVerdict } from "./page-recovery.mjs";
 import {
   CALIBRATION_INTERVAL_MS,
   chatSurfaceReady,
@@ -246,6 +246,7 @@ async function executeProbePageRecovery(task, { uuid = "12345678-1234-1234-1234-
     previous: { pageLabel: previousPageLabel }, now: () => 1_000_000,
     selectUniqueConversationPage,
     isConversationUrl,
+    probeOriginVerdict,
     claimAgentSpace: async () => {}, reserveAgentPage: reservePage, AGENT_ID: "test-agent",
     writeState: async (value) => { writes.push(value); },
     appendEvent: async (_dir, type, detail) => { events.push({ type, detail }); },
@@ -352,11 +353,17 @@ test("probe recovery behavior: zero managed and zero matching unmanaged tabs cre
 
 test("probe recovery behavior: unique agent-owned unmanaged tab is adopted, user-owned is rejected", async () => {
   const uuid = "12345678-1234-1234-1234-123456789abc";
-  const page = { targetId: "target-adopt" };
+  const page = { targetId: "target-adopt", url: async () => `https://chatgpt.com/c/${uuid}` };
   const baseTab = { url: `https://chatgpt.com/c/${uuid}`, openedBy: "agent", targetId: "target-adopt", page };
   const fixture = managedRecoveryTask([], [baseTab]);
   let adoptions = 0;
-  fixture.task.adopt = async (candidate) => { adoptions++; assert.equal(candidate, page); return { label: "p1" }; };
+  // Real ego Pages always expose url(); the probe's origin self-check (issue #25 gap 1)
+  // reads it again after adoption, so the stub adopted Page must model that contract.
+  fixture.task.adopt = async (candidate) => {
+    adoptions++;
+    assert.equal(candidate, page);
+    return { label: "p1", url: async () => `https://chatgpt.com/c/${uuid}` };
+  };
   const selected = await executeProbePageRecovery(fixture.task);
   assert.equal(adoptions, 1);
   assert.equal(fixture.newPages, 0);

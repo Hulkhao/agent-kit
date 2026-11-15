@@ -202,6 +202,7 @@ const r = await page.fetch("/backend-api/conversation/" + uuid,
 | `STATE_CORRUPT`（watchdog/probe） | 状态文件 JSON 损坏、缺字段或类型错误（v3 Schema 校验拒绝） | 不猜状态：按现场恢复流程重建状态后全套重启 |
 | `UUID_MISSING_OR_INVALID` | 被监视 UUID 文件缺失或格式非法 | 补 uuid 文件后重启 |
 | `TASKSPACE_RECOVERY_FAILED`（含 `PAGE_URL_MATCH_*`） | Page 恢复 fail-closed（多标签歧义/无匹配/URL 不可读）；输出含 `RECOVERY_HINT=SPACE_REGISTRY_LOST` 时=ego 重启丢失了该空间的注册表 | 带 HINT：先跑受管 `rebuild-space`（§6.5）再重新布防；其余：人工清空间残留标签或核对 UUID 后重启 |
+| `PROBE_INVALID_ORIGIN`（#25） | 受管页漂到非会话源（chrome:// 内页、外来 host 等非空白过渡态），页内请求必败导致假盲监控；probe 一轮即报，不再记 strike 退避 | 检查 ego 页面状态/重启 ego；必要时 rebuild-space（§6.5）后重新布防 |
 | `EGO_TASKSPACE_TAKEOVER_REQUIRED`（#25） | ego 升级后 TaskSpace 接管门阻止脚本访问 | 先 `listTaskSpaces()` 找 id，人工 `claimTaskSpace(id)`，再重跑 probe/布防双循环；不得误走死页梯子 |
 | `DISPATCH_ACCEPTED_WAKE_SUPERVISOR` / `DISPATCH_ATTEMPTED_WAKE_SUPERVISOR`（#26） | 任意 STOP 时本轮消息身份匹配且账本已 ACCEPTED 或已进入发送尝试 | 查看 `DISPATCH_LEDGER` + `STOP_CAUSE`；ACCEPTED 立即布防监控，SEND_STARTED/UNCERTAIN 先对账；都不得盲重发 |
 | `DISPATCH_UNCERTAIN_WAKE_SUPERVISOR` | 派单账本处于 UNCERTAIN，无法证明已接受 | 先对账（结构化 unit 证据）再裁定；未接受才授权重试 |

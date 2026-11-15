@@ -43,7 +43,7 @@ const {
   stormRearmState,
   validateFastState,
 } = await import(pathToFileURL(MON + "/state-schema.mjs").href);
-const { selectUniqueConversationPage, isConversationUrl } = await import(pathToFileURL(MON + "/page-recovery.mjs").href);
+const { selectUniqueConversationPage, isConversationUrl, probeOriginVerdict } = await import(pathToFileURL(MON + "/page-recovery.mjs").href);
 const { TASKSPACE_TAKEOVER_SIGNAL, isTaskSpaceTakeover, assertAgentOwnedTaskSpace } =
   await import(pathToFileURL(MON + "/taskspace-takeover.mjs").href);
 const { claimAgentSpace, reserveAgentPage } = await import(pathToFileURL(MON + "/agent-space.mjs").href);
@@ -290,6 +290,39 @@ try {
     await appendEvent(MON, "PAGE_LABEL_RECOVERED", {
       previousLabel: previousPageLabel, actualLabel: page.label, selectionEvidence,
     });
+  }
+  // Issue #25 gap 1: probe origin self-check (false-blind guard, issue-kit#25). After
+  // selection the managed Page must sit on the watched conversation URL or on a blank
+  // transition (fresh Page before its first navigation, #18 blank reuse, RECOVER-round
+  // blank). Any other source makes every in-page request fail while the probe still
+  // "looks alive", which the structural gate alone would misread as ordinary unavailable
+  // strikes and back off instead of escalating. Exit immediately with PROBE_INVALID_ORIGIN;
+  // the manager's classifyProbeResult default branch turns that into a wake signal.
+  let originUrl;
+  try {
+    originUrl = await page.url();
+  } catch (cause) {
+    // Fail-closed: an unreadable URL keeps the existing PAGE_URL_INSPECTION_FAILED path
+    // (it surfaces through the selection catch below); never a silent pass.
+    const error = new Error("PAGE_URL_INSPECTION_FAILED", { cause });
+    error.code = "PAGE_URL_INSPECTION_FAILED";
+    throw error;
+  }
+  // Blank transitions stay legal here on purpose: the round ladder below already turns
+  // them into the usual RECOVER/CALIBRATE navigation. Only a non-blank, non-session
+  // source (chrome:// inner pages, foreign hosts, unreadable strings) exits.
+  if (probeOriginVerdict(originUrl, uuid) === "INVALID") {
+    await writeState({
+      spaceId, pageLabel: page.label, pageCount: pages.length,
+      probeFailed: true, recoveryFailed: false,
+      errorCode: "PROBE_INVALID_ORIGIN",
+    });
+    await appendEvent(MON, "PROBE_INVALID_ORIGIN", {
+      spaceId, selectionEvidence, conversationUuid: uuid,
+      rawUrl: String(originUrl).slice(0, 200),
+    });
+    console.log("RESULT=PROBE_INVALID_ORIGIN");
+    process.exit(0);
   }
 } catch (error) {
   const takeover = isTaskSpaceTakeover(error);
