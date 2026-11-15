@@ -378,7 +378,20 @@ export function readEgoOutcome(child, emitOutput) {
     child.once("close", (exitCode) => {
       let result = null;
       for (const match of tail.matchAll(/^RESULT=([A-Z0-9_]+)(?:\s|$)/gm)) result = match[1];
-      res({ code: exitCode ?? 2, result });
+      // When no RESULT line was parsed (observed 2026-11: watch probe exited 127
+      // with no RESULT at all — agent-kit#31), surface the last non-empty,
+      // non-RESULT line of the captured streams so an exit like 127 (command
+      // not found) is distinguishable from a script crash. Same truncation
+      // precedent as rebuild-space's RECOVERY_DETAIL, shortened to 200.
+      let detail = null;
+      if (!result) {
+        for (const line of tail.split(/\r?\n/)) {
+          const trimmed = line.trim();
+          if (trimmed && !trimmed.startsWith("RESULT=")) detail = trimmed;
+        }
+        if (detail) detail = detail.slice(0, 200);
+      }
+      res({ code: exitCode ?? 2, result, detail });
     });
   });
 }
@@ -502,7 +515,8 @@ export async function main(args = process.argv.slice(2)) {
       const verdict = classifyProbeResult(observation, benignStreak);
       benignStreak = verdict.streak;
       if (verdict.wake) {
-        console.log("RESULT=FAST_PROBE_WAKE_SUPERVISOR signal=" + (observation.result || "MISSING") + " exit=" + observation.code);
+        console.log("RESULT=FAST_PROBE_WAKE_SUPERVISOR signal=" + (observation.result || "MISSING") + " exit=" + observation.code +
+          (observation.detail ? " detail=" + observation.detail : ""));
         return 2;
       }
       if (await tick(Date.now(), dir)) return 2;

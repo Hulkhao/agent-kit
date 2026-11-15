@@ -35,7 +35,7 @@ test("#31: ego result parsing waits for stdout to drain after process exit", asy
   child.stdout.emit("data", Buffer.from("RESULT=GEN"));
   child.stdout.emit("data", Buffer.from("ERATING\n"));
   child.emit("close", 0);
-  assert.deepEqual(await reading, { code: 0, result: "GENERATING" });
+  assert.deepEqual(await reading, { code: 0, result: "GENERATING", detail: null });
 });
 
 test("#31: managed module copies refresh without replacing runtime state", async () => {
@@ -615,4 +615,53 @@ test("#31: the guard keeps the managed rebuild-space entry point allowed", () =>
   // The ad-hoc rebuild path the guard exists to block stays blocked.
   const adhoc = "ego-browser nodejs -e \"await import('file:///C:/tmp/adhoc-rebuild.mjs')\"";
   assert.equal(checkDispatchTool(native("Bash", { command: adhoc })).hookSpecificOutput.permissionDecision, "deny");
+});
+
+test("#31: a RESULT-less exit carries the last stderr line as diagnostic detail", async () => {
+  const child = new EventEmitter();
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  const reading = readEgoOutcome(child, () => {});
+  child.stderr.emit("data", Buffer.from("spawn warning\n"));
+  child.stderr.emit("data", Buffer.from("/bin/sh: 1: ego-browser: command not found\n"));
+  child.emit("close", 127);
+  const observation = await reading;
+  assert.equal(observation.code, 127);
+  assert.equal(observation.result, null);
+  assert.equal(observation.detail, "/bin/sh: 1: ego-browser: command not found");
+  assert.ok(observation.detail.includes("ego-browser: command not found"));
+  assert.ok(observation.detail.length <= 200);
+});
+
+test("#31: a parsed RESULT line leaves diagnostic detail null", async () => {
+  const child = new EventEmitter();
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  const reading = readEgoOutcome(child, () => {});
+  child.stdout.emit("data", Buffer.from("noise before the answer\nRESULT=GENERATING\n"));
+  child.stderr.emit("data", Buffer.from("harmless stderr noise\n"));
+  child.emit("close", 0);
+  assert.deepEqual(await reading, { code: 0, result: "GENERATING", detail: null });
+});
+
+test("#31: diagnostic detail truncates to 200 characters without a RESULT line", async () => {
+  const child = new EventEmitter();
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  const reading = readEgoOutcome(child, () => {});
+  const long = "E".repeat(500) + " tail-marker";
+  child.stderr.emit("data", Buffer.from(long + "\n"));
+  child.emit("close", 1);
+  const observation = await reading;
+  assert.equal(observation.result, null);
+  assert.equal(observation.detail.length, 200);
+  assert.ok(observation.detail.startsWith("E".repeat(200)));
+  assert.ok(!observation.detail.includes("tail-marker"));
+});
+
+test("#31: the watch wake line appends diagnostic detail when present", async () => {
+  const source = await readFile(new URL("../monitor/dispatch-manager.mjs", import.meta.url), "utf8");
+  const watch = source.slice(source.indexOf('if (p.action === "watch")'), source.indexOf('if (p.action === "probe") await writeFile'));
+  assert.match(watch, /RESULT=FAST_PROBE_WAKE_SUPERVISOR signal=/);
+  assert.match(watch, /\(observation\.detail \? " detail=" \+ observation\.detail : ""\)/);
 });

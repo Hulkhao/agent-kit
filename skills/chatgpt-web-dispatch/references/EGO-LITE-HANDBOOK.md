@@ -207,6 +207,7 @@ const r = await page.fetch("/backend-api/conversation/" + uuid,
 | `DISPATCH_UNCERTAIN_WAKE_SUPERVISOR` | 派单账本处于 UNCERTAIN，无法证明已接受 | 先对账（结构化 unit 证据）再裁定；未接受才授权重试 |
 | `CONVERSATION_UNAVAILABLE_PERSISTENT` | 死页梯子 3 strikes | 只报「持续不可用」，深查/重派/迁移；不声称会话永久死亡 |
 | `START_IDLE_WAKE_SUPERVISOR` | 恢复首轮空闲，存在基线时序风险（issue #8 起属良性：wrapper 自动重启自愈并留痕，连续 >20 轮才升级唤醒） | 单次出现无需处置；wrapper 日志见 `BENIGN_SIGNAL_SELFHEAL` 留痕可审计 |
+| `FAST_PROBE_WAKE_SUPERVISOR signal=MISSING exit=<code> [detail=<行>]` | watch 子进程异常退出且无 RESULT 行（2026-11-16 起 detail=末条非 RESULT 输出行，≤200 字符，#31） | 三段判定：detail 含 `command not found`=命令缺失（修 ego-browser PATH/环境后全套重启）；detail 为 JS 堆栈行（`at …`/`Error: …`）=脚本崩溃（留 tail 证据上报 §9.1）；无 detail=零输出静默退出（查托管宿主/进程被杀，非脚本逻辑）。exit=127 通常是命令缺失 |
 
 ### 6.4 异常接棒、监控健康与重新布防
 
