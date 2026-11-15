@@ -131,6 +131,43 @@ export async function releaseAgentConversation({ agentId, spaceName, conversatio
   }, directory);
 }
 
+// #27 re-review P1-3: persist the temp-page sweep intent BEFORE the browser
+// sweep runs. A crash or partial failure leaves sweepPending in the registry,
+// so a rerun release performs a REAL re-sweep instead of taking the zero-browser
+// early exit; the flag is cleared only after a fully successful sweep.
+// A pending sweep for a DIFFERENT conversation is never overwritten (fail-closed
+// — the earlier conversation's recovery state must not be lost).
+export async function markAgentSweepPending({ agentId, spaceName, conversationUuid, directory } = {}) {
+  validateIdentity({ agentId, spaceName, conversationUuid });
+  return withAgentRegistry((registry) => {
+    const entry = registry.agents[agentId];
+    if (!entry || entry.spaceName !== spaceName) throw fail("AGENT_SPACE_NOT_REGISTERED");
+    if (entry.sweepPending && entry.sweepPending.conversationUuid !== conversationUuid) {
+      throw fail("AGENT_SPACE_SWEEP_PENDING");
+    }
+    if (!entry.sweepPending) {
+      entry.sweepPending = { conversationUuid, startedAt: new Date().toISOString() };
+      return { changed: true, value: structuredClone(entry.sweepPending) };
+    }
+    return { changed: false, value: structuredClone(entry.sweepPending) };
+  }, directory);
+}
+
+// Clear the recoverable sweep flag. Only a fully successful sweep may call this;
+// clearing a flag for a different conversation is a no-op, never an error.
+export async function clearAgentSweepPending({ agentId, spaceName, conversationUuid, directory } = {}) {
+  validateIdentity({ agentId, spaceName, conversationUuid });
+  return withAgentRegistry((registry) => {
+    const entry = registry.agents[agentId];
+    if (!entry || entry.spaceName !== spaceName) throw fail("AGENT_SPACE_NOT_REGISTERED");
+    if (entry.sweepPending?.conversationUuid === conversationUuid) {
+      delete entry.sweepPending;
+      return { changed: true, value: null };
+    }
+    return { changed: false, value: entry.sweepPending ?? null };
+  }, directory);
+}
+
 // #27 Batch 2 (ruling §3.2, frozen): a NEWLY created TaskSpace must be named
 // <project>-<purpose>-<AGENT_ID>-<YYYYMMDD>. AGENT_ID is the Agent's stable
 // identity — temporary session ids and omission are forbidden. The project and
@@ -143,4 +180,16 @@ export function isValidNewTaskSpaceName(name, agentId) {
       name === "" || agentId === "" || name.length > 120) return false;
   const escaped = agentId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   return new RegExp("^[A-Za-z0-9][A-Za-z0-9_.]*-[A-Za-z0-9][A-Za-z0-9_.]*-" + escaped + "-\\d{8}$").test(name);
+}
+
+// #27 re-review P1-1: the pre-claim gate shared by every creation/reuse entry
+// point (probe + dispatch-round). MUST be called before claimAgentSpace():
+// when the TaskSpace does not yet exist in ego, the frozen naming convention
+// is enforced fail-closed, so a violating new name can never enter the
+// registry (and from there borrow rebuild-space's LEDGER_PROOF creation).
+// An EXISTING space always passes — legacy names keep working, untouched.
+export function assertTaskSpaceNamingAllowed(space, agentId, spaceExists) {
+  if (!spaceExists && !isValidNewTaskSpaceName(space, agentId)) {
+    throw Object.assign(new Error("TASKSPACE_NAMING_VIOLATION_STOP"), { code: "TASKSPACE_NAMING_VIOLATION_STOP" });
+  }
 }

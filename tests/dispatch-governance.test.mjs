@@ -11,7 +11,7 @@ import { normalizeFastState } from "../monitor/state-schema.mjs";
 import { tick, acknowledge } from "../monitor/supervision-watchdog.mjs";
 import { shouldReviewStartupIdle } from "../monitor/supervision-policy.mjs";
 import { parseArgs, adaptTemplate, bindNewConversation, classifyManagerResult, loadAttachments, requireArmedDispatch, main, readEgoOutcome, ensureMonitor, authorizeSpaceRebuild, rebuildSpace, claimSpace, taskspaceOwnershipLost, announceTaskspaceOwnershipLoss, exitWatching, acknowledgeWake, releaseDelivered, managedAcknowledge, ackOwnershipEvidence, ACK_RESOLVED_OWNERSHIP_REQUIRED, ACK_AUDIT_FILE } from "../monitor/dispatch-manager.mjs";
-import { withAgentRegistry, isValidNewTaskSpaceName } from "../monitor/agent-space.mjs";
+import { withAgentRegistry, isValidNewTaskSpaceName, assertTaskSpaceNamingAllowed } from "../monitor/agent-space.mjs";
 import { taskspaceOperatorAction } from "../monitor/taskspace-takeover.mjs";
 import { checkDispatchTool } from "../plugins/chatgpt-dispatch-guard/hooks/policy.mjs";
 import { installConfig, install } from "../monitor/install-zcode-guard.mjs";
@@ -1621,6 +1621,12 @@ test("#27 B2: the frozen naming convention gates NEW-space creation only", async
   assert.match(round, /if \(!isValidNewTaskSpaceName\(SPACE, AGENT_ID\)\) abort\("TASKSPACE_NAMING_VIOLATION_STOP"\);\s*\n\s*task = await taskSpace\(SPACE, \{ profileId: profileCfg\.defaultProfileId \}\)/);
   // The violation keeps its own code instead of being masked as a registry loss.
   assert.match(probe, /error\?\.message === "TASKSPACE_NAMING_VIOLATION_STOP" \? "TASKSPACE_NAMING_VIOLATION_STOP"/);
+  // re-review P1-1: the shared pre-claim gate runs BEFORE claimAgentSpace in
+  // both entry points, after the read-only existence check — a violating new
+  // name can never reach the registry (behavioral coverage in
+  // tests/release-sweep.test.mjs).
+  assert.match(probe, /const spaceExists = existingSpaces\.some\(\(space\) => space\.taskId === SPACE \|\| space\.name === SPACE\);\s*\n\s*assertTaskSpaceNamingAllowed\(SPACE, AGENT_ID, spaceExists\);\s*\n\s*await claimAgentSpace\(\{ agentId: AGENT_ID, spaceName: SPACE \}\);/);
+  assert.match(round, /const spaceExists = existingSpaces\.some\(\(space\) => space\.taskId === SPACE \|\| space\.name === SPACE\);\s*\n\s*assertTaskSpaceNamingAllowed\(SPACE, AGENT_ID, spaceExists\);\s*\n\s*await claimAgentSpace\(\{ agentId: AGENT_ID, spaceName: SPACE \}\);/);
   // The legacy recovery path has NO naming gate: old spaces are recovered under
   // their proven original names (registry loss → managed rebuild-space).
   assert.doesNotMatch(rebuild, /isValidNewTaskSpaceName|TASKSPACE_NAMING/);
@@ -1633,39 +1639,60 @@ test("#27 B2: the probe boot line announces the stable Owner next to the space",
 });
 
 test("#27 B2: the release sweep keeps the conservative boundary and reports truthfully", async () => {
-  const source = await readFile(new URL("../monitor/release-agent-space.template.mjs", import.meta.url), "utf8");
-  // Close ONLY provably finished pages of THIS agent: registry-known conversation
-  // + terminal dispatch ledger.
-  assert.match(source, /const TERMINAL_DISPATCH = new Set\(\["COMPLETED", "ABORTED", "RELEASED"\]\)/);
-  assert.match(source, /TEMP_RESULT_PAGE_FINISHED_DISPATCH/);
-  assert.match(source, /assigned\.known\.some\(\(k\) => typeof k === "string" && k\.toLowerCase\(\) === uuid\.toLowerCase\(\)\)/);
-  // Conservative keeps: active dispatch, unproven ledger, unattributable pages,
-  // release-target residual (the managed close/finish path is exclusive there).
-  assert.match(source, /ACTIVE_DISPATCH_LEDGER/);
-  assert.match(source, /LEDGER_UNPROVEN/);
-  assert.match(source, /"OWNERSHIP_UNPROVEN"/);
-  assert.match(source, /RELEASE_TARGET_RESIDUAL/);
-  // The TaskSpace itself is never deleted; blank pages fall under OWNERSHIP_UNPROVEN.
-  assert.doesNotMatch(source, /deleteTaskSpace|removeTaskSpace|finish\(\{\s*\}\)/);
-  // Per-page audit lines carry page identity and reason; failures are audited too.
-  assert.match(source, /a-release-sweep-audit\.ndjson/);
-  assert.match(source, /action: "release-sweep"/);
-  assert.match(source, /page: \{ label: page\.label \?\? null, uuid: uuid \?\? null \}, decision, reason/);
-  assert.match(source, /"close-failed"/);
-  // A cleanup failure is reported truthfully, never disguised as a full release.
-  assert.match(source, /RESULT=AGENT_SPACE_RELEASE_SWEEP_FAILED closed=\$\{closed\} kept=\$\{kept\} failed=\$\{failed\}/);
-  // Last-conversation finish skips the sweep (finish already closed everything).
-  assert.match(source, /if \(result\.finished\) \{[\s\S]*?SPACE_FINISHED_BY_RELEASE/);
+  const unit = await readFile(new URL("../monitor/release-sweep.mjs", import.meta.url), "utf8");
+  // P1-4 unification: terminal = schema-validated terminal statuses only.
+  // "RELEASED" is not a real ledger state (nothing writes it and
+  // validateDispatchRecord rejects it) — the sweep set narrowed instead of
+  // loosening the frozen dispatch-state v2 validator.
+  assert.match(unit, /const TERMINAL_DISPATCH = new Set\(\["COMPLETED", "ABORTED"\]\)/);
+  assert.match(unit, /validateDispatchRecord\(record\)/);
+  assert.match(unit, /record\.conversationUuid\.toLowerCase\(\) !== String\(uuid\)\.toLowerCase\(\)/);
+  assert.match(unit, /record\.taskSpace !== space/);
+  // Conservative boundary: closed only provably finished pages of THIS agent.
+  assert.match(unit, /TEMP_RESULT_PAGE_FINISHED_DISPATCH/);
+  assert.match(unit, /ACTIVE_DISPATCH_LEDGER/);
+  assert.match(unit, /LEDGER_UNPROVEN/);
+  assert.match(unit, /OWNERSHIP_UNPROVEN/);
+  assert.match(unit, /RELEASE_TARGET_RESIDUAL/);
+  assert.match(unit, /PAGE_CLOSE_FAILED:/);
+  assert.match(unit, /PAGE_ENUMERATION_FAILED/);
+  // The TaskSpace itself is never deleted by the sweep.
+  assert.doesNotMatch(unit, /deleteTaskSpace|removeTaskSpace/);
+  // P1-2: finish applies only to a provably empty space; P1-3: the early exit
+  // requires no outstanding sweep.
+  assert.match(unit, /finished && hasTask && kept === 0 && failed === 0/);
+  assert.match(unit, /!entry\.releasePending && !entry\.sweepPending/);
+  const template = await readFile(new URL("../monitor/release-agent-space.template.mjs", import.meta.url), "utf8");
+  // P1-2: the managed finish closes ONLY the release-target page — no blanket
+  // task.finish({keep:[]}) that would destroy pages the boundary must keep.
+  assert.match(template, /finishSpace: async \(entry\) => \{\s*\n\s*if \(!task \|\| \(!target && !entry\.releasePending\?\.finished\)\) throw new Error\("COMPLETED_SPACE_NOT_FOUND"\);\s*\n\s*if \(target\) await target\.close\(\);\s*\n\s*\},/);
+  // The space fate is decided by the injectable gate, never unconditionally.
+  assert.match(template, /if \(shouldFinishSpace\(\{ finished: result\.finished, hasTask: Boolean\(task\), kept: sweep\.kept, failed: sweep\.failed \}\)\)/);
+  // P1-3: intent-first — sweepPending is recorded BEFORE the browser release,
+  // and cleared only in the all-success branch; the failure branch keeps it.
+  assert.ok(template.indexOf("await markAgentSweepPending(") < template.indexOf("const result = await releaseAgentConversation("),
+    "sweepPending must be marked before the browser release");
+  const tail = template.slice(template.indexOf("if (sweep.failed > 0) {"));
+  assert.match(tail, /RESULT=AGENT_SPACE_RELEASE_SWEEP_FAILED closed=\$\{sweep\.closed\} kept=\$\{sweep\.kept\} failed=\$\{sweep\.failed\}/);
+  assert.ok(tail.indexOf("await clearAgentSweepPending(") > tail.indexOf("} else {"),
+    "clearAgentSweepPending must live in the success branch only");
+  const failedBranch = tail.slice(0, tail.indexOf("} else {"));
+  assert.doesNotMatch(failedBranch, /clearAgentSweepPending/);
+  // A sweepPending rerun with the space already gone is the normal recovery
+  // shape; TASKSPACE_NOT_FOUND only fires when nothing justifies the absence.
+  assert.match(template, /!assigned\.sweepPending\) \{\s*\n\s*throw new Error\("TASKSPACE_NOT_FOUND"\);/);
   // Idempotency: the registry early-exit path (repeat release) stays a
   // zero-close success with zero browser calls.
-  const early = source.slice(source.indexOf("if (!assigned.active.includes(CONV)"), source.indexOf("const spaces = await listTaskSpaces();"));
+  const early = template.slice(template.indexOf("releaseHasNothingOutstanding(assigned, CONV)"), template.indexOf("const spaces = await listTaskSpaces();"));
   assert.match(early, /RESULT=AGENT_SPACE_RELEASED/);
-  assert.doesNotMatch(early, /task\.pages|page\.close|finish\(/);
-  // Manager wiring: the sweep failure is classified exit 2 with operator guidance.
+  assert.doesNotMatch(early, /task\.pages|page\.close|finish\(|listTaskSpaces/);
+  // Manager wiring: the sweep failure is classified exit 2 with operator guidance,
+  // and the new module ships through ensureMonitor's managed copies.
   const manager = await readFile(new URL("../monitor/dispatch-manager.mjs", import.meta.url), "utf8");
   assert.match(manager, /if \(released\.result === "AGENT_SPACE_RELEASE_SWEEP_FAILED"\)/);
   assert.match(manager, /OPERATOR_ACTION=release 临时页清理未完整完成/);
   assert.match(manager, /if \(p\.action === "release" && observation\.result === "AGENT_SPACE_RELEASE_SWEEP_FAILED"\)/);
+  assert.match(manager, /"release-sweep\.mjs"/);
 });
 
 test("#27 B2: claim audit rows carry owner attribution without touching the #33 chain", async () => {

@@ -69,23 +69,24 @@
 
 ## E-27 Batch 2：TaskSpace 归属治理回归合同（issue #27，V1 口径，规划师裁决 §三 + §六）
 
-**范围**：命名规范固化、probe owner 日志、release 清理扩展、claim 归属审计字段。前置：git pull 至含 Batch 2 的 commit；验收空间命名按 §1 规范新建（`-accept-` 前缀纪律与命名规范并用）。对应测试：`tests/dispatch-governance.test.mjs` #27 B2 用例。归属与清理合同正文见 `docs/OPERATIONS.md`。
+**范围**：命名规范固化、probe owner 日志、release 清理扩展、claim 归属审计字段。前置：git pull 至含 Batch 2（含复审修订）的 commit；验收空间命名按 §1 规范新建（`-accept-` 前缀纪律与命名规范并用）。对应测试：`tests/dispatch-governance.test.mjs` #27 B2 用例 + `tests/release-sweep.test.mjs` 行为级用例（注入假件）。归属与清理合同正文见 `docs/OPERATIONS.md`。
 
-1. **命名规范合同**（冻结形态 `<project>-<purpose>-<AGENT_ID>-<YYYYMMDD>`）：
+1. **命名规范合同**（冻结形态 `<project>-<purpose>-<AGENT_ID>-<YYYYMMDD>`，复审 P1-1 前置门）：
    - 合法名（含 AGENT_ID、8 位日期）通过校验；缺 AGENT_ID / 错 AGENT_ID / 非 8 位日期 / 超 120 字符 / 空 project/purpose 段拒绝；
-   - 校验只落**新建分支**（probe 自举 + dispatch-round Gate 1.5）：不匹配即 `TASKSPACE_NAMING_VIOLATION_STOP`，fail-closed 不创建；不匹配的**新**名无法借道 probe 失败→rebuild-space 绕过（rebuild 需 #31 授权链，无账本绑定即 DENIED）；
+   - 校验落**注册表写入之前**（共享门 `assertTaskSpaceNamingAllowed`）：probe 与 dispatch-round 先只读 `listTaskSpaces()` 判存在性——空间已存在 → 旧名复用放行；空间不存在且要走创建 → 不过规范即 `TASKSPACE_NAMING_VIOLATION_STOP`，**claim 都不做**：违规新名不产生任何注册表绑定，也无法借道 rebuild-space 的 LEDGER_PROOF 绕过（无账本绑定 + 无 allowlist 即 DENIED）；自举创建分支内保留第二道同款校验（存在性竞态防御）；
    - **旧空间名复用不受影响**：复用路径与 rebuild-space 恢复路径无命名校验，旧名照原名复用/恢复，不改名不迁移；
    - probe 启动行 `PROBE_BOOT version=... space=... mon=... owner=<AGENT_ID>` 带 Owner 标识。
-2. **release 清理合同**（受管 release 动作扩展 + `a-release-sweep-audit.ndjson` 逐页审计）：
-   - 应关：注册表 known 集合内、账本终态（COMPLETED/ABORTED/RELEASED）的其他会话页（`TEMP_RESULT_PAGE_FINISHED_DISPATCH`）；
-   - 保留：账本活跃页（`ACTIVE_DISPATCH_LEDGER`）、账本不可证页（`LEDGER_UNPROVEN`）、空白页与归属不明页（`OWNERSHIP_UNPROVEN`）、release 目标残留（`RELEASE_TARGET_RESIDUAL`，由既有受管路径独占处理）；
-   - TaskSpace 本身不删除；其他 Agent 页面/用户页面不可触碰（unmanaged tab 由既有 `assertManagedReleasePages` 前置拦截）；
-   - 清理失败（关页失败/枚举失败/审计写失败）→ `RESULT=AGENT_SPACE_RELEASE_SWEEP_FAILED` exit 2，真实上报不伪装完整 release，OPERATOR 指引幂等重跑；
-   - 幂等：无临时页 zero-close 算成功；重复 release 走注册表早退，零浏览器调用直接成功。
+2. **release 清理合同**（受管 release 动作扩展 + `a-release-sweep-audit.ndjson` 逐页审计；复审 P1-2/P1-3/P1-4 修订）：
+   - 应关：注册表 known 集合内、账本**结构合法且铻定一致**（`validateDispatchRecord` 通过 + conversationUuid/taskSpace 与页面匹配）、状态 ∈ {COMPLETED, ABORTED} 的其他会话页（`TEMP_RESULT_PAGE_FINISHED_DISPATCH`）。**RELEASED 不在终态集合**（无代码写入它、schema 校验器拒绝它；统一方式 = 收窄 sweep 终态集合，不放宽 schema，复审 P1-4）；
+   - 保留：账本活跃页（`ACTIVE_DISPATCH_LEDGER`）、账本缺失/残缺/铻定不一致页（`LEDGER_UNPROVEN`，裸 `{"status":"COMPLETED"}` 之类残缺对象不信任）、空白页与归属不明页（`OWNERSHIP_UNPROVEN`）、release 目标残留（`RELEASE_TARGET_RESIDUAL`，由既有受管路径独占处理）；
+   - **最后会话不再 `finish({keep:[]})` 一把全关**（复审 P1-2，ego finish 的 keep 保留语义无权威文档不赌）：受管 finish 分支只关目标页，其余页逐页分类；**仅当最后会话 + 零保留页 + 零失败**才 finish 销毁空空间；有任何保留页 → 空间带保留页继续存活，注册表侧记录 release 完成态，由归属者后续处置；
+   - TaskSpace 本身不删除（上一条的空空间 finish 除外）；其他 Agent 页面/用户页面不可触碰（unmanaged tab 由既有 `assertManagedReleasePages` 前置拦截）；
+   - 清理失败（关页失败/枚举失败/审计写失败）→ `RESULT=AGENT_SPACE_RELEASE_SWEEP_FAILED` exit 2，真实上报不伪装完整 release，OPERATOR 指引重跑；
+   - **sweepPending 可恢复状态**（复审 P1-3）：浏览器动作前 intent-first 写入注册表条目 `{conversationUuid, startedAt}`；失败后重跑 release 不走早退、真实重扫（需要浏览器），全部成功才清标志；完整成功后的重复 release 走注册表早退，零浏览器调用直接成功。
 3. **claim 归属字段合同**：claim 审计行含 `ownerAgentId`、`taskSpaceId`、`taskSpaceName`、`conversation:null`；模板回读证据（`SPACE_CLAIMED_TASK_ID/NAME`）缺失时字段如实留 null；**#33 授权链（ledger binding → spaceTaken → allowlist → deny）零变化**（`authorizeSpaceRebuild` 源码与既有用例原样通过）。
 4. **V1 口径记录**：第 0 步只读检查未发现 ego lite TaskSpace 自定义元数据 API（详见 `docs/OPERATIONS.md` §5），V2 待正式 API 能力证据后另行立项。
 
-**PASS 判据**：1~3 各条全部符合，且与 `tests/dispatch-governance.test.mjs` #27 B2 用例一一对应；实机验收时新建空间走规范名、旧空间原样复用一次、release 后核对 sweep 审计行与幂等重跑。
+**PASS 判据**：1~3 各条全部符合，且与 `tests/dispatch-governance.test.mjs` #27 B2 用例、`tests/release-sweep.test.mjs` 行为级用例一一对应；实机验收时新建空间走规范名、旧空间原样复用一次、release 后核对 sweep 审计行、sweepPending 失败重跑真实重扫一次、幂等重跑零浏览器副作用。
 
 ## E-20：composer 全机锁双 Agent 并发（issue #20）
 

@@ -51,7 +51,7 @@ const { selectUniqueConversationPage, isConversationUrl, probeOriginVerdict } = 
 const { TASKSPACE_TAKEOVER_SIGNAL, isTaskSpaceTakeover, isTaskspaceOwnershipLoss,
   assertAgentOwnedTaskSpace, taskspaceOperatorAction } =
   await import(pathToFileURL(MON + "/taskspace-takeover.mjs").href);
-const { isValidNewTaskSpaceName } = await import(pathToFileURL(MON + "/agent-space.mjs").href);
+const { isValidNewTaskSpaceName, assertTaskSpaceNamingAllowed } = await import(pathToFileURL(MON + "/agent-space.mjs").href);
 const { claimAgentSpace, reserveAgentPage } = await import(pathToFileURL(MON + "/agent-space.mjs").href);
 const { shouldReviewStartupIdle } = await import(pathToFileURL(MON + "/supervision-policy.mjs").href);
 
@@ -125,9 +125,18 @@ try {
 }
 
 try {
+  // #27 re-review P1-1: the naming gate precedes ANY registry write. A
+  // read-only listTaskSpaces() decides whether SPACE already exists (legacy
+  // reuse stays legal); a MISSING space must pass the frozen naming convention
+  // BEFORE claimAgentSpace(), so a violating new name can never enter the
+  // registry — and from there borrow rebuild-space's LEDGER_PROOF creation.
+  const existingSpaces = await listTaskSpaces();
+  const spaceExists = existingSpaces.some((space) => space.taskId === SPACE || space.name === SPACE);
+  assertTaskSpaceNamingAllowed(SPACE, AGENT_ID, spaceExists);
   await claimAgentSpace({ agentId: AGENT_ID, spaceName: SPACE });
 } catch (error) {
   await writeState({ probeFailed: true, recoveryFailed: true, errorCode: error.code || "AGENT_SPACE_REGISTRY_INVALID" });
+  await appendEvent(MON, error.code || "AGENT_SPACE_REGISTRY_INVALID", safeError(error)).catch(() => {});
   console.log("RESULT=" + (error.code || "AGENT_SPACE_REGISTRY_INVALID"));
   process.exit(0);
 }
