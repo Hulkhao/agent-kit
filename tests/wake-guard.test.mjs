@@ -171,16 +171,27 @@ test("corrupt key state JSON yields WAKE_STATUS_UNKNOWN, never health", async ()
 test("detection never throws: only ENOENT roots/files are absence, other failures are UNKNOWN", async () => {
   const now = 1_800_000_000_000;
   const { root } = await makeRoot(now); // empty conversations dir
-  // A missing root (ENOENT) plus a healthy empty root stay silent.
-  const { healthy } = await detectWakeAnomalies([join(root, "missing"), root], now);
-  assert.equal(healthy, true);
+  // WG-01A: a monitorRoot that does not exist at all is UNKNOWN, never health —
+  // ENOENT on the root cannot be distinguished from an unplugged/renamed root.
+  const missing = await detectWakeAnomalies([join(root, "missing")], now);
+  assert.equal(missing.healthy, false);
+  assert.equal(missing.events.length, 1);
+  assert.equal(missing.events[0].type, "WAKE_STATUS_UNKNOWN");
+  assert.equal(missing.events[0].detail, "ENOENT");
+  // WG-01A: a root that exists but has no conversations directory yet IS the
+  // benign empty state and stays healthy.
+  const bareRoot = await mkdtemp(join(tmpdir(), "ego-wake-bare-"));
+  const benign = await detectWakeAnomalies([bareRoot], now);
+  assert.equal(benign.healthy, true);
+  assert.deepEqual(benign.events, []);
+  await rm(bareRoot, { recursive: true, force: true });
   // A root that cannot be read at all is UNKNOWN, never health (WG-01).
   const failing = { readdir: async () => { throw new Error("boom"); }, readFile: async () => { throw new Error("boom"); } };
   const broken = await detectWakeAnomalies(["C:/whatever"], now, failing);
   assert.equal(broken.healthy, false);
   assert.equal(broken.events.length, 1);
   assert.equal(broken.events[0].type, "WAKE_STATUS_UNKNOWN");
-  assert.equal(broken.events[0].source, "C:\\whatever\\conversations");
+  assert.equal(broken.events[0].source, "C:/whatever");
   // Unreadable key-state files (non-ENOENT readFile failure) are UNKNOWN too.
   const unreadable = {
     readdir: async () => [{ isDirectory: () => true, name: uuid }],
@@ -205,7 +216,28 @@ test("monitorRoot permission denied (EACCES readdir) yields WAKE_STATUS_UNKNOWN,
   assert.equal(events.length, 1);
   assert.equal(events[0].type, "WAKE_STATUS_UNKNOWN");
   assert.equal(events[0].detail, "EACCES");
-  assert.match(events[0].source, /conversations$/);
+  // The failing root itself is named, not its conversations subdirectory.
+  assert.equal(events[0].source, "C:/guarded-root");
+});
+
+test("root readable but conversations unreadable (non-ENOENT) is UNKNOWN, not benign", async () => {
+  const now = 1_800_000_000_000;
+  const mixed = {
+    async readdir(path) {
+      if (String(path).endsWith("conversations")) { const e = new Error("EACCES"); e.code = "EACCES"; throw e; }
+      return readdir(path, { withFileTypes: true });
+    },
+    readFile,
+  };
+  const root = await mkdtemp(join(tmpdir(), "ego-wake-conv-eacces-"));
+  try {
+    const { healthy, events } = await detectWakeAnomalies([root], now, mixed);
+    assert.equal(healthy, false);
+    assert.equal(events.length, 1);
+    assert.equal(events[0].type, "WAKE_STATUS_UNKNOWN");
+    assert.equal(events[0].detail, "EACCES");
+    assert.match(events[0].source, /conversations$/);
+  } finally { await rm(root, { recursive: true, force: true }); }
 });
 
 test("one failing monitorRoot does not mask detection on the remaining roots", async () => {
@@ -245,6 +277,28 @@ test("structurally invalid state files violate their contract and yield WAKE_STA
     [{ "a-dispatch-state.json": dispatchRecord(now - 60 * 60_000, { status: "" }) }, "DISPATCH_STATUS_INVALID"],
     [{ "a-dispatch-state.json": dispatchRecord(now - 60 * 60_000, { updatedAt: "later" }) }, "DISPATCH_UPDATED_AT_INVALID"],
     [{ "a-dispatch-state.json": dispatchRecord("early") }, "DISPATCH_CREATED_AT_INVALID"],
+    // WG-01B: supervision ledgers missing the loadStatus() required fields.
+    [{ "a-supervision-status.json": supervisionStatus(null, { abnormalRounds: undefined }) }, "SUPERVISION_ABNORMAL_ROUNDS_INVALID"],
+    [{ "a-supervision-status.json": supervisionStatus(null, { abnormalRounds: -1 }) }, "SUPERVISION_ABNORMAL_ROUNDS_INVALID"],
+    [{ "a-supervision-status.json": supervisionStatus(null, { abnormalRounds: 1.5 }) }, "SUPERVISION_ABNORMAL_ROUNDS_INVALID"],
+    [{ "a-supervision-status.json": supervisionStatus(null, { progressAt: undefined }) }, "SUPERVISION_PROGRESS_AT_INVALID"],
+    [{ "a-supervision-status.json": supervisionStatus(null, { progressAt: "now" }) }, "SUPERVISION_PROGRESS_AT_INVALID"],
+    [{ "a-supervision-status.json": supervisionStatus(null, { lastReviewAt: undefined }) }, "SUPERVISION_LAST_REVIEW_AT_INVALID"],
+    [{ "a-supervision-status.json": supervisionStatus(null, { lastReviewAt: "never" }) }, "SUPERVISION_LAST_REVIEW_AT_INVALID"],
+    [{ "a-supervision-status.json": { schema: "ego-supervision/v1", abnormalRounds: 0, progressAt: 0, lastReviewAt: 0 } }, "SUPERVISION_PENDING_MISSING"],
+    // WG-01C: structurally incomplete terminal dispatch ledgers are corruption,
+    // never silently healthy.
+    [{ "a-dispatch-state.json": dispatchRecord(now - 60 * 60_000, { status: "COMPLETED", createdAt: undefined }) }, "DISPATCH_CREATED_AT_INVALID"],
+    [{ "a-dispatch-state.json": dispatchRecord(now - 60 * 60_000, { status: "COMPLETED", dispatchId: undefined }) }, "DISPATCH_ID_INVALID"],
+    [{ "a-dispatch-state.json": dispatchRecord(now - 60 * 60_000, { status: "COMPLETED", dispatchId: 7 }) }, "DISPATCH_ID_INVALID"],
+    [{ "a-dispatch-state.json": dispatchRecord(now - 60 * 60_000, { status: "COMPLETED", pageLabel: undefined }) }, "DISPATCH_PAGE_LABEL_INVALID"],
+    [{ "a-dispatch-state.json": dispatchRecord(now - 60 * 60_000, { status: "COMPLETED", taskSpace: undefined }) }, "DISPATCH_TASKSPACE_INVALID"],
+    [{ "a-dispatch-state.json": dispatchRecord(now - 60 * 60_000, { status: "COMPLETED", conversationUuid: undefined }) }, "DISPATCH_CONVERSATION_INVALID"],
+    [{ "a-dispatch-state.json": dispatchRecord(now - 60 * 60_000, { status: "COMPLETED", attempt: 0 }) }, "DISPATCH_ATTEMPT_INVALID"],
+    [{ "a-dispatch-state.json": dispatchRecord(now - 60 * 60_000, { status: "COMPLETED", attempt: 0.5 }) }, "DISPATCH_ATTEMPT_INVALID"],
+    [{ "a-dispatch-state.json": dispatchRecord(now - 60 * 60_000, { status: "COMPLETED", baselineComposerLength: -1 }) }, "DISPATCH_BASELINE_LENGTH_INVALID"],
+    [{ "a-dispatch-state.json": dispatchRecord(now - 60 * 60_000, { status: "COMPLETED", baselineTailRole: 5 }) }, "DISPATCH_BASELINE_ROLE_INVALID"],
+    [{ "a-dispatch-state.json": dispatchRecord(now - 60 * 60_000, { status: "COMPLETED", baselineTailKey: 5 }) }, "DISPATCH_BASELINE_KEY_INVALID"],
   ];
   for (const [files, expectedDetail] of cases) {
     const { root } = await makeRoot(now, files);

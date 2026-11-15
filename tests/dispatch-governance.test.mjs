@@ -811,6 +811,40 @@ test("#25 WG-03: RELEASE_PENDING exits through the durable watch-exit ledger (re
   }
 });
 
+test("#25 WG-03A: ensureMonitor failure after watch identity confirmation exits through the durable ledger", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ego-ensuremon-fail-"));
+  const dir = join(root, "conversations", uuid);
+  const logs = [];
+  const originalLog = console.log;
+  try {
+    await mkdir(dir, { recursive: true });
+    // A terminal COMPLETED dispatch whose identity requireArmedDispatch accepts.
+    const record = { schema: "ego-dispatch-state/v2", dispatchId: uuid, conversationUuid: uuid,
+      taskSpace: "GDC-执行A", pageLabel: "p1", status: "COMPLETED",
+      baselineTailKey: null, baselineTailRole: null, baselineComposerLength: 0,
+      attempt: 1, createdAt: Date.now(), payload_sha256: sha256("任务") };
+    await writeFile(join(dir, "a-dispatch-state.json"), JSON.stringify(record));
+    // A managed module copy target that is a directory makes ensureMonitor's
+    // refresh fail with EISDIR after the watch identity was already confirmed.
+    await mkdir(join(dir, "agent-space.mjs"));
+    console.log = (line) => logs.push(String(line));
+    const code = await main(["watch", "--monitor-dir", root, "--agent-id", "gdc-a",
+      "--space", "GDC-执行A", "--conversation", uuid]);
+    assert.equal(code, 2);
+    const marker = JSON.parse(await readFile(join(dir, WATCH_EXIT_FILE), "utf8"));
+    assert.equal(marker.schema, "ego-watch-exit/v1");
+    assert.equal(marker.reason, "WATCH_EXCEPTION");
+    assert.equal(marker.exitCode, 2);
+    assert.equal(marker.acknowledgedAt, null);
+    assert.equal(marker.ackAction, null);
+    assert.ok(logs.some((line) => line.startsWith("RESULT=WATCH_EXCEPTION code=EISDIR wakeId=")),
+      "wake line must announce WATCH_EXCEPTION with the failing ensureMonitor code: " + JSON.stringify(logs));
+  } finally {
+    console.log = originalLog;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("#25: every watch exit-2 path persists the ego-watch-exit ledger and announces its wakeId", async () => {
   const source = await readFile(new URL("../monitor/dispatch-manager.mjs", import.meta.url), "utf8");
   const watch = source.slice(source.indexOf('if (p.action === "watch")'), source.indexOf('if (p.action === "probe") await writeFile'));

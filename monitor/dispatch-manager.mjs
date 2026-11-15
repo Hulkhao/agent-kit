@@ -526,7 +526,21 @@ export async function main(args = process.argv.slice(2)) {
   // leave both the registry and the user's open tabs untouched.
   const armed = ["watch", "probe"].includes(p.action)
     ? await requireArmedDispatch(dir, p, p.action) : null;
-  await ensureMonitor(dir);
+  // After requireArmedDispatch() the watch identity (conversation, space,
+  // status) is confirmed, so an ensureMonitor() failure is catchable watch
+  // scope (WG-03A): it must leave the durable wake marker via exitWatching —
+  // a bare MANAGER_FAILURE on a possibly terminal dispatch has no marker and
+  // no WATCH_STALE backstop. Other actions keep MANAGER_FAILURE semantics.
+  if (p.action === "watch") {
+    try { await ensureMonitor(dir); }
+    catch (error) {
+      return exitWatching(dir, "WATCH_EXCEPTION", {
+        detail: "code=" + ((error && (error.code || error.message)) || "UNKNOWN"),
+      });
+    }
+  } else {
+    await ensureMonitor(dir);
+  }
   p.monitorDir = dir;
   if (p.recoverOnly && p.archivedRecord) {
     const originalPayload = await readFile(resolve(p.message), "utf8");

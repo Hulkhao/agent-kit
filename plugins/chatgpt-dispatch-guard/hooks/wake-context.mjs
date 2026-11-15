@@ -104,8 +104,16 @@ function watchExitStructureError(marker) {
 function supervisionStatusStructureError(status) {
   if (!status || typeof status !== "object" || Array.isArray(status)) return "SUPERVISION_STATUS_INVALID";
   if (status.schema !== SUPERVISION_SCHEMA) return "SUPERVISION_SCHEMA_INVALID";
+  // loadStatus() contract (supervision-watchdog.mjs): the watchdog never writes
+  // a ledger without these three fields being valid.
+  if (!Number.isInteger(status.abnormalRounds) || status.abnormalRounds < 0) return "SUPERVISION_ABNORMAL_ROUNDS_INVALID";
+  if (!Number.isFinite(status.progressAt)) return "SUPERVISION_PROGRESS_AT_INVALID";
+  if (!Number.isFinite(status.lastReviewAt)) return "SUPERVISION_LAST_REVIEW_AT_INVALID";
+  // A missing pending property is NOT the same as pending: null — the watchdog's
+  // empty() always writes pending: null explicitly.
+  if (!("pending" in status)) return "SUPERVISION_PENDING_MISSING";
   const pending = status.pending;
-  if (pending === null || pending === undefined) return null; // no alarm armed
+  if (pending === null) return null; // no alarm armed
   if (typeof pending !== "object" || Array.isArray(pending)) return "SUPERVISION_PENDING_INVALID";
   if (typeof pending.id !== "string" || pending.id === "") return "SUPERVISION_PENDING_ID_INVALID";
   if (!Number.isFinite(pending.issuedAt)) return "SUPERVISION_PENDING_ISSUED_AT_INVALID";
@@ -117,8 +125,19 @@ function dispatchStructureError(record) {
   if (record.schema !== DISPATCH_SCHEMA) return "DISPATCH_SCHEMA_INVALID";
   // Structure only: status is any non-empty string; no status whitelist here.
   if (typeof record.status !== "string" || record.status === "") return "DISPATCH_STATUS_INVALID";
+  // validateDispatchRecord() contract (dispatch-state.mjs): identity, baseline
+  // and attempt fields are always present with these types — a terminal record
+  // missing them is corruption and must surface as UNKNOWN, never silent health.
+  if (typeof record.dispatchId !== "string") return "DISPATCH_ID_INVALID";
+  if (typeof record.conversationUuid !== "string") return "DISPATCH_CONVERSATION_INVALID";
+  if (typeof record.taskSpace !== "string") return "DISPATCH_TASKSPACE_INVALID";
+  if (typeof record.pageLabel !== "string") return "DISPATCH_PAGE_LABEL_INVALID";
+  if (typeof record.baselineTailRole !== "string" && record.baselineTailRole !== null) return "DISPATCH_BASELINE_ROLE_INVALID";
+  if (typeof record.baselineTailKey !== "string" && record.baselineTailKey !== null) return "DISPATCH_BASELINE_KEY_INVALID";
+  if (!Number.isFinite(record.baselineComposerLength) || record.baselineComposerLength < 0) return "DISPATCH_BASELINE_LENGTH_INVALID";
+  if (!Number.isInteger(record.attempt) || record.attempt < 1) return "DISPATCH_ATTEMPT_INVALID";
   if (("updatedAt" in record) && !Number.isFinite(record.updatedAt)) return "DISPATCH_UPDATED_AT_INVALID";
-  if (("createdAt" in record) && !Number.isFinite(record.createdAt)) return "DISPATCH_CREATED_AT_INVALID";
+  if (!Number.isFinite(record.createdAt)) return "DISPATCH_CREATED_AT_INVALID";
   return null;
 }
 
@@ -223,20 +242,31 @@ async function scanConversation(dir, name, now, io, events) {
 
 // Enumerate <root>/conversations/*/ and collect wake anomalies. Any single
 // directory or file failure is tolerated: detection never throws, and a failed
-// read of key state surfaces as WAKE_STATUS_UNKNOWN, never as health. A root
-// whose conversations directory cannot be read at all is also UNKNOWN — only
-// ENOENT (a configured root that has no conversations directory yet) is a
-// benign empty state (WG-01). One failing root never masks the other roots.
+// read of key state surfaces as WAKE_STATUS_UNKNOWN, never as health.
+//
+// Root vs conversations distinction (WG-01A): the configured monitorRoot is
+// verified to exist and be readable FIRST. A missing or unreadable root is
+// UNKNOWN — it must never pass as a benign empty state. Only after the root is
+// proven readable may a missing conversations subdirectory count as the benign
+// "root configured but not yet created" state; any other conversations read
+// failure is UNKNOWN. One failing root never masks the other roots.
 export async function detectWakeAnomalies(monitorRoots, now, io = defaultIo) {
   const events = [];
   for (const root of Array.isArray(monitorRoots) ? monitorRoots : []) {
+    try {
+      await io.readdir(root, { withFileTypes: true });
+    } catch (error) {
+      // The whole monitorRoot is absent or unreadable (ENOENT/EACCES/...):
+      // fail closed as UNKNOWN.
+      events.push(unknownEvent(root, error?.code || "READ_FAILED"));
+      continue;
+    }
     const conversationsDir = join(root, "conversations");
     let entries;
     try {
       entries = await io.readdir(conversationsDir, { withFileTypes: true });
     } catch (error) {
-      if (error?.code === "ENOENT") continue; // configured but not yet created: benign empty state
-      // Unreadable root (EACCES/EPERM/EIO/...): fail closed as UNKNOWN.
+      if (error?.code === "ENOENT") continue; // root exists, conversations not yet created: benign empty state
       events.push(unknownEvent(conversationsDir, error?.code || "READ_FAILED"));
       continue;
     }
