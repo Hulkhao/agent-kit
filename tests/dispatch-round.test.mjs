@@ -384,3 +384,158 @@ test("#30: real composer callback extracts top-level paragraphs for strict URL r
   composer.childNodes = [{ nodeType: 1, tagName: "DIV", innerText: original }];
   assert.equal(readbackMatches(original, composerReadbackText(await evaluate("read"))), false);
 });
+
+// ---- #30 closure: edge cases for the landed readback repair (#30 + #23-3) ----
+
+test("#30: URL payload strict mode — paragraph join matches, raw double-newline artifact fails closed", async () => {
+  const { composerReadbackText, readbackMatches, readbackMode } = await import("../monitor/dispatch-state.mjs");
+  const payload = "打开 https://example.com/admin?tab=1\n第二行 URL 说明";
+  assert.equal(readbackMode(payload), "strict");
+  // Verified top-level <p> structure: ProseMirror's per-paragraph readback reconstructs the
+  // single newline the payload contains, despite the raw innerText carrying a block-boundary
+  // double-newline artifact.
+  const good = {
+    raw: "打开 https://example.com/admin?tab=1\n\n第二行 URL 说明",
+    paragraphs: ["打开 https://example.com/admin?tab=1", "第二行 URL 说明"],
+  };
+  assert.equal(readbackMatches(payload, composerReadbackText(good), "strict"), true);
+  // The same composer WITHOUT a recognized paragraph structure keeps the raw artifact
+  // ("…\n\n…") — strict fidelity must reject it, never normalize on the caller's behalf.
+  assert.equal(readbackMatches(payload, composerReadbackText({ raw: good.raw, paragraphs: null }), "strict"), false);
+  assert.equal(readbackMatches(payload, composerReadbackText(good.raw), "strict"), false);
+  // Strict also rejects reordering: paragraph order is part of the payload's identity.
+  const swapped = {
+    raw: "第二行 URL 说明\n\n打开 https://example.com/admin?tab=1",
+    paragraphs: ["第二行 URL 说明", "打开 https://example.com/admin?tab=1"],
+  };
+  assert.equal(readbackMatches(payload, composerReadbackText(swapped), "strict"), false);
+});
+
+test("#30: CJK multi-line payload matches via per-paragraph single-newline reconstruction", async () => {
+  const { composerReadbackText, readbackMatches } = await import("../monitor/dispatch-state.mjs");
+  const payload = "修复 https://example.com/issue-30\n中文第二行：逐段回读\n第三行结尾";
+  const snapshot = {
+    raw: "修复 https://example.com/issue-30\n\n中文第二行：逐段回读\n\n第三行结尾",
+    paragraphs: ["修复 https://example.com/issue-30", "中文第二行：逐段回读", "第三行结尾"],
+  };
+  assert.equal(readbackMatches(payload, composerReadbackText(snapshot), "strict"), true);
+  // A stray trailing CR inside one paragraph stays CRLF-equivalent in strict mode.
+  const crlf = {
+    raw: "修复 https://example.com/issue-30\r\n\r\n中文第二行：逐段回读\r\n\r\n第三行结尾",
+    paragraphs: ["修复 https://example.com/issue-30\r", "中文第二行：逐段回读", "第三行结尾"],
+  };
+  assert.equal(readbackMatches(payload, composerReadbackText(crlf), "strict"), true);
+  // One character dropped inside a paragraph → strict mismatch, no whitespace forgiveness.
+  const drifted = {
+    ...snapshot,
+    paragraphs: ["修复 https://example.com/issue-30", "中文第二行：逐段回读!", "第三行结尾"],
+  };
+  assert.equal(readbackMatches(payload, composerReadbackText(drifted), "strict"), false);
+});
+
+test("#23-3: block-boundary double-newline collapse matches in normalized mode and classifies INSERTED", async () => {
+  const { readbackMatches, classifyChunkReadback } = await import("../monitor/dispatch-state.mjs");
+  const payload = "前缀段落\n\n后续段落";
+  const collapsed = "前缀段落后续段落"; // ProseMirror removed BOTH newlines at the pasted chunk boundary
+  assert.equal(readbackMatches(payload, collapsed, "normalized"), true);
+  assert.equal(classifyChunkReadback("前缀段落", payload, collapsed, "normalized"), "INSERTED");
+  // The identical shape must NOT pass the strict gate — the normalized relaxation never
+  // leaks into sensitive payloads.
+  assert.equal(readbackMatches(payload, collapsed, "strict"), false);
+  // Unrelated text remains a mismatch even under normalized comparison.
+  assert.equal(readbackMatches(payload, "前缀段落别的段落", "normalized"), false);
+});
+
+test("#30: strict readback on unrecognized DOM drift yields MISMATCH (fidelity gate refuses)", async () => {
+  const { readbackMatches, classifyChunkReadback } = await import("../monitor/dispatch-state.mjs");
+  const payload = "step1 https://a.example/x\nstep2";
+  // Raw innerText with a block-boundary artifact and no paragraph structure.
+  const artifact = "step1 https://a.example/x\n\nstep2";
+  assert.equal(readbackMatches(payload, artifact, "strict"), false);
+  assert.equal(classifyChunkReadback("", payload, artifact, "strict"), "MISMATCH");
+  // Plain content drift is equally refused.
+  const drifted = "step1 https://a.example/x\nstep2 补句";
+  assert.equal(classifyChunkReadback("", payload, drifted, "strict"), "MISMATCH");
+  // Contrast: exact and CRLF-equivalent readbacks still classify normally in strict mode.
+  assert.equal(classifyChunkReadback("", payload, payload, "strict"), "INSERTED");
+  assert.equal(classifyChunkReadback("", payload, "step1 https://a.example/x\r\nstep2", "strict"), "INSERTED");
+  assert.equal(classifyChunkReadback(payload, payload + "\nstep3", payload, "strict"), "NO_EFFECT");
+});
+
+test("#30: verifyDraftOwnership fidelity — sensitive whitespace loss rejected, compact prefix owned, historical SHA256 only", async () => {
+  const { verifyDraftOwnership } = await import("../monitor/dispatch-state.mjs");
+  const { createHash } = await import("node:crypto");
+
+  // Sensitive payload (URL): newline lost at a chunk edge → NOT owned. The compact
+  // whitespace-loss fallback is reserved for plain prose and must never apply here.
+  const sensitive = "请访问 https://example.com/docs\n参数 --mode=strict";
+  const lostNewline = "请访问 https://example.com/docs参数 --mode=strict";
+  assert.deepEqual(verifyDraftOwnership({ draft: lostNewline, payload: sensitive }),
+    { owned: false, kind: "foreign", reason: "DRAFT_NOT_OWNED" });
+  // Byte-identical raw content (CRLF-equivalent) is still owned in full.
+  assert.deepEqual(verifyDraftOwnership({ draft: "请访问 https://example.com/docs\r\n参数 --mode=strict", payload: sensitive }),
+    { owned: true, kind: "full" });
+
+  // Plain prose: whitespace loss at a chunk edge keeps an in-order compact prefix owned.
+  const plain = "第一段落内容\n第二段落内容\n第三段落内容";
+  assert.deepEqual(verifyDraftOwnership({ draft: "第一段落内容第二段落内", payload: plain }),
+    { owned: true, kind: "prefix" });
+  // Reordered fragments stay foreign even for plain prose.
+  assert.deepEqual(verifyDraftOwnership({ draft: "第二段落内容第一段落内", payload: plain }),
+    { owned: false, kind: "foreign", reason: "DRAFT_NOT_OWNED" });
+
+  // Historical identity: only the SHA256 of the full CRLF-normalized draft proves ownership.
+  const historical = { payload_sha256: createHash("sha256").update("历史草稿全文\n第二行", "utf8").digest("hex") };
+  assert.deepEqual(verifyDraftOwnership({ draft: "历史草稿全文\n第二行", record: historical }),
+    { owned: true, kind: "historical-identity" });
+  assert.deepEqual(verifyDraftOwnership({ draft: "历史草稿全文\r\n第二行", record: historical }),
+    { owned: true, kind: "historical-identity" });
+  assert.equal(verifyDraftOwnership({ draft: "历史草稿全文\n第二行改动", record: historical }).owned, false);
+  assert.equal(verifyDraftOwnership({
+    draft: "历史草稿全文\n第二行",
+    record: { payload_sha256: createHash("sha256").update("另一份历史草稿", "utf8").digest("hex") },
+  }).owned, false);
+
+  // In-flight interlock: once the ledger reached SEND_STARTED, even the exact draft is locked.
+  assert.deepEqual(verifyDraftOwnership({ draft: sensitive, payload: sensitive, record: { status: "SEND_STARTED" } }),
+    { owned: false, kind: "send-started-locked",
+      reason: "SEND_STARTED_LOCKED_ACCEPTANCE_RECONCILIATION_REQUIRED" });
+});
+
+test("#30: recover-draft ledger semantics — only a proved PREPARED aborts to ABORTED, everything else is rejected", async () => {
+  const { abortPreparedDispatch, writeJsonAtomic } = await import("../monitor/dispatch-state.mjs");
+  const { mkdtemp, readFile, rm } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const root = await mkdtemp(join(tmpdir(), "ego-recover-draft-"));
+  const dispatchId = "30aaaaaa-3030-4030-8030-000000000030";
+  const ledger = join(root, "a-dispatch-state.json");
+  const record = (status) => ({ schema: "ego-dispatch-state/v2", dispatchId,
+    conversationUuid: dispatchId, taskSpace: "GDC-执行A", pageLabel: "p1",
+    baselineTailKey: null, baselineTailRole: null, baselineComposerLength: 0,
+    attempt: 1, createdAt: Date.now(), payload_sha256: null, payload_bytes: null,
+    composer_baseline: null, status });
+  try {
+    await writeJsonAtomic(ledger, record("PREPARED"));
+    const aborted = await abortPreparedDispatch(root, dispatchId);
+    assert.equal(aborted.status, "ABORTED");
+    assert.equal(aborted.reasonCode, "OWNED_DRAFT_RECOVERED");
+    const events = await readFile(join(root, "a-fast-events.ndjson"), "utf8");
+    assert.match(events, /"event":"ABORTED"/);
+    assert.match(events, /"attempt":1/);
+    // The recovery is single-shot: an ABORTED draft cannot be aborted again.
+    await assert.rejects(() => abortPreparedDispatch(root, dispatchId),
+      /DISPATCH_TRANSITION_REJECTED:ABORTED->ABORTED/);
+    // A draft that was already sent (or is awaiting reconciliation) can never be "recovered".
+    for (const status of ["SEND_STARTED", "ACCEPTED", "UNCERTAIN", "RETRY_AUTHORIZED"]) {
+      await writeJsonAtomic(ledger, record(status));
+      await assert.rejects(() => abortPreparedDispatch(root, dispatchId),
+        new RegExp(`DISPATCH_TRANSITION_REJECTED:${status}->ABORTED`));
+    }
+    // Ledger identity mismatch fails closed.
+    await writeJsonAtomic(ledger, record("PREPARED"));
+    await assert.rejects(() => abortPreparedDispatch(root, "other-dispatch-id"), /DISPATCH_ID_MISMATCH/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
