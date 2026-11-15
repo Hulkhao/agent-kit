@@ -10,8 +10,9 @@
 // Double insurance against blocking the same stop flow repeatedly:
 // 1. stop_hook_active === true -> never block (the host is already continuing
 //    because of a previous Stop block).
-// 2. a stopBlockAt timestamp in the rate-limit ledger suppresses further
-//    blocks for 90s (one forced continuation per stop flow).
+// 2. a per-session stopBlocks entry in the rate-limit ledger suppresses further
+//    blocks for 90s (one forced continuation per stop flow, scoped to the
+//    session that raised it — different sessions never suppress each other).
 import { readFile, writeFile, rename } from "node:fs/promises";
 import {
   detectWakeAnomalies, summarizeEvents, readMonitorRoots,
@@ -35,10 +36,14 @@ try {
   for await (const chunk of process.stdin) raw += chunk;
   const event = JSON.parse(raw);
   if (event?.stop_hook_active === true) process.exit(0); // insurance 1
+  // Session-scoped cooldown (WG-04): the ledger key is the ZCode session id, so
+  // each session's 90s cooldown is independent. Events without an id share the
+  // "global" fallback key (which also receives migrated pre-session ledgers).
+  const sessionId = event?.sessionId ?? event?.session_id ?? "global";
   let ledger;
   try { ledger = parseLedger(await readFile(ledgerPath, "utf8")); }
   catch { ledger = parseLedger(null); } // unreadable ledger: cooldown unenforceable
-  if (stopCooldownActive(ledger, Date.now())) process.exit(0); // insurance 2
+  if (stopCooldownActive(ledger, sessionId, Date.now())) process.exit(0); // insurance 2
   const profile = JSON.parse(await readFile(profilePath, "utf8"));
   const roots = readMonitorRoots(profile);
   if (!roots.length) process.exit(0); // config gap, not health; nothing to hand off
@@ -48,7 +53,7 @@ try {
   // Record the block before emitting it. If the ledger write fails, blocking
   // still happens — the worst case is one extra continuation, never a silent
   // pass over an unhandled wake.
-  await saveLedger(withStopBlock(ledger, Date.now())).catch(() => {});
+  await saveLedger(withStopBlock(ledger, sessionId, Date.now())).catch(() => {});
   process.stdout.write(JSON.stringify({ decision: "block", reason: "[AGENT_KIT_WAKE_GUARD] " + summary }));
 } catch {
   // Unparseable input: stop_hook_active is unknown, so blocking could loop the

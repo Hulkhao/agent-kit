@@ -55,14 +55,19 @@ export function readMonitorRoots(profile) {
 }
 
 function readJson(io, path) {
-  // Returns: { present:false } for ENOENT, { present:true, value } for parsed
-  // JSON, { present:true, error } for any other failure (never throws).
+  // Returns: { present:false } ONLY for ENOENT (file absent), { present:true,
+  // value } for parsed JSON, { present:true, error } for any other failure
+  // (never throws). Non-ENOENT read errors (EACCES/EPERM/EIO/...) mean
+  // "exists but unreadable" and MUST surface as WAKE_STATUS_UNKNOWN — a read
+  // failure is never allowed to pass as absence/health (WG-01).
   return io.readFile(path, "utf8").then(
     (text) => {
       try { return { present: true, value: JSON.parse(text) }; }
       catch { return { present: true, error: "JSON_PARSE_FAILED" }; }
     },
-    (error) => ({ present: false, error: error?.code ?? "READ_FAILED" }),
+    (error) => error?.code === "ENOENT"
+      ? { present: false }
+      : { present: true, error: error?.code || "READ_FAILED" },
   );
 }
 
@@ -70,57 +75,121 @@ function unknownEvent(source, detail) {
   return { type: "WAKE_STATUS_UNKNOWN", key: `unknown:${source}`, source, detail };
 }
 
+// Structured state validation (WG-01): a file that parses but violates its
+// frozen contract is corruption, not health — it always yields
+// WAKE_STATUS_UNKNOWN. Validation checks STRUCTURE only; classification (e.g.
+// which dispatch statuses are terminal) stays separate.
+const UUID_PATTERN = /^[a-f\d]{8}-[a-f\d]{4}-[1-8][a-f\d]{3}-[89ab][a-f\d]{3}-[a-f\d]{12}$/i;
+const ACK_ACTIONS = new Set(["investigated", "resolved"]);
+// Frozen schema pins, mirrored from their writers (monitor/supervision-watchdog.mjs
+// SCHEMA and monitor/dispatch-state.mjs) — this module stays self-contained and
+// imports nothing from monitor/**.
+const SUPERVISION_SCHEMA = "ego-supervision/v1";
+const DISPATCH_SCHEMA = "ego-dispatch-state/v2";
+
+function watchExitStructureError(marker) {
+  if (!marker || typeof marker !== "object" || Array.isArray(marker)) return "WATCH_EXIT_MARKER_INVALID";
+  if (marker.schema !== WATCH_EXIT_SCHEMA) return "WATCH_EXIT_SCHEMA_INVALID";
+  if (typeof marker.wakeId !== "string" || !UUID_PATTERN.test(marker.wakeId)) return "WATCH_EXIT_WAKE_ID_INVALID";
+  if (!Number.isFinite(marker.issuedAt)) return "WATCH_EXIT_ISSUED_AT_INVALID";
+  if (marker.exitCode !== 2) return "WATCH_EXIT_EXIT_CODE_INVALID";
+  // Un-acked: both ack fields null. Acked: finite acknowledgedAt plus a legal
+  // action. Any other combination violates ego-watch-exit/v1.
+  const unacked = marker.acknowledgedAt === null && marker.ackAction === null;
+  const acked = Number.isFinite(marker.acknowledgedAt) && ACK_ACTIONS.has(marker.ackAction);
+  if (!unacked && !acked) return "WATCH_EXIT_ACK_COMBINATION_INVALID";
+  return null;
+}
+
+function supervisionStatusStructureError(status) {
+  if (!status || typeof status !== "object" || Array.isArray(status)) return "SUPERVISION_STATUS_INVALID";
+  if (status.schema !== SUPERVISION_SCHEMA) return "SUPERVISION_SCHEMA_INVALID";
+  const pending = status.pending;
+  if (pending === null || pending === undefined) return null; // no alarm armed
+  if (typeof pending !== "object" || Array.isArray(pending)) return "SUPERVISION_PENDING_INVALID";
+  if (typeof pending.id !== "string" || pending.id === "") return "SUPERVISION_PENDING_ID_INVALID";
+  if (!Number.isFinite(pending.issuedAt)) return "SUPERVISION_PENDING_ISSUED_AT_INVALID";
+  return null;
+}
+
+function dispatchStructureError(record) {
+  if (!record || typeof record !== "object" || Array.isArray(record)) return "DISPATCH_STATE_INVALID";
+  if (record.schema !== DISPATCH_SCHEMA) return "DISPATCH_SCHEMA_INVALID";
+  // Structure only: status is any non-empty string; no status whitelist here.
+  if (typeof record.status !== "string" || record.status === "") return "DISPATCH_STATUS_INVALID";
+  if (("updatedAt" in record) && !Number.isFinite(record.updatedAt)) return "DISPATCH_UPDATED_AT_INVALID";
+  if (("createdAt" in record) && !Number.isFinite(record.createdAt)) return "DISPATCH_CREATED_AT_INVALID";
+  return null;
+}
+
 async function scanConversation(dir, name, now, io, events) {
   // a-watch-exit.json: an un-acknowledged watch exit is reported immediately
-  // (no grace threshold). Parse failure is UNKNOWN, never health.
-  const exitRead = await readJson(io, join(dir, "a-watch-exit.json"));
+  // (no grace threshold). Parse or structure failure is UNKNOWN, never health.
+  const exitFile = join(dir, "a-watch-exit.json");
+  const exitRead = await readJson(io, exitFile);
   if (exitRead.present && exitRead.error) {
-    events.push(unknownEvent(join(dir, "a-watch-exit.json"), exitRead.error));
-  } else if (exitRead.present && exitRead.value?.acknowledgedAt === null) {
-    const issuedAt = exitRead.value.issuedAt;
-    events.push({
-      type: "WAKE_PENDING",
-      key: `wake:${exitRead.value.wakeId ?? name}`,
-      wakeId: exitRead.value.wakeId ?? null,
-      reason: exitRead.value.reason ?? null,
-      ageMs: Number.isFinite(issuedAt) ? Math.max(0, now - issuedAt) : null,
-      source: dir,
-    });
-  }
-
-  // a-supervision-status.json: pending older than 60s.
-  const statusRead = await readJson(io, join(dir, "a-supervision-status.json"));
-  const status = statusRead.present && !statusRead.error ? statusRead.value : null;
-  if (statusRead.present && statusRead.error) {
-    events.push(unknownEvent(join(dir, "a-supervision-status.json"), statusRead.error));
-  } else if (status?.pending) {
-    const issuedAt = status.pending.issuedAt;
-    if (!Number.isFinite(issuedAt)) {
-      events.push(unknownEvent(join(dir, "a-supervision-status.json"), "PENDING_ISSUED_AT_INVALID"));
-    } else if (now - issuedAt >= SUPERVISION_PENDING_MS) {
+    events.push(unknownEvent(exitFile, exitRead.error));
+  } else if (exitRead.present) {
+    const marker = exitRead.value;
+    const structureError = watchExitStructureError(marker);
+    if (structureError) {
+      events.push(unknownEvent(exitFile, structureError));
+    } else if (marker.acknowledgedAt === null) {
       events.push({
-        type: "SUPERVISION_PENDING",
-        key: `wake:${status.pending.id ?? name}`,
-        wakeId: status.pending.id ?? null,
-        reason: status.pending.reason ?? null,
-        ageMs: Math.max(0, now - issuedAt),
+        type: "WAKE_PENDING",
+        key: `wake:${marker.wakeId ?? name}`,
+        wakeId: marker.wakeId ?? null,
+        reason: marker.reason ?? null,
+        ageMs: Number.isFinite(marker.issuedAt) ? Math.max(0, now - marker.issuedAt) : null,
         source: dir,
       });
     }
   }
 
-  // Dispatch ledger: terminal or missing -> silence; active with unreadable
-  // key state -> UNKNOWN; ACCEPTED with stale fast state AND a dispatch
-  // record that is itself older than the stale window -> WATCH_STALE. The
-  // record-timestamp clause suppresses false positives for a dispatch that
+  // a-supervision-status.json: pending older than 60s; malformed ledger is
+  // UNKNOWN (schema pin + pending.id/pending.issuedAt structure).
+  const statusFile = join(dir, "a-supervision-status.json");
+  const statusRead = await readJson(io, statusFile);
+  if (statusRead.present && statusRead.error) {
+    events.push(unknownEvent(statusFile, statusRead.error));
+  } else if (statusRead.present) {
+    const status = statusRead.value;
+    const structureError = supervisionStatusStructureError(status);
+    if (structureError) {
+      events.push(unknownEvent(statusFile, structureError));
+    } else if (status.pending) {
+      const issuedAt = status.pending.issuedAt;
+      if (now - issuedAt >= SUPERVISION_PENDING_MS) {
+        events.push({
+          type: "SUPERVISION_PENDING",
+          key: `wake:${status.pending.id ?? name}`,
+          wakeId: status.pending.id ?? null,
+          reason: status.pending.reason ?? null,
+          ageMs: Math.max(0, now - issuedAt),
+          source: dir,
+        });
+      }
+    }
+  }
+
+  // Dispatch ledger: terminal or missing -> silence; unreadable or
+  // structurally invalid -> UNKNOWN; ACCEPTED with stale fast state AND a
+  // dispatch record that is itself older than the stale window -> WATCH_STALE.
+  // The record-timestamp clause suppresses false positives for a dispatch that
   // was just sent (the watch may not have written its first fast state yet).
   const dispatchRead = await readJson(io, join(dir, "a-dispatch-state.json"));
   if (dispatchRead.present && dispatchRead.error) {
     events.push(unknownEvent(join(dir, "a-dispatch-state.json"), dispatchRead.error));
     return;
   }
-  const dispatch = dispatchRead.present ? dispatchRead.value : null;
-  if (!dispatch || TERMINAL_DISPATCH_STATUSES.has(dispatch.status)) return;
+  if (!dispatchRead.present) return;
+  const dispatch = dispatchRead.value;
+  const dispatchStructure = dispatchStructureError(dispatch);
+  if (dispatchStructure) {
+    events.push(unknownEvent(join(dir, "a-dispatch-state.json"), dispatchStructure));
+    return;
+  }
+  if (TERMINAL_DISPATCH_STATUSES.has(dispatch.status)) return;
   if (!ACTIVE_DISPATCH_STATUSES.has(dispatch.status) && dispatch.status !== "ACCEPTED") return;
 
   const fastRead = await readJson(io, join(dir, "a-fast-state.json"));
@@ -154,18 +223,27 @@ async function scanConversation(dir, name, now, io, events) {
 
 // Enumerate <root>/conversations/*/ and collect wake anomalies. Any single
 // directory or file failure is tolerated: detection never throws, and a failed
-// read of key state surfaces as WAKE_STATUS_UNKNOWN, never as health.
+// read of key state surfaces as WAKE_STATUS_UNKNOWN, never as health. A root
+// whose conversations directory cannot be read at all is also UNKNOWN — only
+// ENOENT (a configured root that has no conversations directory yet) is a
+// benign empty state (WG-01). One failing root never masks the other roots.
 export async function detectWakeAnomalies(monitorRoots, now, io = defaultIo) {
   const events = [];
   for (const root of Array.isArray(monitorRoots) ? monitorRoots : []) {
+    const conversationsDir = join(root, "conversations");
     let entries;
     try {
-      entries = await io.readdir(join(root, "conversations"), { withFileTypes: true });
-    } catch { continue; } // root missing/unreadable: skip silently, no throw
+      entries = await io.readdir(conversationsDir, { withFileTypes: true });
+    } catch (error) {
+      if (error?.code === "ENOENT") continue; // configured but not yet created: benign empty state
+      // Unreadable root (EACCES/EPERM/EIO/...): fail closed as UNKNOWN.
+      events.push(unknownEvent(conversationsDir, error?.code || "READ_FAILED"));
+      continue;
+    }
     for (const entry of entries) {
       if (!entry.isDirectory()) continue;
-      try { await scanConversation(join(root, "conversations", entry.name), entry.name, now, io, events); }
-      catch { events.push(unknownEvent(join(root, "conversations", entry.name), "SCAN_FAILED")); }
+      try { await scanConversation(join(conversationsDir, entry.name), entry.name, now, io, events); }
+      catch { events.push(unknownEvent(join(conversationsDir, entry.name), "SCAN_FAILED")); }
     }
   }
   return { healthy: events.length === 0, events };
@@ -218,19 +296,35 @@ export function summarizeEvents(events, maxEvents = 3) {
 
 // Rate-limit ledger: an independent hook state file under ~/.agents/. It never
 // touches supervision or dispatch business ledgers.
+//
+// Stop cooldown is SESSION-scoped (WG-04): stopBlocks maps <sessionId> -> the
+// timestamp of that session's last Stop block, so one session's 90s cooldown
+// never suppresses another session's independent wake handoff. The 90s duration
+// and the "same session only takes over one round" rule are unchanged.
 export function parseLedger(text) {
   if (text === null || text === undefined || text === "") {
-    return { schema: LEDGER_SCHEMA, injections: {}, stopBlockAt: 0 };
+    return { schema: LEDGER_SCHEMA, injections: {}, stopBlocks: {} };
   }
   const value = JSON.parse(text);
   if (!value || typeof value !== "object" || Array.isArray(value) || value.schema !== LEDGER_SCHEMA) {
     throw new Error("WAKE_GUARD_LEDGER_INVALID");
   }
+  const stopBlocks = value.stopBlocks && typeof value.stopBlocks === "object" && !Array.isArray(value.stopBlocks)
+    ? Object.fromEntries(Object.entries(value.stopBlocks).filter(([, ts]) => Number.isFinite(ts)))
+    : {};
+  // Old-format migration (WG-04): the pre-session-level ledger stored one global
+  // stopBlockAt timestamp. Migrate it to the "global" session key — the same
+  // fallback key stop.mjs uses when an event carries no sessionId — so an
+  // in-flight cooldown is not lost while still never suppressing other named
+  // sessions.
+  if (Number.isFinite(value.stopBlockAt) && value.stopBlockAt > 0) {
+    stopBlocks.global ??= value.stopBlockAt;
+  }
   return {
     schema: LEDGER_SCHEMA,
     injections: value.injections && typeof value.injections === "object" && !Array.isArray(value.injections)
       ? value.injections : {},
-    stopBlockAt: Number.isFinite(value.stopBlockAt) ? value.stopBlockAt : 0,
+    stopBlocks,
   };
 }
 
@@ -239,14 +333,15 @@ export function injectionCooldownActive(ledger, key, now, cooldownMs = INJECTION
   return Number.isFinite(last) && now - last < cooldownMs;
 }
 
-export function stopCooldownActive(ledger, now, cooldownMs = STOP_BLOCK_COOLDOWN_MS) {
-  return Number.isFinite(ledger.stopBlockAt) && ledger.stopBlockAt > 0 && now - ledger.stopBlockAt < cooldownMs;
+export function stopCooldownActive(ledger, sessionId, now, cooldownMs = STOP_BLOCK_COOLDOWN_MS) {
+  const last = ledger.stopBlocks?.[sessionId];
+  return Number.isFinite(last) && last > 0 && now - last < cooldownMs;
 }
 
 export function withInjection(ledger, key, now) {
   return { ...ledger, injections: { ...ledger.injections, [key]: now } };
 }
 
-export function withStopBlock(ledger, now) {
-  return { ...ledger, stopBlockAt: now };
+export function withStopBlock(ledger, sessionId, now) {
+  return { ...ledger, stopBlocks: { ...ledger.stopBlocks, [sessionId]: now } };
 }

@@ -308,7 +308,9 @@ async function collectCompleted(params, dir) {
   return 0;
 }
 
-async function releaseDelivered(params, dir) {
+// Exported for testing with a runScript injection (rebuildSpace precedent);
+// production callers use the default browser path.
+export async function releaseDelivered(params, dir, { runScript } = {}) {
   const record = await readDispatchState(dir);
   if (!record || record.status !== "COMPLETED" ||
       record.conversationUuid.toLowerCase() !== params.conversation.toLowerCase() || record.taskSpace !== params.space) {
@@ -316,10 +318,15 @@ async function releaseDelivered(params, dir) {
   }
   await verifiedConsumption(dir, record);
   const template = await readFile(templates.release, "utf8");
-  const released = await runEgo(adaptTemplate(template, params), dir, "release");
+  const released = runScript
+    ? await runScript(adaptTemplate(template, params), dir)
+    : await runEgo(adaptTemplate(template, params), dir, "release");
   if (released.code !== 0 || released.result !== "AGENT_SPACE_RELEASED") {
-    console.log("RESULT=REPLY_DELIVERED_RELEASE_PENDING");
-    return 2;
+    // The dispatch is already COMPLETED here, so wake-context's WATCH_STALE
+    // backstop would never re-raise it; the only durable handoff is the
+    // watch-exit marker. Exit 2 therefore goes through exitWatching (WG-03),
+    // keeping the RESULT line text with the appended ledger wakeId.
+    return exitWatching(dir, "REPLY_DELIVERED_RELEASE_PENDING");
   }
   console.log("RESULT=DISPATCH_FINISHED_AND_RELEASED");
   return 0;
@@ -544,23 +551,29 @@ export async function main(args = process.argv.slice(2)) {
     await verifiedConsumption(dir, record);
   }
   if (p.action === "watch") {
-    await writeFile(join(dir, "a-watch-uuid.txt"), p.conversation + "\n", "utf8");
-    // Restart after delivery must finish the page release, even though the
-    // probe deliberately suppresses DONE_CANDIDATE for completed dispatches.
-    if (armed.status === "COMPLETED") {
-      try { await verifiedConsumption(dir, armed); }
-      catch (error) {
-        if (error.message !== "REPLY_NOT_CONSUMED") throw error;
-        return await exitWatching(dir, "REPLY_STAGED_WAKE_SUPERVISOR", { detail: "action=consume" });
-      }
-      return releaseDelivered(p, dir);
-    }
-    // One managed job owns BOTH the fast probe and the slow supervisor. No idle
-    // model calls; only the terminal return code wakes a compatible host, and
-    // every wake path first persists the ego-watch-exit ledger (agent-kit#25).
-    const pollIntervalMs = 30_000;
-    let benignStreak = 0;
+    // Branch-external initialization above (requireArmedDispatch / ensureMonitor)
+    // runs before watch identity is confirmed and keeps its MANAGER_FAILURE
+    // semantics on purpose. Everything inside this branch — init writes,
+    // COMPLETED reconciliation, release and the poll loop — is catchable watch
+    // scope (WG-03): any failure must leave the durable ego-watch-exit ledger
+    // behind via exitWatching(WATCH_EXCEPTION), never a bare exit 2.
     try {
+      await writeFile(join(dir, "a-watch-uuid.txt"), p.conversation + "\n", "utf8");
+      // Restart after delivery must finish the page release, even though the
+      // probe deliberately suppresses DONE_CANDIDATE for completed dispatches.
+      if (armed.status === "COMPLETED") {
+        try { await verifiedConsumption(dir, armed); }
+        catch (error) {
+          if (error.message !== "REPLY_NOT_CONSUMED") throw error;
+          return await exitWatching(dir, "REPLY_STAGED_WAKE_SUPERVISOR", { detail: "action=consume" });
+        }
+        return await releaseDelivered(p, dir);
+      }
+      // One managed job owns BOTH the fast probe and the slow supervisor. No idle
+      // model calls; only the terminal return code wakes a compatible host, and
+      // every wake path first persists the ego-watch-exit ledger (agent-kit#25).
+      const pollIntervalMs = 30_000;
+      let benignStreak = 0;
       while (true) {
         const pollStartedAt = Date.now();
         const template = await readFile(templates.probe, "utf8");
@@ -595,8 +608,8 @@ export async function main(args = process.argv.slice(2)) {
         await new Promise((res) => setTimeout(res, Math.max(0, pollIntervalMs - (Date.now() - pollStartedAt))));
       }
     } catch (error) {
-      // A loop crash still leaves the durable wake ledger behind; exit code 2
-      // is preserved instead of turning the failure into a clean exit.
+      // A watch-branch crash still leaves the durable wake ledger behind; exit
+      // code 2 is preserved instead of turning the failure into a clean exit.
       return await exitWatching(dir, "WATCH_EXCEPTION", {
         detail: "code=" + ((error && (error.code || error.message)) || "UNKNOWN"),
       });

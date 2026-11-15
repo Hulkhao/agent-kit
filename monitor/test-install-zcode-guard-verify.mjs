@@ -228,6 +228,21 @@ test("installConfig fails loudly on duplicate AgentKit Stop entries (no silent r
   if (code !== "ZCODE_GUARD_DUPLICATE_RULES") throw new Error(code || "no throw");
 });
 
+test("installConfig fails on duplicate AgentKit hooks inside one group (matches VERIFY)", () => {
+  let code = "";
+  const duplicated = { hooks: [...guard().hooks, ...guard().hooks] };
+  try {
+    installConfig({ hooks: { enabled: true, events: { PreToolUse: [rtk, duplicated], Stop: [stopGuard()] } } });
+  } catch (e) { code = e.message; }
+  if (code !== "ZCODE_GUARD_DUPLICATE_RULES") throw new Error(code || "no throw");
+  let stopCode = "";
+  const duplicatedStop = { hooks: [...stopGuard().hooks, ...stopGuard().hooks] };
+  try {
+    installConfig({ hooks: { enabled: true, events: { PreToolUse: [rtk, guard()], Stop: [duplicatedStop] } } });
+  } catch (e) { stopCode = e.message; }
+  if (stopCode !== "ZCODE_GUARD_DUPLICATE_RULES") throw new Error(stopCode || "no throw");
+});
+
 test("install() backs up before first write and keeps the backup on later installs", async () => {
   const dir = await mkdtemp(join(tmpdir(), "zcode-stop-install-"));
   const file = join(dir, "config.json");

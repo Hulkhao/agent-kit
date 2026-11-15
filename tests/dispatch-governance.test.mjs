@@ -10,7 +10,7 @@ import { join, resolve } from "node:path";
 import { normalizeFastState } from "../monitor/state-schema.mjs";
 import { tick, acknowledge } from "../monitor/supervision-watchdog.mjs";
 import { shouldReviewStartupIdle } from "../monitor/supervision-policy.mjs";
-import { parseArgs, adaptTemplate, bindNewConversation, classifyManagerResult, loadAttachments, requireArmedDispatch, main, readEgoOutcome, ensureMonitor, authorizeSpaceRebuild, rebuildSpace, exitWatching, acknowledgeWake } from "../monitor/dispatch-manager.mjs";
+import { parseArgs, adaptTemplate, bindNewConversation, classifyManagerResult, loadAttachments, requireArmedDispatch, main, readEgoOutcome, ensureMonitor, authorizeSpaceRebuild, rebuildSpace, exitWatching, acknowledgeWake, releaseDelivered } from "../monitor/dispatch-manager.mjs";
 import { withAgentRegistry } from "../monitor/agent-space.mjs";
 import { checkDispatchTool } from "../plugins/chatgpt-dispatch-guard/hooks/policy.mjs";
 import { installConfig, install } from "../monitor/install-zcode-guard.mjs";
@@ -758,6 +758,59 @@ test("#25: a staged-but-unconsumed reply exits watch through the durable ledger"
   }
 });
 
+test("#25 WG-03: RELEASE_PENDING exits through the durable watch-exit ledger (real execution)", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ego-release-pending-"));
+  const dir = join(root, "conversations", uuid);
+  const logs = [];
+  const originalLog = console.log;
+  try {
+    await mkdir(dir, { recursive: true });
+    const record = { schema: "ego-dispatch-state/v2", dispatchId: uuid, conversationUuid: uuid,
+      taskSpace: "GDC-执行A", pageLabel: "p1", status: "COMPLETED",
+      baselineTailKey: null, baselineTailRole: null, baselineComposerLength: 0,
+      attempt: 1, createdAt: Date.now(), payload_sha256: sha256("任务") };
+    await writeFile(join(dir, "a-dispatch-state.json"), JSON.stringify(record));
+    // The reply is verified consumed — only the page release itself fails.
+    const receipt = await saveReply(dir, record, { text: "已消费回复", source: "DOM_BOUNDARY_VISIBLE" }, uuid);
+    await acknowledgeReply(dir, record, receipt.sha256);
+    await verifiedConsumption(dir, record);
+    const params = { conversation: uuid, space: "GDC-执行A", agentId: "gdc-a", monitorDir: root };
+    console.log = (line) => logs.push(String(line));
+    const code = await releaseDelivered(params, dir, {
+      runScript: async () => ({ code: 1, result: "SPACE_RELEASE_ACCOUNT_UNPROVEN" }),
+    });
+    assert.equal(code, 2);
+    const marker = JSON.parse(await readFile(join(dir, WATCH_EXIT_FILE), "utf8"));
+    assert.equal(marker.schema, "ego-watch-exit/v1");
+    assert.equal(marker.reason, "REPLY_DELIVERED_RELEASE_PENDING");
+    assert.equal(marker.exitCode, 2);
+    // Un-acked: the host must still inspect and ack this wake.
+    assert.equal(marker.acknowledgedAt, null);
+    assert.equal(marker.ackAction, null);
+    assert.deepEqual(Object.keys(marker).sort(),
+      ["ackAction", "acknowledgedAt", "exitCode", "issuedAt", "reason", "schema", "wakeId"]);
+    // The RESULT line keeps its text and appends the ledger wakeId.
+    assert.ok(logs.some((line) => line === "RESULT=REPLY_DELIVERED_RELEASE_PENDING wakeId=" + marker.wakeId),
+      "wake line must announce REPLY_DELIVERED_RELEASE_PENDING with the ledger wakeId: " + JSON.stringify(logs));
+    // The marker is ackable through the normal ack path.
+    await acknowledgeWake(marker.wakeId, "investigated", dir, Date.now());
+    const after = JSON.parse(await readFile(join(dir, WATCH_EXIT_FILE), "utf8"));
+    assert.equal(after.ackAction, "investigated");
+    // Success path unchanged: a verified release still exits 0 without a marker.
+    await rm(join(dir, WATCH_EXIT_FILE), { force: true });
+    console.log = (line) => logs.push(String(line));
+    const clean = await releaseDelivered(params, dir, {
+      runScript: async () => ({ code: 0, result: "AGENT_SPACE_RELEASED" }),
+    });
+    assert.equal(clean, 0);
+    assert.ok(logs.some((line) => line === "RESULT=DISPATCH_FINISHED_AND_RELEASED"));
+    await assert.rejects(readFile(join(dir, WATCH_EXIT_FILE)), { code: "ENOENT" });
+  } finally {
+    console.log = originalLog;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("#25: every watch exit-2 path persists the ego-watch-exit ledger and announces its wakeId", async () => {
   const source = await readFile(new URL("../monitor/dispatch-manager.mjs", import.meta.url), "utf8");
   const watch = source.slice(source.indexOf('if (p.action === "watch")'), source.indexOf('if (p.action === "probe") await writeFile'));
@@ -775,9 +828,10 @@ test("#25: every watch exit-2 path persists the ego-watch-exit ledger and announ
   assert.match(watch, /wakeId: pending && typeof pending\.id === "string" \? pending\.id : undefined/);
   assert.match(watch, /pending\.reason : "MONITOR_WAKE_UNACKNOWLEDGED"/);
   assert.match(watch, /announce: false/);
-  // Path 5: a catchable loop crash still leaves the ledger and exits 2.
-  assert.match(watch, /try \{\s*while \(true\)/);
-  assert.match(watch, /exitWatching\(dir, "WATCH_EXCEPTION", \{/);
+  // Path 5: any catchable watch-branch failure — init, reconciliation, release
+  // or the poll loop — leaves the ledger behind and exits 2 (WG-03): the whole
+  // branch body is wrapped in one try whose catch lands on exitWatching.
+  assert.match(watch, /try \{[\s\S]*while \(true\)[\s\S]*\} catch \(error\) \{[\s\S]*return await exitWatching\(dir, "WATCH_EXCEPTION"/);
   assert.match(watch, /"code=" \+ \(\(error && \(error\.code \|\| error\.message\)\) \|\| "UNKNOWN"\)/);
 });
 

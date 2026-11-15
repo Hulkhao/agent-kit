@@ -209,7 +209,8 @@ const r = await page.fetch("/backend-api/conversation/" + uuid,
 | `CONVERSATION_UNAVAILABLE_PERSISTENT` | 死页梯子 3 strikes | 只报「持续不可用」，深查/重派/迁移；不声称会话永久死亡 |
 | `START_IDLE_WAKE_SUPERVISOR` | 恢复首轮空闲，存在基线时序风险（issue #8 起属良性：wrapper 自动重启自愈并留痕，连续 >20 轮才升级唤醒） | 单次出现无需处置；wrapper 日志见 `BENIGN_SIGNAL_SELFHEAL` 留痕可审计 |
 | `FAST_PROBE_WAKE_SUPERVISOR signal=MISSING exit=<code> [detail=<行>]` | watch 子进程异常退出且无 RESULT 行（2026-11-16 起 detail=末条非 RESULT 输出行，≤200 字符，#31） | 三段判定：detail 含 `command not found`=命令缺失（修 ego-browser PATH/环境后全套重启）；detail 为 JS 堆栈行（`at …`/`Error: …`）=脚本崩溃（留 tail 证据上报 §9.1）；无 detail=零输出静默退出（查托管宿主/进程被杀，非脚本逻辑）。exit=127 通常是命令缺失 |
-| `WATCH_EXCEPTION code=<…> wakeId=<uuid>`（#25③） | watch 循环可捕获异常（2026-11-16 起 watch 所有 exit 2 路径统一先落盘 `a-watch-exit.json` 再退出） | 读 stderr 定位异常；按 wakeId 处置后 `ack`（§6.6，与监督账本同 id 时一次 ack 双清）；再重新布防 |
+| `WATCH_EXCEPTION code=<…> wakeId=<uuid>`（#25③） | watch 分支内可捕获异常（2026-11-16 起 watch 全部 exit 2 路径统一先落盘 `a-watch-exit.json` 再退出，含初始化段与 RELEASE_PENDING） | 读 stderr 定位异常；按 wakeId 处置后 `ack`（§6.6，与监督账本同 id 时一次 ack 双清）；再重新布防 |
+| `REPLY_DELIVERED_RELEASE_PENDING wakeId=<uuid>`（#25③） | 回复已交付但 Page release 未成功（dispatch 已 COMPLETED——此时 WATCH_STALE 不会兜底，唯一持久凭据就是 watch-exit 标记） | 按 wakeId ack 后重跑 `release`（或按 §6.5/接管流程处理空间问题）；不要当成功放行 |
 
 2026-11-16 起，watch 的全部 exit 2 唤醒行（REPLY_READY/REPLY_STAGED/FAST_PROBE/WATCH_EXCEPTION）末尾统一追加 `wakeId=<uuid>`，处置后按该 id ack（§6.6）；tick 监督路径复用监督 pending id（双账本同 id）。
 
@@ -247,9 +248,9 @@ node monitor/dispatch-manager.mjs rebuild-space --monitor-dir <监控根目录> 
 
 **机器配置（显式，不猜 cwd）**：`~/.agents/ego-profile.json` 增加 `"monitorRoots": ["<监控根目录绝对路径>", …]`，每项=一次 `--monitor-dir` 的根（其下含 `conversations/<uuid>/`）。未配置/为空=钩子不启用（配置缺口，**不是健康信号**，零输出）。
 
-**PreToolUse 注入（仅异常注入，健康零输出）**：`[AGENT_KIT_WAKE_GUARD]` 块，四态——`WAKE_PENDING`（watch-exit 未 ack，0s 即报，action=INSPECT_AND_ACK_REQUIRED）/`SUPERVISION_PENDING`（监督 pending ≥60s）/`WATCH_STALE`（ACCEPTED 且 fast-state 陈旧 ≥7min，与监督 FAST_POLL_STALE 同值，且派单记录本身也超 7 分钟防刚派单误报，action=REARM_WATCH_AND_VERIFY）/`WAKE_STATUS_UNKNOWN`（关键状态文件损坏或不可读，绝不解释成健康，action=INSPECT_MONITOR_STATE）。限频：同 session+wakeId 60s 一次；每次 ≤3 事件（超出报 `additional=<n>`）；限频账本 `~/.agents/ego-wake-guard-state.json`（独立文件，不碰业务账本）。deny 共存冻结契约：deny 原因原文不动、注入并列；**禁止**因注入转 allow、禁止因监控文件读取失败放行本该 deny 的调用。
+**PreToolUse 注入（仅异常注入，健康零输出）**：`[AGENT_KIT_WAKE_GUARD]` 块，四态——`WAKE_PENDING`（watch-exit 未 ack，0s 即报，action=INSPECT_AND_ACK_REQUIRED）/`SUPERVISION_PENDING`（监督 pending ≥60s）/`WATCH_STALE`（ACCEPTED 且 fast-state 陈旧 ≥7min，与监督 FAST_POLL_STALE 同值，且派单记录本身也超 7 分钟防刚派单误报，action=REARM_WATCH_AND_VERIFY）/`WAKE_STATUS_UNKNOWN`（关键状态文件损坏、结构不符合同或不可读——ENOENT 以外的一切读取异常与结构校验失败都不解释成健康，action=INSPECT_MONITOR_STATE）。限频：同 session+wakeId 60s 一次；每次 ≤3 事件（超出报 `additional=<n>`）；限频账本 `~/.agents/ego-wake-guard-state.json`（独立文件，不碰业务账本；**写失败不吞注入**——已识别的唤醒照常注入，只是下次可能重复）。deny 共存冻结契约：deny 原因原文不动、注入并列；**禁止**因注入转 allow、禁止因监控文件读取失败放行本该 deny 的调用。
 
-**Stop 接棒**：宿主准备收尾仍有未处理唤醒 → 输出 `decision:block` 强制继续一轮（`stop_hook_active=true` 或 90s 冷却内不再 block；账本写失败仍 block，最坏多继续一轮，绝不静默放行未处理唤醒）。
+**Stop 接棒**：宿主准备收尾仍有未处理唤醒 → 输出 `decision:block` 强制继续一轮（`stop_hook_active=true` 不再 block；90s 冷却为 **session 级**——账本 `stopBlocks` 按 sessionId 记键，同一会话多异常只接棒一轮，不同会话互不抑制；限频账本写失败仍 block，最坏多继续一轮，绝不静默放行未处理唤醒）。
 
 **处置闭环**：看到 `[AGENT_KIT_WAKE_GUARD]` → 按 state/action 处置（collect/重新布防/查状态）→ `node monitor/dispatch-manager.mjs ack --monitor-dir <根> --agent-id <ID> --space <空间> --conversation <uuid> --wake-id <注入的wakeId> --ack-action investigated|resolved`（双账本同 id 一次双清；已 ack 再 ack 报 `WAKE_ID_ALREADY_ACKNOWLEDGED`）→ 下次注入确认该 wakeId 消失。
 

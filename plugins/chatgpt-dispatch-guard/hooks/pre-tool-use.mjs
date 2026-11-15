@@ -50,7 +50,11 @@ async function wakeContext(event, now = Date.now()) {
     const sessionId = event?.sessionId ?? event?.session_id ?? "global";
     const key = sessionId + ":" + (events[0]?.key ?? "wake");
     if (injectionCooldownActive(ledger, key, now)) return null;
-    await saveLedger(withInjection(ledger, key, now), now);
+    // The rate-limit ledger write is best-effort ONLY (WG-02): the anomaly is
+    // already identified, so it must still be injected. A write failure means
+    // at worst a repeated injection on the next call — never a dropped wake.
+    try { await saveLedger(withInjection(ledger, key, now), now); }
+    catch { /* ledger unwritable: skip dedup bookkeeping, keep the injection */ }
     return context;
   } catch {
     // Any detection failure must not interfere with the guard's decision.

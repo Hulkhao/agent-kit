@@ -16,21 +16,27 @@ const wakeContextScript = resolve(dirname(fileURLToPath(import.meta.url)), "../p
 export const marker = "chatgpt-dispatch-guard/hooks/pre-tool-use.mjs";
 export const stopMarker = "chatgpt-dispatch-guard/hooks/stop.mjs";
 
+// Hook-level matching (WG-05): duplicates are counted per actual Agent Kit
+// hook across all groups — matching verifyConfig/auditStopRule, so install and
+// VERIFY agree. Two Agent Kit hooks inside ONE group are duplicates too.
 function findOwn(entries, entryMarker) {
-  return entries.filter((group) => group.hooks?.some((h) => h.args?.some((a) => String(a).replace(/\\/g, "/").includes(entryMarker))));
+  return entries.flatMap((group) => (group.hooks || [])
+    .filter((h) => h.args?.some((a) => String(a).replace(/\\/g, "/").includes(entryMarker)))
+    .map((hook) => ({ group, hook })));
 }
 
 function upsertOwn(entries, entryMarker, canonical) {
-  // Idempotent: an existing AgentKit entry is upgraded in place (older shape),
-  // missing entries are appended, duplicate AgentKit entries fail loudly
-  // instead of being silently repaired.
+  // Idempotent: an existing AgentKit hook's group is upgraded in place (older
+  // shape), missing entries are appended, duplicate AgentKit hooks — separate
+  // groups or inside one group — fail loudly instead of being silently repaired.
   const own = findOwn(entries, entryMarker);
   if (own.length > 1) throw new Error("ZCODE_GUARD_DUPLICATE_RULES");
   if (!own.length) { entries.push(canonical); return true; }
-  if (JSON.stringify(own[0]) !== JSON.stringify(canonical)) {
+  const { group } = own[0];
+  if (JSON.stringify(group) !== JSON.stringify(canonical)) {
     // An older installation used matcher="*", which is an invalid regular expression.
-    Object.keys(own[0]).forEach((key) => delete own[0][key]);
-    Object.assign(own[0], canonical);
+    Object.keys(group).forEach((key) => delete group[key]);
+    Object.assign(group, canonical);
     return true;
   }
   return false;
