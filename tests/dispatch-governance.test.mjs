@@ -1115,7 +1115,7 @@ test("#27 B: managed claim takeover evidence grants resolved without a registry 
     // the claim row is matched exactly once per qualifying line.
     await writeRow({ action: "claim", agentId: "gdc-a", space: "GDC-执行A", outcome: "CLAIMED" });
     const { dir: dirE, p: pE } = await ackFixture(root, { wakeId: randomUUID() });
-    assert.equal(await ackOwnershipEvidence("gdc-a", "GDC-执行A", root, dirE, { directory: root }), "CLAIM");
+    assert.equal(await ackOwnershipEvidence("gdc-a", "GDC-执行A", uuid, root, dirE, { directory: root }), "CLAIM");
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
@@ -1159,9 +1159,212 @@ test("#27 B: the managed ack path is wired into main and the primitive stays int
   // primitive; the tiering lives only on the managed path above it).
   assert.match(source, /export async function acknowledgeWake\(id, action, dir, now = Date\.now\(\)\)/);
   // The gate itself: evidence (a) registry binding, evidence (b) claim row.
-  assert.match(source, /export async function ackOwnershipEvidence\(agentId, space, monitorDir, dir, \{ directory \} = \{\}\)/);
+  assert.match(source, /export async function ackOwnershipEvidence\(agentId, space, conversation, monitorDir, dir, \{ directory \} = \{\}\)/);
   assert.match(source, /return "REGISTRY";/);
   assert.match(source, /return "CLAIM";/);
+  // B-02: audit failures are reported, never allowed to flip the ack verdict.
+  assert.match(source, /ACK_AUDIT_WRITE_FAILED/);
+});
+
+// ---- planner re-review (B-01): the ownership precondition chain is anchored
+// to the TARGET conversation's ledger, before either evidence path runs. ----
+
+test("#27 B-01: registry evidence is refused when --space does not match the ledger taskSpace", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ego-ack-b01-space-"));
+  try {
+    // Registry binding would match the ledger perfectly — but the caller
+    // declares a different space, so precondition 3 must block it.
+    const { dir, p } = await ackFixture(root, { agentId: "gdc-a", space: "别家空间" });
+    await withAgentRegistry((registry) => {
+      registry.agents["gdc-a"] = { spaceName: "GDC-执行A", active: [], known: [] };
+      return { changed: true };
+    }, root);
+    assert.equal(await ackOwnershipEvidence("gdc-a", "别家空间", uuid, root, dir, { directory: root }), null);
+    assert.equal(await managedAcknowledge(p, { directory: root }), 2);
+    const marker = JSON.parse(await readFile(join(dir, WATCH_EXIT_FILE), "utf8"));
+    assert.equal(marker.acknowledgedAt, null);
+    assert.equal(marker.ackAction, null);
+    const audit = await ackAuditLines(root);
+    assert.equal(audit.length, 1);
+    assert.equal(audit[0].outcome, "DENIED");
+    assert.equal(audit[0].reason, ACK_RESOLVED_OWNERSHIP_REQUIRED);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("#27 B-01: claim evidence is refused when --space does not match the ledger taskSpace", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ego-ack-b01-claim-space-"));
+  try {
+    // The claim row itself would match the DECLARED space — the precondition
+    // chain (and the record-anchored row comparison) must still refuse it.
+    const { dir, p } = await ackFixture(root, { agentId: "gdc-a", space: "别家空间" });
+    await writeFile(join(root, "a-space-rebuild-audit.ndjson"), JSON.stringify({
+      ts: new Date().toISOString(), action: "claim", agentId: "gdc-a", space: "别家空间",
+      decision: "LEDGER_PROOF", outcome: "CLAIMED", result: "SPACE_CLAIMED_OWNERSHIP_VERIFIED", exit: 0,
+    }) + "\n", "utf8");
+    assert.equal(await ackOwnershipEvidence("gdc-a", "别家空间", uuid, root, dir, { directory: root }), null);
+    assert.equal(await managedAcknowledge(p, { directory: root }), 2);
+    const marker = JSON.parse(await readFile(join(dir, WATCH_EXIT_FILE), "utf8"));
+    assert.equal(marker.acknowledgedAt, null);
+    assert.equal(marker.ackAction, null);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("#27 B-01: claim evidence is refused when the dispatch ledger is missing", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ego-ack-b01-noledger-"));
+  try {
+    // A claim row alone must never grant: without a valid dispatch ledger the
+    // precondition chain cannot even anchor the TaskSpace (fail-closed).
+    const dir = join(root, "conversations", uuid);
+    await mkdir(dir, { recursive: true });
+    await writeFile(join(dir, WATCH_EXIT_FILE), JSON.stringify({
+      schema: "ego-watch-exit/v1", wakeId: randomUUID(), reason: "REPLY_READY_WAKE_SUPERVISOR",
+      issuedAt: 1234, exitCode: 2, acknowledgedAt: null, ackAction: null,
+    }));
+    await writeFile(join(root, "a-space-rebuild-audit.ndjson"), JSON.stringify({
+      ts: new Date().toISOString(), action: "claim", agentId: "gdc-a", space: "GDC-执行A",
+      decision: "LEDGER_PROOF", outcome: "CLAIMED", result: "SPACE_CLAIMED_OWNERSHIP_VERIFIED", exit: 0,
+    }) + "\n", "utf8");
+    const p = parseArgs(["ack", "--monitor-dir", root, "--agent-id", "gdc-a", "--space", "GDC-执行A",
+      "--conversation", uuid, "--wake-id", randomUUID(), "--ack-action", "resolved"]);
+    assert.equal(await ackOwnershipEvidence("gdc-a", "GDC-执行A", uuid, root, dir, { directory: root }), null);
+    assert.equal(await managedAcknowledge(p, { directory: root }), 2);
+    const marker = JSON.parse(await readFile(join(dir, WATCH_EXIT_FILE), "utf8"));
+    assert.equal(marker.acknowledgedAt, null);
+    assert.equal(marker.ackAction, null);
+    await assert.rejects(readFile(join(dir, "a-dispatch-state.json")), { code: "ENOENT" });
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("#27 B-01: a --conversation that mismatches the ledger record.conversationUuid is refused", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ego-ack-b01-conv-"));
+  try {
+    // The ledger lives in the addressed directory but belongs to ANOTHER
+    // conversation; registry binding AND a matching claim row both exist, and
+    // the conversation precondition must still refuse the grant.
+    const other = "22222222-2222-4222-8222-222222222222";
+    const { dir, p } = await ackFixture(root);
+    await writeFile(join(dir, "a-dispatch-state.json"), JSON.stringify({
+      schema: "ego-dispatch-state/v2", dispatchId: other, conversationUuid: other,
+      taskSpace: "GDC-执行A", pageLabel: "p1", status: "ACCEPTED", baselineTailKey: null,
+      baselineTailRole: null, baselineComposerLength: 0, attempt: 1, createdAt: Date.now(),
+      payload_sha256: null, payload_bytes: null, composer_baseline: null,
+    }));
+    await withAgentRegistry((registry) => {
+      registry.agents["gdc-a"] = { spaceName: "GDC-执行A", active: [], known: [] };
+      return { changed: true };
+    }, root);
+    await writeFile(join(root, "a-space-rebuild-audit.ndjson"), JSON.stringify({
+      ts: new Date().toISOString(), action: "claim", agentId: "gdc-a", space: "GDC-执行A",
+      decision: "LEDGER_PROOF", outcome: "CLAIMED", result: "SPACE_CLAIMED_OWNERSHIP_VERIFIED", exit: 0,
+    }) + "\n", "utf8");
+    assert.equal(await ackOwnershipEvidence("gdc-a", "GDC-执行A", uuid, root, dir, { directory: root }), null);
+    assert.equal(await managedAcknowledge(p, { directory: root }), 2);
+    const marker = JSON.parse(await readFile(join(dir, WATCH_EXIT_FILE), "utf8"));
+    assert.equal(marker.acknowledgedAt, null);
+    assert.equal(marker.ackAction, null);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+// ---- planner re-review (B-02): the audit verdict never diverges from the ack
+// business result; audit write failures are reported, never fatal to the ack. ----
+
+test("#27 B-02: a succeeded ack with a failed GRANTED audit stays exit 0, never a fake DENIED", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ego-ack-b02-granted-"));
+  const errors = [];
+  const originalError = console.error;
+  try {
+    const { dir, p } = await ackFixture(root, { agentId: "gdc-c", ackAction: "investigated" });
+    // The audit target IS a directory: every appendFile to it fails (EISDIR)
+    // while the ack itself proceeds normally.
+    const auditPath = join(root, ACK_AUDIT_FILE);
+    await mkdir(auditPath, { recursive: true });
+    console.error = (line) => errors.push(String(line));
+    assert.equal(await managedAcknowledge(p, { directory: root }), 0);
+    // The ack really succeeded and was never misrecorded as a failure.
+    const marker = JSON.parse(await readFile(join(dir, WATCH_EXIT_FILE), "utf8"));
+    assert.notEqual(marker.acknowledgedAt, null);
+    assert.equal(marker.ackAction, "investigated");
+    // The audit failure is reported on stderr, without any DENIED downgrade.
+    assert.equal(errors.filter((line) => line.includes("ACK_AUDIT_WRITE_FAILED")).length, 1);
+    assert.equal(errors.some((line) => line.includes("ACK_DENIED")), false);
+    // Nothing was written through the unwritable audit target.
+    assert.equal((await stat(auditPath)).isDirectory(), true);
+  } finally {
+    console.error = originalError;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("#27 B-02: a failed ack with a working audit records the DENIED accurately", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ego-ack-b02-denied-"));
+  const errors = [];
+  const originalError = console.error;
+  try {
+    const { p } = await ackFixture(root, { agentId: "gdc-c", ackAction: "investigated" });
+    // Point the ack at a wake id that matches no ledger: acknowledgeWake
+    // fails, the DENIED audit must record exactly that reason.
+    const unknown = parseArgs(["ack", "--monitor-dir", root, "--agent-id", "gdc-c", "--space", "GDC-执行A",
+      "--conversation", uuid, "--wake-id", randomUUID(), "--ack-action", "investigated"]);
+    console.error = (line) => errors.push(String(line));
+    await assert.rejects(managedAcknowledge(unknown, { directory: root }), /WAKE_ID_NOT_PENDING/);
+    const audit = await ackAuditLines(root);
+    assert.equal(audit.length, 1);
+    assert.equal(audit[0].outcome, "DENIED");
+    assert.equal(audit[0].reason, "WAKE_ID_NOT_PENDING");
+    assert.equal(errors.some((line) => line.includes("ACK_AUDIT_WRITE_FAILED")), false);
+    // The rethrown error is the ORIGINAL ack failure, not an audit artifact.
+    assert.equal(errors.filter((line) => line.includes("RESULT=")).length, 0);
+  } finally {
+    console.error = originalError;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("#27 B-02: an ownership denial still denies (exit 2) when its audit write fails", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ego-ack-b02-denyfail-"));
+  const errors = [];
+  const originalError = console.error;
+  try {
+    const { dir, p } = await ackFixture(root, { agentId: "gdc-a", ackAction: "resolved" });
+    // No registry binding, no claim row: the resolved is denied — and the
+    // audit target is a directory, so even the DENIED line cannot be written.
+    const auditPath = join(root, ACK_AUDIT_FILE);
+    await mkdir(auditPath, { recursive: true });
+    console.error = (line) => errors.push(String(line));
+    assert.equal(await managedAcknowledge(p, { directory: root }), 2);
+    // The business ledgers keep zero changes (fail-closed denial stands).
+    const marker = JSON.parse(await readFile(join(dir, WATCH_EXIT_FILE), "utf8"));
+    assert.equal(marker.acknowledgedAt, null);
+    assert.equal(marker.ackAction, null);
+    await assert.rejects(readFile(join(dir, "a-supervision-status.json")), { code: "ENOENT" });
+    assert.equal(errors.filter((line) => line.includes("ACK_AUDIT_WRITE_FAILED")).length, 1);
+    assert.ok(errors.some((line) => line.includes("ACK_DENIED code=" + ACK_RESOLVED_OWNERSHIP_REQUIRED)));
+    assert.equal((await stat(auditPath)).isDirectory(), true);
+  } finally {
+    console.error = originalError;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("#27 B-02: a normal audit run writes exactly one line per operation with the matching outcome", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ego-ack-b02-normal-"));
+  const errors = [];
+  const originalError = console.error;
+  try {
+    const { p } = await ackFixture(root, { agentId: "gdc-c", ackAction: "investigated" });
+    console.error = (line) => errors.push(String(line));
+    assert.equal(await managedAcknowledge(p, { directory: root }), 0);
+    const audit = await ackAuditLines(root);
+    assert.equal(audit.length, 1);
+    assert.equal(audit[0].outcome, "GRANTED");
+    for (const field of ["ts", "agentId", "space", "conversation", "wakeId", "ackAction", "outcome"]) {
+      assert.ok(field in audit[0], "audit field " + field);
+    }
+    assert.equal(errors.some((line) => line.includes("ACK_AUDIT_WRITE_FAILED")), false);
+  } finally {
+    console.error = originalError;
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 // ---- agent-kit#33: managed claim action + takeover operator guidance ----

@@ -51,14 +51,15 @@
    - f. 不同 monitorRoot 的 UNKNOWN 事件互不掩盖（跨 root 隔离）；
    - g. 一批超过 3 个新事件 → 展示前 3 个，其余以 `additional=N suppressed by cap` 计数；**被计数隐藏的事件本轮不写冷却**（未被展示过，下一批仍可见）。
    - 身份键 = `eventType + wakeId + monitorRoot`（无 wakeId 的事件用稳定来源标识，UNKNOWN 的来源路径已含 root）；冷却期维持 60s 不变。
-   - **向后兼容**：旧冷却状态文件 `~/.agents/ego-wake-guard-state.json` 原样解析，旧键（`<session>:wake:<id>` 形态）保留有效，新键按 `<session>:<TYPE>:<id>:<root>` 形态追加，不清洗旧条目。
+   - **向后兼容（数据保留口径）**：旧冷却状态文件 `~/.agents/ego-wake-guard-state.json` 原样解析，旧键（`<session>:wake:<id>` 形态）保留、不清洗，新键按 `<session>:<TYPE>:<id>:<root>` 形态追加。注意：旧键保留**不等于**旧键冷却效果在新身份体系下继续生效——新逻辑只匹配新格式身份键，升级后允许发生一次重复注入。
 
 2. **ack 分级合同**（落点 `monitor/dispatch-manager.mjs` 受管 ack 路径；对应 `tests/dispatch-governance.test.mjs` #27 B 用例）：
    - `investigated`：任意合法 `--agent-id` 实际调查后即可 ack（现状行为不变）；
    - `resolved`：需所有权证据，满足其一即 GRANTED：①注册表绑定——`ego-taskspaces.json`（withAgentRegistry）中该 agentId 的 spaceName === 会话账本（`conversations/<conversation>/a-dispatch-state.json`）的 taskSpace；②claim 接管证据——`--monitor-dir` 下 `a-space-rebuild-audit.ndjson` 存在 `action:"claim"` 且 `outcome:"CLAIMED"` 且 agentId、space 均匹配的行；
    - 无证据的 resolved → `ACK_RESOLVED_OWNERSHIP_REQUIRED` + OPERATOR 指引（先受管 claim 或降级 investigated），exit 2，**账本与 ego-watch-exit 标记零改动（fail-closed）**；
    - 每次受管 ack 在 `--monitor-dir` 下 `a-wake-ack-audit.ndjson` 追加一行 `{ts, agentId, space, conversation, wakeId, ackAction, outcome[, reason, evidence]}`；DENIED（含所有权拒绝与 WAKE_ID_NOT_PENDING 失败）也留痕；
-   - **落点偏离说明**：裁决表格列的落点是 hooks/pre-tool-use.mjs，但 hook 层只有命令字符串与 session_id，无可靠的会话↔agent 身份映射；裁决自身规定「无法取得可靠会话身份时 resolved 必须 fail-closed」——在 hook 层执行 resolved 门禁会拒绝所有 Owner 的合法 resolved，与分级设计矛盾。故门禁落在唯一有可靠身份证据的 dispatch-manager 受管 ack 路径（注册表绑定与会话账本均在此可读），hook 层不加拦截。此偏离需规划师逐项验收时裁定；
+   - **落点偏离说明**：裁决表格列的落点是 hooks/pre-tool-use.mjs，但 hook 层只有命令字符串与 session_id，无可靠的会话↔agent 身份映射；裁决自身规定「无法取得可靠会话身份时 resolved 必须 fail-closed」——在 hook 层执行 resolved 门禁会拒绝所有 Owner 的合法 resolved，与分级设计矛盾。故门禁落在唯一能核验声明身份与目标 TaskSpace 所有权关系的 dispatch-manager 受管 ack 路径（注册表绑定与会话账本均在此可读），hook 层不加拦截。此偏离需规划师逐项验收时裁定；
+   - **身份边界说明（规划师复审 B-03）**：本门禁验证的是调用者**声明**的 agentId 与目标 TaskSpace 的所有权关系；不验证调用进程的真实 Agent 身份，不防止主动伪造 agentId——这是操作治理机制，不是安全认证；
    - **ego-watch-exit/v1 七字段合同零改动**（#25 冻结，现有 marker 测试原样通过）。
 
 3. **fail-open 维持记录（PO 决策 dcc8701）**：PreToolUse hook 进程故障/无法启动时，工具调用**静默放行**——安装器 `install-zcode-guard.mjs` 零改动、不写 `onError`，hooks config 写入形态不变。守卫不阻断工具，依赖 wake 注入（本批次观察 A 修订后可靠性更高）与探针判别法兜底。规划师的 deny-on-error 收紧建议被 PO 否决，双方观点与风险已按冲突处置纪律记录于 `docs/planning/issue-27-ruling-20261116.md` §五第 1 项；如需重启讨论，以该记录为凭。

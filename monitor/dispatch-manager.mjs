@@ -277,40 +277,60 @@ export async function acknowledgeWake(id, action, dir, now = Date.now()) {
 export const ACK_AUDIT_FILE = "a-wake-ack-audit.ndjson";
 export const ACK_RESOLVED_OWNERSHIP_REQUIRED = "ACK_RESOLVED_OWNERSHIP_REQUIRED";
 
-// Ownership evidence for a `resolved` ack (ruling #27 observation B). Either
-// proof below grants; anything unprovable returns null and the caller must
-// fail closed. Evidence is only looked for — never fabricated — here, where
-// reliable identity actually exists:
-// (a) REGISTRY: the machine-wide ownership ledger (~/.agents/ego-taskspaces.json,
-//     withAgentRegistry) binds this agentId to the taskSpace of THIS
-//     conversation's dispatch ledger. An unreadable registry or ledger proves
-//     nothing and never grants.
-// (b) CLAIM: a managed claim takeover recorded in the monitor root's shared
-//     a-space-rebuild-audit.ndjson — a row with action:"claim", outcome:"CLAIMED"
-//     and matching agentId AND space. Claim is the only managed cross-session
-//     takeover channel; an ack must not bypass it.
-export async function ackOwnershipEvidence(agentId, space, monitorDir, dir, { directory } = {}) {
+// Ownership evidence for a `resolved` ack (ruling #27 observation B; planner
+// re-review B-01/B-03). A unified precondition chain runs BEFORE either
+// evidence path — any unprovable step returns null and the caller fails
+// closed. Boundary wording (planner re-review B-03): this gate verifies the
+// ownership relation between the caller-DECLARED agentId and the target
+// TaskSpace; it does NOT verify the calling process's real Agent identity and
+// does NOT prevent an actively forged agentId — an operational-governance
+// mechanism, not security authentication.
+//
+// Precondition chain (all must hold; record is the anchor):
+//   1. the conversation's dispatch ledger exists and is structurally valid
+//      (readDispatchState throws on corruption);
+//   2. record.conversationUuid matches the target conversation (toLowerCase
+//      comparison, same precedent as the consume branch);
+//   3. record.taskSpace === the declared space (p.space).
+// Evidence paths (evaluated only after the chain holds):
+//   (a) REGISTRY: the machine-wide ownership ledger
+//       (~/.agents/ego-taskspaces.json, withAgentRegistry) binds this agentId
+//       to record.taskSpace. An unreadable registry proves nothing.
+//   (b) CLAIM: a managed claim takeover recorded in the monitor root's shared
+//       a-space-rebuild-audit.ndjson — a row with action:"claim",
+//       outcome:"CLAIMED", row agentId === the declared agentId and
+//       row space === record.taskSpace (anchored to the ledger, not to the
+//       caller's declared space — precondition 3 already equates them).
+//       Claim is the only managed cross-session takeover channel; an ack must
+//       not bypass it.
+export async function ackOwnershipEvidence(agentId, space, conversation, monitorDir, dir, { directory } = {}) {
+  // Precondition chain (fail-closed): an absent, unreadable or corrupt ledger,
+  // a conversation mismatch or a space mismatch can never be bridged by any
+  // evidence below.
   let record = null;
   try { record = await readDispatchState(dir); }
-  catch { record = null; } // unreadable/corrupt ledger proves nothing (fail-closed)
-  if (record && typeof record.taskSpace === "string" && record.taskSpace !== "") {
-    let boundSpace = null;
-    try {
-      // withAgentRegistry actions return { changed, value } — read-only here.
-      boundSpace = await withAgentRegistry((registry) => ({
-        changed: false,
-        value: registry.agents[agentId]?.spaceName ?? null,
-      }), directory);
-    } catch { boundSpace = null; } // unreadable registry proves nothing
-    if (typeof boundSpace === "string" && boundSpace === record.taskSpace) return "REGISTRY";
-  }
+  catch { return null; }
+  if (!record) return null;
+  if (typeof record.conversationUuid !== "string" ||
+      record.conversationUuid.toLowerCase() !== String(conversation ?? "").toLowerCase()) return null;
+  if (record.taskSpace !== space) return null;
+  let boundSpace = null;
+  try {
+    // withAgentRegistry actions return { changed, value } — read-only here.
+    boundSpace = await withAgentRegistry((registry) => ({
+      changed: false,
+      value: registry.agents[agentId]?.spaceName ?? null,
+    }), directory);
+  } catch { boundSpace = null; } // unreadable registry proves nothing
+  if (typeof boundSpace === "string" && boundSpace === record.taskSpace) return "REGISTRY";
   try {
     const raw = await readFile(join(monitorDir, "a-space-rebuild-audit.ndjson"), "utf8");
     for (const line of raw.split("\n")) {
       if (!line.trim()) continue;
       let row;
       try { row = JSON.parse(line); } catch { continue; }
-      if (row.action === "claim" && row.outcome === "CLAIMED" && row.agentId === agentId && row.space === space) {
+      if (row.action === "claim" && row.outcome === "CLAIMED" &&
+          row.agentId === agentId && row.space === record.taskSpace) {
         return "CLAIM";
       }
     }
@@ -329,17 +349,28 @@ export async function ackOwnershipEvidence(agentId, space, monitorDir, dir, { di
 // Batch-1 table lists hooks/pre-tool-use.mjs as the落点, but the hook layer only
 // sees a command string and a session id — there is no reliable
 // session↔agent identity mapping there, and the ruling itself demands that
-// resolved fail closed whenever reliable identity is unavailable. Gating
-// resolved at the hook layer would therefore reject every Owner's legitimate
-// resolved. The gate lives in the one place with reliable identity evidence:
-// this managed ack path (registry binding and the conversation ledger are both
-// readable here). The hook layer stays unchanged.
+// resolved fail closed whenever a declared identity's ownership cannot be
+// verified. Gating resolved at the hook layer would therefore reject every
+// Owner's legitimate resolved. The gate lives in this managed ack path — the
+// only layer that can verify the DECLARED agentId's ownership relation to the
+// target TaskSpace (registry binding and the conversation ledger are both
+// readable here). It verifies declared-identity ownership, not the calling
+// process's real Agent identity, and does not prevent an actively forged
+// agentId (B-03 boundary wording).
 //
 // Every managed ack attempt appends one audit line to
 // <monitorDir>/a-wake-ack-audit.ndjson:
 //   { ts, agentId, space, conversation, wakeId, ackAction, outcome[, reason, evidence] }
 // outcome is GRANTED or DENIED; denials (including ownership denials and
-// WAKE_ID_NOT_PENDING failures) leave evidence too. The ego-watch-exit/v1
+// WAKE_ID_NOT_PENDING failures) leave evidence too.
+//
+// Audit/result consistency (planner re-review B-02): the audit verdict is
+// kept SEPARATE from the ack business result. A succeeded ack can never be
+// recorded as DENIED — if its GRANTED audit write fails, the failure is
+// reported as ACK_AUDIT_WRITE_FAILED on stderr and the ack still returns 0
+// (the exit code reflects the ack result, the audit failure is reported
+// separately). A failed ack best-effort writes DENIED (a failed DENIED write
+// is likewise reported, then the original error is rethrown). The ego-watch-exit/v1
 // marker schema is untouched (#25 frozen seven-field contract).
 export async function managedAcknowledge(p, { directory, now = Date.now() } = {}) {
   const dir = conversationDir(p);
@@ -348,12 +379,19 @@ export async function managedAcknowledge(p, { directory, now = Date.now() } = {}
     ts: new Date().toISOString(), agentId: p.agentId, space: p.space,
     conversation: p.conversation, wakeId: p.wakeId, ackAction: p.ackAction, ...entry,
   }) + "\n", "utf8");
+  // Warn-only reporting: an audit write failure never flips the ack verdict.
+  const auditWriteFailed = (error) => console.error("RESULT=ACK_AUDIT_WRITE_FAILED code=" +
+    String(error?.code || error?.message || "UNKNOWN"));
   let evidence = null;
   if (p.ackAction === "resolved") {
-    try { evidence = await ackOwnershipEvidence(p.agentId, p.space, p.monitorDir, dir, { directory }); }
+    try { evidence = await ackOwnershipEvidence(p.agentId, p.space, p.conversation, p.monitorDir, dir, { directory }); }
     catch { evidence = null; } // evidence lookup failure never grants
     if (!evidence) {
-      await audit({ outcome: "DENIED", reason: ACK_RESOLVED_OWNERSHIP_REQUIRED }).catch(() => {});
+      // Ownership denial: business ledgers stay untouched (fail-closed). The
+      // DENIED audit is best-effort — a write failure is reported but the
+      // denial stands (exit 2).
+      try { await audit({ outcome: "DENIED", reason: ACK_RESOLVED_OWNERSHIP_REQUIRED }); }
+      catch (error) { auditWriteFailed(error); }
       console.error("RESULT=ACK_DENIED code=" + ACK_RESOLVED_OWNERSHIP_REQUIRED);
       console.error("OPERATOR_ACTION=resolved 需空间所有权证据：先用受管 claim 接管该空间" +
         "（node monitor/dispatch-manager.mjs claim --monitor-dir <根> --agent-id <ID> --space <空间>），" +
@@ -363,12 +401,18 @@ export async function managedAcknowledge(p, { directory, now = Date.now() } = {}
   }
   try {
     await acknowledgeWake(p.wakeId, p.ackAction, dir, now);
-    await audit(evidence ? { outcome: "GRANTED", evidence } : { outcome: "GRANTED" });
-    return 0;
   } catch (error) {
-    await audit({ outcome: "DENIED", reason: String(error.code || error.message) }).catch(() => {});
+    // Ack failed: best-effort DENIED audit, then rethrow the ORIGINAL error —
+    // a failed audit write must not mask or replace the ack failure.
+    try { await audit({ outcome: "DENIED", reason: String(error.code || error.message) }); }
+    catch (auditError) { auditWriteFailed(auditError); }
     throw error;
   }
+  // The ack succeeded: it can never be recorded as DENIED. A failed GRANTED
+  // audit write is reported separately and the ack still returns 0.
+  try { await audit(evidence ? { outcome: "GRANTED", evidence } : { outcome: "GRANTED" }); }
+  catch (error) { auditWriteFailed(error); }
+  return 0;
 }
 
 export function classifyManagerResult(action, observation, record, params) {
