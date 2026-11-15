@@ -17,13 +17,13 @@
 
 1. 正常 `send` 一条短任务并 `watch` 布防（建立基线）。
 2. **[PO 手工步骤]** Agent 禁止终止或重启 Ego Lite 宿主 `ego.exe` 及其进程树（skill 1.7.1 硬禁令，PR#32）。由 PO 手工杀 ego 主进程 → 手工删除 ego 内该空间（或用 ego 提供的清理路径），确保 `listTaskSpaces` 无此空间；Agent 只保留 PO 操作前后的脱敏现场记录。
-3. **[PO 手工]** PO 重启 ego，完成后 Agent 接手：跑 `probe`，期望 `TASKSPACE_RECOVERY_FAILED` 且 stdout 含 `RECOVERY_HINT=SPACE_REGISTRY_LOST`。
+3. **[PO 手工]** PO 重启 ego，完成后 Agent 接手：跑 `probe`。r48 起为双分支：空间自举成功 → `SPACE_BOOTSTRAPPED`（注册表丢失自愈，无 HINT，监控继续）；自举也失败且非 takeover → `TASKSPACE_RECOVERY_FAILED` 且 stdout 含 `RECOVERY_HINT=SPACE_REGISTRY_LOST`（ego-fast-probe.mjs：HINT 仅在 `spaceRegistryMissing && !takeover && 自举抛错` 时输出）。健康机器上注册表丢失通常走自举分支（本机实测 2026-11-16）；因此步骤 4 的 rebuild-space 须趁空间仍缺失时执行，才能取得 `LEDGER_PROOF` 审计行。
 4. 跑 `node monitor/dispatch-manager.mjs rebuild-space --monitor-dir <根> --agent-id <ID> --space <空间>`：期望 `RESULT=SPACE_REBUILT`、exit 0；`<根>/a-space-rebuild-audit.ndjson` 出现 `decision=LEDGER_PROOF, outcome=REBUILT` 行。
 5. 重跑 `probe`/`watch`：期望空间恢复、页面恢复走既有链路（`SPACE_BOOTSTRAPPED` 不再出现，`AGENT_OWNED_BLANK_PAGE`/`NEW_PAGE_FOR_EXISTING_CONVERSATION` 任一恢复路径），任务继续到 DONE → collect/consume/release 全链。
 6. **allowlist 兜底一次**：另取一个未入账本的空间名，加入本机 `ego-profile.json` `spaceRebuildAllowlist` → rebuild-space：期望 `decision=ALLOWLIST`；对不在白名单且无账本的第三个名字：期望 `SPACE_REBUILD_DENIED code=SPACE_REBUILD_NOT_AUTHORIZED`（审计行 decision=DENIED）。
 7. **HINT 边界**：在 takeover 场景（ego 升级把空间还给用户）跑 probe：期望不出现 HINT、报 `EGO_TASKSPACE_TAKEOVER_REQUIRED`。
 
-**PASS 判据**：3~7 全部符合；audit 文件每个动作一行 JSON（含 DENIED）。
+**PASS 判据**：3~7 全部符合（3 按上述双分支任一，且与现场一致）；audit 文件每个动作一行 JSON（含 DENIED）。
 **附带复测**：若 watch 再次异常退出，按 §6.3 三段判定归因（detail=command not found / 堆栈行 / 无 detail），把归因结果回报 #31。
 
 ## E-25：接管门 + 源自验 + 升级回归（issue #25）
