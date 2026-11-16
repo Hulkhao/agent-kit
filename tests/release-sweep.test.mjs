@@ -501,6 +501,70 @@ test("#27 re-review② P1-A: after an audit write failure no further page is clo
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
+test("#27 re-review 4fa17a8: an unidentifiable page (about:blank) blocks absence backfill until it is really gone", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ego-sweep-blank-"));
+  try {
+    await claimAgentSpace({ agentId: AGENT, spaceName: SPACE, directory: root });
+    await writeLedger(root, OTHER, validLedger(OTHER, "COMPLETED"));
+    // ONE task and ONE page set across all runs; the target page survives run 1
+    // but is later found BLANKED (a live object whose identity is unknowable).
+    const pages = [];
+    const closedUrls = [];
+    const page = {
+      label: "L-target",
+      url: async () => chatUrl(OTHER),
+      close: async () => { pages.splice(pages.indexOf(page), 1); closedUrls.push(chatUrl(OTHER)); },
+    };
+    pages.push(page);
+    const task = { pages: async () => pages };
+    const auditFile = join(root, "a-release-sweep-audit.ndjson");
+    const realAudit = makeSweepAudit({ auditFile, agentId: AGENT, space: SPACE, conversationUuid: CONV });
+    // Run 1: intent persists, close succeeds, final line write fails → the
+    // intent stays unconfirmed (the planner's construction).
+    const run1 = await sweepTaskPages({
+      task, monitorDir: root, agentId: AGENT, space: SPACE,
+      conversationUuid: CONV, known: [CONV, OTHER], auditFile,
+      audit: async (entry) => {
+        if (entry.decision === "closed") throw new Error("EIO");
+        return realAudit(entry);
+      },
+    });
+    assert.equal(run1.closed, 1);
+    assert.equal(run1.unconfirmed, 1);
+    const intent = JSON.parse((await readFile(auditFile, "utf8")).trim().split("\n")
+      .find((line) => line.includes("close-intent")));
+    // Run 2 on the SAME set: the target page is gone, but an about:blank page
+    // is present (assertManagedReleasePages may pass a managed blank). Its
+    // identity is unknowable → absence cannot be proven → NO backfill.
+    pages.push({ label: "L-blank", url: async () => "about:blank", close: async () => {} });
+    const run2 = await sweepTaskPages({
+      task, monitorDir: root, agentId: AGENT, space: SPACE,
+      conversationUuid: CONV, known: [CONV, OTHER], auditFile, // healthy writer
+    });
+    assert.ok(run2.unconfirmed > 0, "the intent must stay unconfirmed while an unidentifiable page exists");
+    assert.equal(run2.backfilled, 0);
+    assert.equal((await readFile(auditFile, "utf8")).includes("closed-backfilled"), false);
+    // Until backfill, sweepPending must not clear: the template gate is
+    // failed > 0 || unconfirmed > 0 (text asserted in dispatch-governance).
+    assert.ok(run2.unconfirmed > 0 || run2.failed > 0);
+    // Run 3: the blank page truly leaves the set → absence is provable and
+    // the carried intent is finally backfilled.
+    pages.splice(pages.indexOf(pages.find((p) => p.label === "L-blank")), 1);
+    const run3 = await sweepTaskPages({
+      task, monitorDir: root, agentId: AGENT, space: SPACE,
+      conversationUuid: CONV, known: [CONV, OTHER], auditFile,
+    });
+    assert.equal(run3.backfilled, 1);
+    assert.equal(run3.unconfirmed, 0);
+    assert.equal(run3.failed, 0);
+    const backfill = (await readFile(auditFile, "utf8")).trim().split("\n")
+      .map((line) => JSON.parse(line)).find((line) => line.decision === "closed-backfilled");
+    assert.ok(backfill);
+    assert.equal(backfill.intentId, intent.intentId); // references the persisted intent
+    assert.equal(backfill.page.uuid, OTHER);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test("#27 re-review② P1-B: a legacy releasePending blocks other conversations' sweep intents without deadlock", async () => {
   const root = await mkdtemp(join(tmpdir(), "ego-sweep-legacy-"));
   try {

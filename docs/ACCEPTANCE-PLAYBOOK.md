@@ -82,7 +82,7 @@
    - **最后会话不再 `finish({keep:[]})` 一把全关**（复审 P1-2，ego finish 的 keep 保留语义无权威文档不赌）：受管 finish 分支只关目标页，其余页逐页分类；**仅当最后会话 + 零保留页 + 零失败**才 finish 销毁空空间；有任何保留页 → 空间带保留页继续存活，注册表侧记录 release 完成态，由归属者后续处置；
    - TaskSpace 本身不删除（上一条的空空间 finish 除外）；其他 Agent 页面/用户页面不可触碰（unmanaged tab 由既有 `assertManagedReleasePages` 前置拦截）；
    - 清理失败（关页失败/枚举失败/审计写失败）→ `RESULT=AGENT_SPACE_RELEASE_SWEEP_FAILED` exit 2，真实上报不伪装完整 release，OPERATOR 指引重跑；
-   - **close-intent 审计恢复**（复审② P1-A）：每页关闭前先在同一 `a-release-sweep-audit.ndjson` 写 `close-intent` 行（intentId）；intent 写失败该页不关；审计写失败后停止一切后续关页；重跑时页面已消失的遗留 intent 依持久化记录补 `closed-backfilled` 行（与实时 closed 行可区分）；sweepPending 仅在 failed=0 且每个 intent 都有处置确认时清除；
+   - **close-intent 审计恢复**（复审② P1-A）：每页关闭前先在同一 `a-release-sweep-audit.ndjson` 写 `close-intent` 行（intentId）；intent 写失败该页不关；审计写失败后停止一切后续关页；重跑时页面已消失且集合中无身份不可知页（URL 读取失败或解析不出有效会话 UUID，含空白页）的遗留 intent 依持久化记录补 `closed-backfilled` 行（与实时 closed 行可区分）；sweepPending 仅在 failed=0 且每个 intent 都有处置确认时清除；
    - **sweepPending 可恢复状态**（复审 P1-3）：浏览器动作前 intent-first 写入注册表条目 `{conversationUuid, startedAt}`；失败后重跑 release 不走早退、真实重扫（需要浏览器），全部成功才清标志；完整成功后的重复 release 走注册表早退，零浏览器调用直接成功；
    - **旧版 releasePending 升级兼容**（复审② P1-B）：注册表遗留他话会话的 releasePending（无 sweepPending）时，其他会话的 sweep intent 拒绝建立（`AGENT_SPACE_RELEASE_PENDING`，不写标志），先恢复旧 releasePending 那笔——同会话 pending 属正常恢复形态，无迁移机制。
 3. **claim 归属字段合同**：claim 审计行含 `ownerAgentId`、`taskSpaceId`、`taskSpaceName`、`conversation:null`；模板回读证据（`SPACE_CLAIMED_TASK_ID/NAME`）缺失时字段如实留 null；**#33 授权链（ledger binding → spaceTaken → allowlist → deny）零变化**（`authorizeSpaceRebuild` 源码与既有用例原样通过）。

@@ -80,7 +80,7 @@ release(CONV)
 **审计恢复成功判定**：重跑时（同一 task/页面集合贯穿）逐页重扫——
 - 页面仍存在 → 重新执行关闭（intent 已持久化的复用原 intentId）；
 - 页面已消失且本跑无身份不可知页 → 依据持久化 intent 写 `closed-backfilled` 补齐行（仅补**上轮遗留** intent；本轮新产生且处置行写失败的 intent 保留到下轮，不在自身写失败的同跑内自证）；
-- 枚举失败或存在 URL 不可读页 → 无法证明缺席，不补齐（fail-closed）。
+- 枚举失败，或集合中存在身份不可知页（URL 读取失败**或解析不出有效会话 UUID**，含 about:blank 等空白页——空白页可能正是被清稿的原目标页）→ 无法证明缺席，不补齐（fail-closed，复审 4fa17a8）；页面 label 一律不作为身份证据（仅审计记录字段）。
 
 **sweepPending 最终清除条件**：`failed === 0` **且** `unconfirmed === 0`（每个 intent 都有处置行确认）且审计链可校验（文件可解析）。任一不满足 → SWEEP_FAILED exit 2，sweepPending 保留，重跑真实重扫。
 

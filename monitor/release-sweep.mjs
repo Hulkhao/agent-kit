@@ -146,10 +146,18 @@ export async function sweepTaskPages({
     catch { auditBroken = true; failed++; return false; }
   };
 
+  // pageId is an AUDIT-RECORD field only — a page label never proves identity;
+  // identity comes exclusively from the conversation URL's valid uuid.
   const pageId = (page, uuid) => ({ label: page?.label ?? null, uuid: uuid ?? null });
   let remaining = [];
   let enumerated = false;
-  let sawUnknownPage = false; // a page whose URL READ threw: its identity is unknowable
+  // A page whose URL read threw OR parsed to no valid conversation uuid (e.g.
+  // about:blank — assertManagedReleasePages may legitimately pass a managed
+  // blank) has UNKNOWABLE identity: while any such page exists, this run
+  // cannot prove a carried intent's page is absent, so absence backfill is
+  // blocked (re-review 4fa17a8: a surviving-but-blanked page must never be
+  // audited as closed).
+  let sawUnidentifiablePage = false;
   if (task) {
     try { remaining = [...await task.pages()]; enumerated = true; }
     catch (error) {
@@ -162,7 +170,8 @@ export async function sweepTaskPages({
   for (const page of enumerated ? remaining : []) {
     let uuid = null;
     try { uuid = conversationIdFromUrl(await page.url(), true); }
-    catch { uuid = null; sawUnknownPage = true; }
+    catch { uuid = null; }
+    if (!uuid) sawUnidentifiablePage = true;
     const status = uuid ? await ledgerStatusOf(monitorDir, uuid, space) : null;
     const verdict = classifySweepPage({ uuid, conversationUuid, known, status });
     const priorIntent = uuid ? open.get(uuid.toLowerCase()) : null;
@@ -212,7 +221,7 @@ export async function sweepTaskPages({
   // reference). When any page's identity was unknowable this run, absence
   // cannot be proven → the intents stay open (fail-closed; SWEEP_FAILED, the
   // flag is not cleared).
-  const absenceProvable = !task || (enumerated && !sawUnknownPage);
+  const absenceProvable = !task || (enumerated && !sawUnidentifiablePage);
   if (absenceProvable) {
     for (const [uuidLower, intent] of [...open]) {
       if (!carried.has(uuidLower)) continue; // born this run → waits for the rerun
