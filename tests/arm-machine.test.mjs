@@ -404,12 +404,21 @@ test("#27 B3 disarm criteria: each blocker fires alone and the happy path is eli
     { eligible: true, blockers: [] });
 });
 
-async function completedConsumed(dir) {
-  const record = dispatchRecord();
+async function completedConsumed(dir, record = dispatchRecord()) {
   await writeFile(join(dir, "a-dispatch-state.json"), JSON.stringify(record));
   const receipt = await saveReply(dir, record, { text: "已消费回复", source: "DOM_BOUNDARY_VISIBLE" }, uuid);
   await acknowledgeReply(dir, record, receipt.sha256);
   return record;
+}
+
+// P1-C round 3: companion release-success credential (a-disarm-credential.json)
+// helpers for the retry-gate tests.
+const disarmCredential = (dispatchId = uuid) =>
+  ({ schema: "ego-disarm-credential/v1", dispatchId, issuedAt: Date.now() });
+
+async function writeDisarmCredential(dir, credential) {
+  await writeFile(join(dir, "a-disarm-credential.json"),
+    typeof credential === "string" ? credential : JSON.stringify(credential), "utf8");
 }
 
 test("#27 B3 disarmAfterRelease: satisfied criteria write DISARMED_IDLE after terminal confirmation (ruling order)", async () => {
@@ -711,26 +720,35 @@ test("#27 B3 P1-C: a deferred disarm exits the watch through the durable DISARM_
   }
 });
 
-test("#27 B3 P1-C round 2: the managed retry path requires a release-success credential and converges exactly once", async () => {
+test("#27 B3 P1-C rounds 2+3: the managed retry path requires a release-success credential bound to THIS dispatch and converges exactly once", async () => {
   // Ruling rewrite: the previous version of this test FIXED THE BUGGY BEHAVIOR —
   // it expected a disarm from a COMPLETED + already-consumed ledger with NO
   // release evidence at all. A retry is a convergence of a prior SUCCESSFUL
   // release only; its credential is the durable DISARM_DEFERRED_WAKE_SUPERVISOR
   // wake marker a verified release leaves when it defers the disarm.
+  // Round 3: the marker alone is no longer the credential — the gate also
+  // requires the companion a-disarm-credential.json naming the ledger's
+  // CURRENT dispatchId.
   const root = await mkdtemp(join(tmpdir(), "ego-disarm-retry-"));
   try {
     const dir = await makeConversation(root, { "a-fast-state.json": armedState("DISPATCH_ACCEPTED") });
     await completedConsumed(dir);
-    // No credential: the retry is a no-op and the ledger stays armed.
+    // No credential (and no marker): the retry is a no-op and the ledger stays armed.
     const unproven = await retryPendingDisarm(dir, { rootMonitorDir: root });
     assert.deepEqual(unproven, { disarmed: false, alreadyDisarmed: false, blockers: ["RELEASE_SUCCESS_UNPROVEN"] });
     assert.equal(JSON.parse(await readFile(join(dir, "a-fast-state.json"), "utf8")).armedReason, "DISPATCH_ACCEPTED");
-    // The credential SHAPE with its own wake still unacked: blocked (fail-closed)
-    // by the wake criterion itself until the supervisor acks.
+    // A DISARM_DEFERRED marker without its companion credential (round-2 shape
+    // alone, e.g. the credential write failed or was cleared) is unproven.
     await writeFile(join(dir, "a-watch-exit.json"), JSON.stringify({
       schema: "ego-watch-exit/v1", wakeId: otherUuid, reason: "DISARM_DEFERRED_WAKE_SUPERVISOR",
       issuedAt: Date.now(), exitCode: 2, acknowledgedAt: null, ackAction: null,
     }));
+    const markerOnly = await retryPendingDisarm(dir, { rootMonitorDir: root });
+    assert.deepEqual(markerOnly, { disarmed: false, alreadyDisarmed: false, blockers: ["RELEASE_SUCCESS_UNPROVEN"] });
+    // The full credential SHAPE (marker + companion file) with its own wake
+    // still unacked: blocked (fail-closed) by the wake criterion itself until
+    // the supervisor acks.
+    await writeDisarmCredential(dir, disarmCredential());
     const unacked = await retryPendingDisarm(dir, { rootMonitorDir: root });
     assert.equal(unacked.disarmed, false);
     assert.ok(unacked.blockers.includes("WAKE_MARKER_UNACKNOWLEDGED"), JSON.stringify(unacked.blockers));
@@ -749,6 +767,44 @@ test("#27 B3 P1-C round 2: the managed retry path requires a release-success cre
     const events = (await readFile(join(dir, "a-fast-events.ndjson"), "utf8")).trim().split("\n");
     assert.equal(events.filter((line) => line.includes("DISARMED_IDLE")).length, 1);
   } finally { await rm(root, { recursive: true, force: true }); }
+  // Gate component checks (round 3, still on the armed-conversation shape):
+  // a companion credential that fails any ownership criterion keeps the ledger
+  // armed, and a later failed release overwriting the marker invalidates the
+  // pair even though the credential file itself is still on disk.
+  const gateRoot = await mkdtemp(join(tmpdir(), "ego-disarm-retry-gate-"));
+  try {
+    const dir = await makeConversation(gateRoot, { "a-fast-state.json": armedState("DISPATCH_ACCEPTED") });
+    await completedConsumed(dir);
+    await writeFile(join(dir, "a-watch-exit.json"), JSON.stringify({
+      schema: "ego-watch-exit/v1", wakeId: otherUuid, reason: "DISARM_DEFERRED_WAKE_SUPERVISOR",
+      issuedAt: Date.now(), exitCode: 2, acknowledgedAt: Date.now(), ackAction: "investigated",
+    }));
+    // Foreign dispatchId in the credential: the ledger's current dispatch
+    // instance is never proven -> RELEASE_SUCCESS_UNPROVEN.
+    await writeDisarmCredential(dir, disarmCredential(otherUuid));
+    const foreign = await retryPendingDisarm(dir, { rootMonitorDir: gateRoot });
+    assert.deepEqual(foreign, { disarmed: false, alreadyDisarmed: false, blockers: ["RELEASE_SUCCESS_UNPROVEN"] });
+    // Corrupt credential bytes: unproven.
+    await writeDisarmCredential(dir, "{corrupted");
+    const corrupt = await retryPendingDisarm(dir, { rootMonitorDir: gateRoot });
+    assert.deepEqual(corrupt, { disarmed: false, alreadyDisarmed: false, blockers: ["RELEASE_SUCCESS_UNPROVEN"] });
+    // Foreign schema: unproven.
+    await writeDisarmCredential(dir, { schema: "ego-disarm-credential/v2", dispatchId: uuid, issuedAt: Date.now() });
+    const foreignSchema = await retryPendingDisarm(dir, { rootMonitorDir: gateRoot });
+    assert.deepEqual(foreignSchema, { disarmed: false, alreadyDisarmed: false, blockers: ["RELEASE_SUCCESS_UNPROVEN"] });
+    // Valid credential, but the marker no longer records a deferred disarm (a
+    // later FAILED release overwrote it): the pair is invalidated -> unproven.
+    await writeDisarmCredential(dir, disarmCredential());
+    await writeFile(join(dir, "a-watch-exit.json"), JSON.stringify({
+      schema: "ego-watch-exit/v1", wakeId: otherUuid, reason: "REPLY_DELIVERED_RELEASE_PENDING",
+      issuedAt: Date.now(), exitCode: 2, acknowledgedAt: Date.now(), ackAction: "investigated",
+    }));
+    const overwritten = await retryPendingDisarm(dir, { rootMonitorDir: gateRoot });
+    assert.deepEqual(overwritten, { disarmed: false, alreadyDisarmed: false, blockers: ["RELEASE_SUCCESS_UNPROVEN"] });
+    assert.equal(JSON.parse(await readFile(join(dir, "a-fast-state.json"), "utf8")).armedReason, "DISPATCH_ACCEPTED");
+    // The gate never fired a disarm through any of the failing shapes above.
+    await assert.rejects(readFile(join(dir, "a-fast-events.ndjson"), "utf8"), /ENOENT/);
+  } finally { await rm(gateRoot, { recursive: true, force: true }); }
   // Wiring pin (unchanged): consume and the managed ack both run the retry after
   // their own managed work succeeded; both deferred-disarm exits share one reason.
   const source = await readFile(
@@ -835,6 +891,124 @@ test("#27 B3 P1-C round 2: consume-before-release keeps the ledger armed — no 
     const bare = await retryPendingDisarm(dir, { rootMonitorDir: root });
     assert.deepEqual(bare, { disarmed: false, alreadyDisarmed: false, blockers: ["RELEASE_SUCCESS_UNPROVEN"] });
     assert.equal(JSON.parse(await readFile(join(dir, "a-fast-state.json"), "utf8")).armedReason, "DISPATCH_ACCEPTED");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("#27 B3 P1-C round 3 (ruling scenario): a surviving stale deferred marker can never authorize a NEW dispatch's disarm", async () => {
+  // The exact attack path from the round-3 ruling: old dispatch released
+  // successfully with a deferred disarm (sibling in flight) -> supervisor acked
+  // and the credential survived -> the SAME fixed conversation page started a
+  // NEW dispatch -> the new dispatch's REPLY_READY marker write FAILED (we
+  // reproduce the post-failure durable state exactly: exitWatching swallows
+  // write errors, so the old acked DISARM_DEFERRED marker simply survives on
+  // disk) -> the new dispatch completed and consumed its reply. The retry must
+  // stay armed until the NEW dispatch itself releases successfully.
+  const root = await mkdtemp(join(tmpdir(), "ego-disarm-cross-"));
+  const logs = [];
+  const originalLog = console.log;
+  const originalError = console.error;
+  try {
+    const dir = await makeConversation(root, { "a-fast-state.json": armedState("DISPATCH_ACCEPTED") });
+    const oldRecord = await completedConsumed(dir);
+    // Sibling dispatch in flight -> the old dispatch's disarm defers.
+    const sibling = join(root, "conversations", otherUuid);
+    await mkdir(sibling, { recursive: true });
+    await writeFile(join(sibling, "a-dispatch-state.json"),
+      JSON.stringify(dispatchRecord({ dispatchId: otherUuid, conversationUuid: otherUuid, status: "ACCEPTED" })));
+    const params = { conversation: uuid, space: "GDC-执行A", agentId: "gdc-a", monitorDir: root, rootMonitorDir: root };
+    console.log = (line) => logs.push(String(line));
+    console.error = (line) => logs.push(String(line));
+    const deferred = await releaseDelivered(params, dir, {
+      runScript: async () => ({ code: 0, result: "AGENT_SPACE_RELEASED" }),
+    });
+    assert.equal(deferred, 2);
+    // The deferred handoff issued the companion credential for the OLD dispatch.
+    const oldCredential = JSON.parse(await readFile(join(dir, "a-disarm-credential.json"), "utf8"));
+    assert.equal(oldCredential.schema, "ego-disarm-credential/v1");
+    assert.equal(oldCredential.dispatchId, oldRecord.dispatchId);
+    // Supervisor acks the deferred wake; the sibling still blocks the retry,
+    // so the ledger stays armed and the credential is retained.
+    let marker = JSON.parse(await readFile(join(dir, "a-watch-exit.json"), "utf8"));
+    assert.equal(marker.reason, "DISARM_DEFERRED_WAKE_SUPERVISOR");
+    const ackCode = await managedAcknowledge({
+      agentId: "gdc-a", space: "GDC-执行A", conversation: uuid,
+      wakeId: marker.wakeId, ackAction: "investigated", monitorDir: root,
+    });
+    assert.equal(ackCode, 0);
+    assert.equal(JSON.parse(await readFile(join(dir, "a-fast-state.json"), "utf8")).armedReason, "DISPATCH_ACCEPTED");
+    assert.equal((await readFile(join(dir, "a-disarm-credential.json"), "utf8")).length > 0, true);
+    // The sibling finishes. Instead of a retry, the SAME fixed conversation
+    // page now starts a NEW dispatch: arming must clear the stale credential.
+    await rm(sibling, { recursive: true, force: true });
+    await armForDispatch(dir, { conversationUuid: uuid, space: "GDC-执行A" });
+    assert.equal(await readFile(join(dir, "a-disarm-credential.json"), "utf8")
+      .then(() => true, (error) => error.code === "ENOENT" ? false : Promise.reject(error)), false);
+    // The new dispatch replaces the ledger (same conversation, new instance).
+    // Realistic order: the reply is staged while the new dispatch is ACCEPTED
+    // (this archives the old dispatch's consumed reply), then the ledger
+    // completes and the reply is consumed.
+    const acceptedRecord = dispatchRecord({ dispatchId: otherUuid, status: "ACCEPTED" });
+    await writeFile(join(dir, "a-dispatch-state.json"), JSON.stringify(acceptedRecord));
+    const newReceipt = await saveReply(dir, acceptedRecord, { text: "已消费回复", source: "DOM_BOUNDARY_VISIBLE" }, uuid);
+    const newRecord = { ...acceptedRecord, status: "COMPLETED" };
+    await writeFile(join(dir, "a-dispatch-state.json"), JSON.stringify(newRecord));
+    await acknowledgeReply(dir, newRecord, newReceipt.sha256);
+    assert.notEqual(newRecord.dispatchId, oldRecord.dispatchId);
+    // The new watch marker write fails: the OLD acked DISARM_DEFERRED marker
+    // survives on disk (durable state identical to a swallowed write error).
+    marker = JSON.parse(await readFile(join(dir, "a-watch-exit.json"), "utf8"));
+    assert.equal(marker.reason, "DISARM_DEFERRED_WAKE_SUPERVISOR");
+    assert.notEqual(marker.acknowledgedAt, null);
+    // The retry against the stale marker must NOT disarm the new dispatch.
+    const stale = await retryPendingDisarm(dir, { rootMonitorDir: root });
+    assert.deepEqual(stale, { disarmed: false, alreadyDisarmed: false, blockers: ["RELEASE_SUCCESS_UNPROVEN"] });
+    assert.equal(JSON.parse(await readFile(join(dir, "a-fast-state.json"), "utf8")).armedReason, "DISPATCH_ACCEPTED");
+    // Even a FORGED/leftover credential naming the OLD dispatchId cannot
+    // bridge the instance gap (dispatchId mismatch -> stays armed).
+    await writeDisarmCredential(dir, disarmCredential(oldRecord.dispatchId));
+    const mismatch = await retryPendingDisarm(dir, { rootMonitorDir: root });
+    assert.deepEqual(mismatch, { disarmed: false, alreadyDisarmed: false, blockers: ["RELEASE_SUCCESS_UNPROVEN"] });
+    // A corrupt credential is equally unproven.
+    await writeDisarmCredential(dir, "{corrupted");
+    const corrupt = await retryPendingDisarm(dir, { rootMonitorDir: root });
+    assert.deepEqual(corrupt, { disarmed: false, alreadyDisarmed: false, blockers: ["RELEASE_SUCCESS_UNPROVEN"] });
+    // No DISARMED_IDLE was ever written for the unreleased new dispatch.
+    const beforeRelease = (await readFile(join(dir, "a-fast-events.ndjson"), "utf8")).trim().split("\n")
+      .filter((line) => line.includes("DISARMED_IDLE"));
+    assert.equal(beforeRelease.length, 0);
+    // Only the NEW dispatch's own verified release converges the disarm.
+    logs.length = 0;
+    const released = await releaseDelivered(params, dir, {
+      runScript: async () => ({ code: 0, result: "AGENT_SPACE_RELEASED" }),
+    });
+    assert.equal(released, 0);
+    assert.ok(logs.some((line) => line === "RESULT=DISPATCH_FINISHED_AND_RELEASED"));
+    assert.equal(JSON.parse(await readFile(join(dir, "a-fast-state.json"), "utf8")).armedReason, "DISARMED_IDLE");
+    const afterRelease = (await readFile(join(dir, "a-fast-events.ndjson"), "utf8")).trim().split("\n")
+      .filter((line) => line.includes("DISARMED_IDLE"));
+    assert.equal(afterRelease.length, 1);
+  } finally {
+    console.log = originalLog;
+    console.error = originalError;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("#27 B3 P1-C round 3: armForDispatch fails closed when a stale credential cannot be cleared", async () => {
+  // Forcing (real filesystem behavior, no mocks): the credential's path is
+  // occupied by a DIRECTORY, so unlink can never succeed. Arming a new
+  // dispatch over a leftover credential would reopen the inheritance gap, so
+  // the arm aborts before any state write.
+  const root = await mkdtemp(join(tmpdir(), "ego-arm-credential-clear-"));
+  try {
+    const dir = await makeConversation(root);
+    await mkdir(join(dir, "a-disarm-credential.json"), { recursive: true });
+    await assert.rejects(
+      armForDispatch(dir, { conversationUuid: uuid, space: "GDC-执行A" }),
+      /ARM_DISARM_CREDENTIAL_CLEAR_FAILED/);
+    // Nothing was armed: no fast state was written and no arm event exists.
+    await assert.rejects(readFile(join(dir, "a-fast-state.json"), "utf8"), /ENOENT/);
+    await assert.rejects(readFile(join(dir, "a-fast-events.ndjson"), "utf8"), /ENOENT/);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
