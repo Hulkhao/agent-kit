@@ -9,7 +9,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { tick, acknowledge } from "./supervision-watchdog.mjs";
-import { readDispatchState, markCompleted, writeJsonAtomic, validateDispatchRecord, evaluateDisarmEligibility, appendEvent } from "./dispatch-state.mjs";
+import { readDispatchState, markCompleted, writeJsonAtomic, validateDispatchRecord, evaluateDisarmEligibility, appendEvent, withCommitLock, isCommitLockError } from "./dispatch-state.mjs";
 import { ARMED_REASONS, IN_FLIGHT_DISPATCH_STATUSES, armedTransitionPatch, classifyFastStateFile, normalizeFastState } from "./state-schema.mjs";
 import { verifiedReply, acknowledgeReply, verifiedConsumption, sha256 } from "./reply-delivery.mjs";
 import { withAgentRegistry } from "./agent-space.mjs";
@@ -757,51 +757,87 @@ async function archiveCorruptFastState(dir, timestamp = Date.now()) {
 // §四.1) WITH the P1-A corrupt carry-over so the storm gate stays shut. A
 // legacy v3 ledger arms from null for the new dispatch (the ruling's legacy
 // clause forbids inferring DISARM, not recording an explicit new arm).
-export async function armForDispatch(dir, { conversationUuid = null, space = null, timestamp = Date.now() } = {}) {
-  // P1-C round 3: a new dispatch never inherits the previous round's release
-  // success — any leftover companion credential is cleared BEFORE the new arm
-  // state is written. A failed clear aborts the whole arm fail-closed (arming
-  // over a stale credential would reopen the cross-dispatch inheritance gap;
-  // the same ordering precedent as the P1-A archive-before-write).
-  try { await unlink(join(dir, DISARM_CREDENTIAL_FILE)); }
-  catch (error) {
-    if (error.code !== "ENOENT") throw new Error("ARM_DISARM_CREDENTIAL_CLEAR_FAILED");
+//
+// P1-C round 5 (ruling requirements 1+4): the whole arm write section runs
+// under the per-conversation commit lock (withCommitLock, dispatch-state.mjs)
+// — the same coordination mechanism prepareDispatch's PREPARED ledger
+// establishment and disarmAfterRelease's final commit use. Fail-closed: an
+// unavailable lock aborts the arm BEFORE any state write, so main() never
+// reaches the delivery template (ARM_COMMIT_LOCK_FAILED, exit 2, nothing sent).
+// The arm also stamps armedSupersededDispatchId with the dispatchId of the
+// TERMINAL ledger observed at arm time (dispatch-manager's route-(a) instance
+// mark): the disarm commit of THAT instance reads the stamp fresh under the
+// lock and refuses when a newer dispatch armed over it in the identity-check →
+// write window. An ACTIVE ledger (e.g. a PREPARED resume) stamps nothing —
+// that dispatch's own later disarm must never be blocked by its own re-arm —
+// and an unreadable ledger stamps nothing (the disarm commit's own in-lock
+// ledger re-read stays fail-closed for that case).
+export async function armForDispatch(dir, { conversationUuid = null, space = null, timestamp = Date.now(), commitLock = null } = {}) {
+  try {
+    return await withCommitLock(dir, async () => {
+      // P1-C round 3: a new dispatch never inherits the previous round's release
+      // success — any leftover companion credential is cleared BEFORE the new arm
+      // state is written. A failed clear aborts the whole arm fail-closed (arming
+      // over a stale credential would reopen the cross-dispatch inheritance gap;
+      // the same ordering precedent as the P1-A archive-before-write).
+      try { await unlink(join(dir, DISARM_CREDENTIAL_FILE)); }
+      catch (error) {
+        if (error.code !== "ENOENT") throw new Error("ARM_DISARM_CREDENTIAL_CLEAR_FAILED");
+      }
+      // The supersession stamp (round 5): which terminal dispatch instance, if
+      // any, did this arm supersede? Read INSIDE the lock, same critical
+      // section as the fast-state write below.
+      let superseded = null;
+      try {
+        const ledger = await readDispatchState(dir);
+        if (ledger && (ledger.status === "COMPLETED" || ledger.status === "ABORTED")) {
+          superseded = ledger.dispatchId;
+        }
+      } catch { /* unreadable ledger stamps nothing — fail-closed stays with the disarm commit */ }
+      const { classification, value } = await readFastStateForDecision(dir);
+      const current = currentArmedReasonOf(classification, value);
+      const target = classification === "corrupt" ? "ARMED_UNKNOWN" : "DISPATCH_ACCEPTED";
+      const decision = armedTransitionPatch(current, target, { conversation: conversationUuid, space, timestamp });
+      if (!decision.ok) throw new Error(`ARM_TRANSITION_REJECTED:${current}->${target}`);
+      let corruptArchive = null;
+      if (classification === "corrupt") {
+        try { corruptArchive = await archiveCorruptFastState(dir, timestamp); }
+        catch (error) {
+          // P1-A (re-review round 2): an archive failure aborts THIS arm write.
+          // The original corrupt ledger is durable blocking evidence the storm
+          // gate refuses on as-is, so it is never overwritten just to arm — the
+          // write below (and the ARMED_DISPATCH_ACCEPTED event) never run. The
+          // failure stays in the event audit, then the whole arm fails closed and
+          // the send surfaces MANAGER_FAILURE without any delivery.
+          await appendEvent(dir, "CORRUPT_STATE_ARCHIVE_FAILED", {
+            code: String(error?.code || error?.message || "UNKNOWN").slice(0, 80),
+          }).catch(() => {});
+          throw new Error("ARM_CORRUPT_STATE_ARCHIVE_FAILED");
+        }
+      }
+      const armPatch = { ...decision.patch, armedSupersededDispatchId: superseded };
+      const next = normalizeFastState(classification === "current" || classification === "legacy" ? value : {},
+        classification === "corrupt"
+          // P1-A carry-over: mirrors the probe's own corrupt landing (probeFailed +
+          // errorCode STATE_CORRUPT) so every reader that treats the marker as a
+          // structural failure — the storm gate included — keeps refusing.
+          ? { ...armPatch, probeFailed: true, recoveryFailed: true, errorCode: "STATE_CORRUPT" }
+          : armPatch, timestamp);
+      await writeJsonAtomic(fastStateFileOf(dir), next);
+      await appendEvent(dir, "ARMED_DISPATCH_ACCEPTED", {
+        conversation: conversationUuid, space: space ?? null,
+        previousReason: current, sourceClassification: classification,
+        ...(superseded ? { supersededDispatchId: superseded } : {}),
+        ...(corruptArchive ? { corruptArchive, stormCarryOver: "STATE_CORRUPT" } : {}),
+      });
+      return next;
+    }, commitLock ?? undefined);
+  } catch (error) {
+    // Fail-closed (ruling requirement 4): an arm that cannot take the commit
+    // lock never arms and never delivers — main() aborts before the template.
+    if (isCommitLockError(error)) throw new Error("ARM_COMMIT_LOCK_FAILED:" + error.message);
+    throw error;
   }
-  const { classification, value } = await readFastStateForDecision(dir);
-  const current = currentArmedReasonOf(classification, value);
-  const target = classification === "corrupt" ? "ARMED_UNKNOWN" : "DISPATCH_ACCEPTED";
-  const decision = armedTransitionPatch(current, target, { conversation: conversationUuid, space, timestamp });
-  if (!decision.ok) throw new Error(`ARM_TRANSITION_REJECTED:${current}->${target}`);
-  let corruptArchive = null;
-  if (classification === "corrupt") {
-    try { corruptArchive = await archiveCorruptFastState(dir, timestamp); }
-    catch (error) {
-      // P1-A (re-review round 2): an archive failure aborts THIS arm write.
-      // The original corrupt ledger is durable blocking evidence the storm
-      // gate refuses on as-is, so it is never overwritten just to arm — the
-      // write below (and the ARMED_DISPATCH_ACCEPTED event) never run. The
-      // failure stays in the event audit, then the whole arm fails closed and
-      // the send surfaces MANAGER_FAILURE without any delivery.
-      await appendEvent(dir, "CORRUPT_STATE_ARCHIVE_FAILED", {
-        code: String(error?.code || error?.message || "UNKNOWN").slice(0, 80),
-      }).catch(() => {});
-      throw new Error("ARM_CORRUPT_STATE_ARCHIVE_FAILED");
-    }
-  }
-  const next = normalizeFastState(classification === "current" || classification === "legacy" ? value : {},
-    classification === "corrupt"
-      // P1-A carry-over: mirrors the probe's own corrupt landing (probeFailed +
-      // errorCode STATE_CORRUPT) so every reader that treats the marker as a
-      // structural failure — the storm gate included — keeps refusing.
-      ? { ...decision.patch, probeFailed: true, recoveryFailed: true, errorCode: "STATE_CORRUPT" }
-      : decision.patch, timestamp);
-  await writeJsonAtomic(fastStateFileOf(dir), next);
-  await appendEvent(dir, "ARMED_DISPATCH_ACCEPTED", {
-    conversation: conversationUuid, space: space ?? null,
-    previousReason: current, sourceClassification: classification,
-    ...(corruptArchive ? { corruptArchive, stormCarryOver: "STATE_CORRUPT" } : {}),
-  });
-  return next;
 }
 
 // ---- #27 Batch 3 P1-B: mirrored wake-guard structure contracts ----
@@ -1008,7 +1044,25 @@ async function hasDeferredReleaseCredential(dir) {
 // release of the previous COMPLETED dispatch is running; without this binding
 // the disarm would read the replaced ledger's terminal/consumption state and
 // the credential would be misbound to the new instance.
-export async function disarmAfterRelease(dir, { rootMonitorDir = null, timestamp = Date.now(), expectedDispatchId = null } = {}) {
+//
+// P1-C round 5 (ruling requirements 2+3+4): the FINAL identity confirmation
+// and the DISARMED_IDLE write are ONE critical section under the
+// per-conversation commit lock. The evidence gathering above stays outside the
+// lock (it is advisory); the authoritative sequence inside the lock is:
+//   acquire lock → re-read ledger → identity re-verification (expectedDispatchId)
+//   → re-read fast state → armed-instance re-verification
+//     (armedSupersededDispatchId, stamped by every coordinated arm) →
+//   transition check → write DISARMED_IDLE → release lock.
+// A concurrent dispatch B that armed (and/or replaced the ledger) either did so
+// BEFORE the lock was taken — then the in-lock re-reads see B's stamp or B's
+// ledger and refuse — or must WAIT for the lock, and then re-arms over the
+// already-written DISARMED_IDLE (the legal DISARMED_IDLE → DISPATCH_ACCEPTED
+// transition). Either way B's armed state is never overwritten (ruling
+// requirement 4). `beforeCommit` is a test injection point (runScript
+// precedent): it runs AFTER the advisory checks and BEFORE the lock is taken —
+// exactly the un-held window the ruling's behavior tests must interleave into.
+// `commitLock` forwards withCommitLock options (test-only bounded waits).
+export async function disarmAfterRelease(dir, { rootMonitorDir = null, timestamp = Date.now(), expectedDispatchId = null, beforeCommit = null, commitLock = null } = {}) {
   const root = rootMonitorDir ?? dirname(dirname(dir));
   const blockers = [];
   // Arm state (current fast state). Missing/corrupt = unconfirmable.
@@ -1114,17 +1168,83 @@ export async function disarmAfterRelease(dir, { rootMonitorDir = null, timestamp
     return { disarmed: false, alreadyDisarmed, blockers: verdict.blockers };
   }
   if (alreadyDisarmed) {
-    // P1-B gap 3: re-verified idempotent success — no rewrite needed.
+    // P1-B gap 3: re-verified idempotent success — no rewrite needed (and no
+    // write means no commit-lock critical section is required here).
     return { disarmed: true, alreadyDisarmed: true, blockers: [] };
   }
 
-  const decision = armedTransitionPatch(current, "DISARMED_IDLE", {
-    conversation: record?.conversationUuid ?? null, space: record?.taskSpace ?? null, timestamp,
-  });
-  if (!decision.ok) return { disarmed: false, alreadyDisarmed: false, blockers: [`ARM_TRANSITION_REJECTED:${current}->DISARMED_IDLE`] };
-  await writeJsonAtomic(fastStateFileOf(dir), normalizeFastState(value, decision.patch, timestamp));
-  await appendEvent(dir, "DISARMED_IDLE", { conversation: record?.conversationUuid ?? null });
-  return { disarmed: true, alreadyDisarmed: false, blockers: [] };
+  // Round 5 injection window (test-only, runScript precedent): between the
+  // advisory identity confirmation above and the serialized commit below, A
+  // holds NO lock — the exact window the ruling's behavior tests interleave a
+  // concurrent new dispatch (real armForDispatch + real ledger replacement on
+  // the real filesystem) into. Production callers never pass it.
+  if (beforeCommit) await beforeCommit();
+
+  // ---- Serialized commit (ruling requirements 2+4): identity confirmation and
+  // the DISARMED_IDLE write are atomic under the per-conversation commit lock.
+  try {
+    return await withCommitLock(dir, async () => {
+      // Fresh ledger identity — the authoritative check of THIS critical
+      // section (the advisory record above may be stale by now).
+      let fresh = null;
+      try { fresh = await readDispatchState(dir); }
+      catch { return { disarmed: false, alreadyDisarmed: false, blockers: ["DISPATCH_LEDGER_UNREADABLE"] }; }
+      if (!fresh) return { disarmed: false, alreadyDisarmed: false, blockers: ["DISPATCH_LEDGER_ABSENT"] };
+      if (typeof expectedDispatchId !== "string" || fresh.dispatchId !== expectedDispatchId) {
+        return { disarmed: false, alreadyDisarmed: false, blockers: ["DISARM_LEDGER_IDENTITY_CHANGED"] };
+      }
+      // Fresh arm state: the fast state the write below is based on is re-read
+      // INSIDE the lock, so a concurrent arm that committed after the advisory
+      // read is never overwritten with the stale snapshot (the round-4 ruling's
+      // exact race: A wrote DISARMED_IDLE from its pre-B read over B's arm).
+      const armNow = await readFastStateForDecision(dir);
+      if (armNow.classification === "missing") {
+        return { disarmed: false, alreadyDisarmed: false, blockers: ["ARM_STATE_MISSING"] };
+      }
+      if (armNow.classification === "corrupt") {
+        return { disarmed: false, alreadyDisarmed: false, blockers: ["ARM_STATE_UNREADABLE"] };
+      }
+      const freshCurrent = currentArmedReasonOf(armNow.classification, armNow.value);
+      if (armNow.classification === "legacy" || freshCurrent === null) {
+        return { disarmed: false, alreadyDisarmed: false, blockers: ["ARM_STATE_LEGACY_NO_DISARM_INFERENCE"] };
+      }
+      if (freshCurrent === "DISARMED_IDLE") {
+        // Disarmed concurrently before this contender got the lock: nothing to
+        // write, the state already IS the target.
+        return { disarmed: true, alreadyDisarmed: true, blockers: [] };
+      }
+      // Armed-instance re-verification (route (a)): every coordinated arm
+      // stamps armedSupersededDispatchId with the TERMINAL ledger it observed.
+      // If that stamp is THIS dispatch's verified instance, a newer dispatch
+      // armed over A's state inside the check→write window — A's disarm must
+      // not clobber it. A missing stamp is the tolerant-read migration path
+      // (see FAST_STATE_DEFAULTS): under the lock it certifies that no
+      // coordinated arm has superseded this state (any coordinated arm WRITES
+      // the stamp), so the in-lock ledger identity check alone suffices and
+      // 存量会话 still converge.
+      const stamp = typeof armNow.value?.armedSupersededDispatchId === "string"
+        ? armNow.value.armedSupersededDispatchId : null;
+      if (stamp !== null && stamp === expectedDispatchId) {
+        return { disarmed: false, alreadyDisarmed: false, blockers: ["DISARM_ARMED_INSTANCE_SUPERSEDED"] };
+      }
+      const decision = armedTransitionPatch(freshCurrent, "DISARMED_IDLE", {
+        conversation: fresh.conversationUuid ?? null, space: fresh.taskSpace ?? null, timestamp,
+      });
+      if (!decision.ok) {
+        return { disarmed: false, alreadyDisarmed: false, blockers: [`ARM_TRANSITION_REJECTED:${freshCurrent}->DISARMED_IDLE`] };
+      }
+      await writeJsonAtomic(fastStateFileOf(dir), normalizeFastState(armNow.value, decision.patch, timestamp));
+      await appendEvent(dir, "DISARMED_IDLE", { conversation: fresh.conversationUuid ?? null });
+      return { disarmed: true, alreadyDisarmed: false, blockers: [] };
+    }, commitLock ?? undefined);
+  } catch (error) {
+    // Fail-closed (ruling requirement 4): an unavailable commit lock keeps the
+    // state armed — the deferred handoff (caller) owns the escalation.
+    if (isCommitLockError(error)) {
+      return { disarmed: false, alreadyDisarmed: false, blockers: ["DISARM_COMMIT_LOCK_FAILED:" + error.message] };
+    }
+    throw error;
+  }
 }
 
 // ---- #27 Batch 3 (ruling §四.4): two page-label lifecycles ----
@@ -1288,11 +1408,17 @@ export async function directRelease(p, dir, { runScript } = {}) {
 // (gap 2): the instance proven at verification time is carried into the
 // disarm (expectedDispatchId), so a ledger replaced between the check and the
 // write cannot be disarmed on evidence verified for the previous instance.
+// P1-C round 5 (ruling requirement 3): the retry path converges through
+// disarmAfterRelease's serialized commit section, so the credential
+// verification → DISARMED_IDLE write window carries the SAME per-conversation
+// commit-lock protection as the direct release paths. `beforeCommit` /
+// `commitLock` are forwarded unchanged (test injection, runScript precedent —
+// production callers never pass them).
 // Best-effort by contract: a retry failure never flips the hosting action's
 // result — the structured wake (above) owns the escalation when the disarm
 // stays blocked. No background daemon, no change to the existing watch
 // scheduling.
-export async function retryPendingDisarm(dir, { rootMonitorDir = null } = {}) {
+export async function retryPendingDisarm(dir, { rootMonitorDir = null, beforeCommit = null, commitLock = null } = {}) {
   try {
     const verifiedDispatchId = await hasDeferredReleaseCredential(dir);
     if (!verifiedDispatchId) {
@@ -1301,6 +1427,8 @@ export async function retryPendingDisarm(dir, { rootMonitorDir = null } = {}) {
     const retry = await disarmAfterRelease(dir, {
       rootMonitorDir: rootMonitorDir ?? dirname(dirname(dir)),
       expectedDispatchId: verifiedDispatchId,
+      ...(beforeCommit ? { beforeCommit } : {}),
+      ...(commitLock ? { commitLock } : {}),
     });
     if (retry.disarmed && !retry.alreadyDisarmed) {
       console.log("RESULT=DISARM_RETRY_COMPLETED");
@@ -1616,10 +1744,16 @@ export async function main(args = process.argv.slice(2)) {
       throw new Error("ARCHIVED_PREPARED_IDENTITY_MISMATCH");
     }
     // Exclusive creation prevents replacing another dispatch's ledger.
-    const handle = await open(join(dir, "a-dispatch-state.json"), "wx", 0o600);
-    try { await handle.writeFile(JSON.stringify(archived)); }
-    finally { await handle.close(); }
-    await readDispatchState(dir);
+    // P1-C round 5 (ruling requirement 1): this is a PREPARED ledger
+    // establishment, so it joins the same per-conversation commit lock as the
+    // arm section and the disarm commit (fail-closed: an unavailable lock
+    // aborts the recovery before any ledger write).
+    await withCommitLock(dir, async () => {
+      const handle = await open(join(dir, "a-dispatch-state.json"), "wx", 0o600);
+      try { await handle.writeFile(JSON.stringify(archived)); }
+      finally { await handle.close(); }
+      await readDispatchState(dir);
+    });
   }
   if (p.action === "collect") return collectCompleted(p, dir);
   // P1-C round 4 (gap 2): the whole direct release flow — entry verification,

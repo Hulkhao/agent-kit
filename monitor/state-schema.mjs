@@ -58,6 +58,22 @@ export const FAST_STATE_DEFAULTS = Object.freeze({
   armedAt: null,
   armedConversation: null,
   armedSpace: null,
+  // #27 Batch 3 P1-C round 5 (TOCTOU closure): the dispatch INSTANCE a
+  // coordinated arm superseded. armForDispatch stamps here the dispatchId of
+  // the TERMINAL ledger (COMPLETED/ABORTED) that was current when the arm
+  // executed — a later commit of THAT instance's disarm reads the stamp under
+  // the commit lock and refuses (DISARM_ARMED_INSTANCE_SUPERSEDED) whenever a
+  // newer dispatch armed over it in the identity-check→write window. null =
+  // this arm superseded no provable terminal instance (fresh conversation,
+  // active/in-flight ledger, unreadable ledger).
+  // TOLERANT READ CONTRACT (ruling round 5 route (a)): this field is OPTIONAL
+  // on disk — a v4 ledger written before the field existed still validates
+  // (validateFastState does not require the key) and reads as null. That is
+  // the migration path for 存量会话: under the commit lock, every coordinated
+  // arm WRITES the stamp, so a missing stamp certifies "no coordinated arm has
+  // superseded this state" and the disarm may converge on the in-lock ledger
+  // identity check alone. See withCommitLock in dispatch-state.mjs.
+  armedSupersededDispatchId: null,
 });
 
 // The four frozen arm states (ruling §四.1). ARMED_UNKNOWN is fail-closed.
@@ -226,6 +242,13 @@ export function normalizeFastState(previous = {}, patch = {}, timestamp = Date.n
   for (const key of ["armedConversation", "armedSpace"]) {
     if (merged[key] !== null && typeof merged[key] !== "string") merged[key] = null;
   }
+  // #27 Batch 3 P1-C round 5: the supersession stamp is a nullable string like
+  // the other arm anchors. normalizeFastState fills it from FAST_STATE_DEFAULTS
+  // (null) when the previous ledger lacked the field, so every write migrates
+  // the field in without touching any other byte of the carried state.
+  if (merged.armedSupersededDispatchId !== null && typeof merged.armedSupersededDispatchId !== "string") {
+    merged.armedSupersededDispatchId = null;
+  }
   if (merged.spaceId !== null && typeof merged.spaceId !== "string" &&
       !(typeof merged.spaceId === "number" && Number.isFinite(merged.spaceId))) merged.spaceId = null;
   if (merged.composerEmpty !== null && typeof merged.composerEmpty !== "boolean") merged.composerEmpty = null;
@@ -240,12 +263,19 @@ export function normalizeFastState(previous = {}, patch = {}, timestamp = Date.n
   return merged;
 }
 
+// #27 Batch 3 P1-C round 5: the only v4 field a pre-round-5 ledger may lawfully
+// lack is the armedSupersededDispatchId supersession stamp (tolerant read — see
+// FAST_STATE_DEFAULTS). Every other default key stays required, so corruption
+// detection is unchanged.
+const OPTIONAL_FAST_STATE_FIELDS = new Set(["armedSupersededDispatchId"]);
+
 export function validateFastState(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   if (value.schema !== FAST_STATE_SCHEMA) return false;
   const allowed = new Set(Object.keys(FAST_STATE_DEFAULTS));
   if (Object.keys(value).some((key) => !allowed.has(key))) return false;
   for (const key of Object.keys(FAST_STATE_DEFAULTS)) {
+    if (!Object.hasOwn(value, key) && OPTIONAL_FAST_STATE_FIELDS.has(key)) continue;
     if (!Object.hasOwn(value, key)) return false;
     const current = value[key];
     if (ARRAY_FIELDS.has(key) && !Array.isArray(current)) return false;
@@ -256,8 +286,11 @@ export function validateFastState(value) {
   if (value.lastProgressAt !== null && (!Number.isFinite(value.lastProgressAt) || value.lastProgressAt < 0)) return false;
   if (value.lastGotoAt !== null && (!Number.isFinite(value.lastGotoAt) || value.lastGotoAt < 0)) return false;
   const nullableStrings = ["pageLabel", "generationKey", "lastMessageRole", "lastMessageKey", "dispatchId", "errorName", "errorCode",
-    "armedConversation", "armedSpace"];
+    "armedConversation", "armedSpace", "armedSupersededDispatchId"];
   for (const key of nullableStrings) {
+    // The optional round-5 stamp may be ABSENT on a pre-round-5 ledger
+    // (tolerant read); every other nullable string must be present.
+    if (value[key] === undefined && OPTIONAL_FAST_STATE_FIELDS.has(key)) continue;
     if (value[key] !== null && typeof value[key] !== "string") return false;
   }
   // #27 Batch 3 arm fields (frozen four-state machine, ruling §四.1).

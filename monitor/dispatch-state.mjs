@@ -1,5 +1,5 @@
 // Durable dispatch ledger. Never stores prompt/response text or virtualized turn counts.
-import { appendFile, readFile, rename, writeFile } from "node:fs/promises";
+import { appendFile, open, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { spacePhaseMs, stormBackoffDeadline, classifyFastStateFile, ARMED_REASONS } from "./state-schema.mjs";
@@ -43,6 +43,131 @@ export async function writeJsonAtomic(path, value) {
   const temp = `${path}.${randomUUID()}.tmp`;
   await writeFile(temp, JSON.stringify(value), "utf8");
   await rename(temp, path);
+}
+
+// ---- #27 Batch 3 P1-C round 5 (planner ruling reply 325e2917): the
+// per-conversation serialized commit lock ----
+//
+// One exclusive-create lockfile per conversation directory serializes every
+// writer of dispatch-identity-relevant state, closing the TOCTOU window the
+// round-4 ruling identified between disarmAfterRelease's one-shot identity
+// check and its final DISARMED_IDLE write. Participants (all writers of
+// arm-relevant state):
+//   armForDispatch      — the whole arm write section (dispatch-manager.mjs);
+//   prepareDispatch     — the PREPARED ledger establishment below (ruling
+//                         requirement 1: arm and PREPARED establishment share
+//                         ONE coordination mechanism);
+//   disarmAfterRelease  — the final commit section (fresh ledger identity +
+//                         fresh armed-instance check + DISARMED_IDLE write in
+//                         ONE critical section, ruling requirement 2);
+//   retryPendingDisarm  — converges through disarmAfterRelease, so it gets the
+//                         same commit protection (ruling requirement 3).
+// Why "read the ledger once more before writeJsonAtomic" is NOT enough: that
+// extra read and the write are still two unrelated file operations — a
+// concurrent arm can commit between them. Under the lock, the identity
+// re-verification and the write are atomic with respect to every other
+// participant, and a concurrent arm that completed before the lock was taken
+// is caught by the armedSupersededDispatchId stamp the arm leaves in the
+// fast state (verified fresh inside the same critical section).
+//
+// Fail-closed policy (ruling requirement 4): a lock the caller cannot take is
+// never a license to write — arm aborts (nothing is delivered), the disarm
+// commit stays armed, prepareDispatch aborts before any delivery. Error codes:
+//   COMMIT_LOCK_TIMEOUT — the bounded wait expired while the current holder
+//     still looks alive (lock file present, not provably stale);
+//   COMMIT_LOCK_STALE   — a stale lock was detected but could not be removed.
+//
+// Stale-lock policy (holder crashed while holding the lock): bounded and
+// evidence-based. A contender waits COMMIT_LOCK_WAIT_MS; at expiry the lock is
+// stolen by ATOMIC RENAME (moving the lockfile to a unique sibling name —
+// exactly one contender can win the move, the losers observe ENOENT and
+// re-contend) — but only when the lock is provably abandoned: its recorded
+// acquiredAt (or, for a zero-byte file from a crash between create and write,
+// its mtime) is older than COMMIT_LOCK_STALE_MS. The stolen file is deleted
+// best-effort; a leftover after a mid-steal crash is inert junk, never a lock.
+// Critical sections here are short pure file operations, so the defaults leave
+// a wide margin: live contention waits up to 10s, an abandoned lock is
+// recoverable after ~30s at the latest.
+
+export const COMMIT_LOCK_FILE = "a-commit-lock.json";
+export const COMMIT_LOCK_WAIT_MS = 10_000;
+export const COMMIT_LOCK_STALE_MS = 30_000;
+const COMMIT_LOCK_POLL_MS = 25;
+export const COMMIT_LOCK_SCHEMA = "ego-commit-lock/v1";
+
+// The two fail-closed lock error codes; callers match on this prefix to wrap
+// the primitive failure into their own site-specific code (ARM_…/DISARM_…).
+export function isCommitLockError(error) {
+  return String(error?.message || "").startsWith("COMMIT_LOCK_");
+}
+
+// Age of the current holder's claim in ms, or null when unprovable (missing,
+// unreadable). Primary evidence: the acquiredAt written into the lock file;
+// fallback for a zero-byte/corrupt lock file (a crash between exclusive create
+// and content write): the file mtime. An unprovable age is never treated as
+// stale — fail-closed, the contender times out instead of stealing blindly.
+async function commitLockAgeMs(lockPath, now) {
+  let acquiredAt = null;
+  try {
+    const raw = JSON.parse(await readFile(lockPath, "utf8"));
+    if (raw?.schema === COMMIT_LOCK_SCHEMA && Number.isFinite(raw.acquiredAt)) acquiredAt = raw.acquiredAt;
+  } catch (error) {
+    if (error?.code !== "ENOENT") acquiredAt = null;
+  }
+  if (acquiredAt === null) {
+    try {
+      const info = await stat(lockPath);
+      acquiredAt = info.mtimeMs;
+    } catch { return null; }
+  }
+  return Number.isFinite(acquiredAt) ? now() - acquiredAt : null;
+}
+
+export async function withCommitLock(dir, task, { waitMs = COMMIT_LOCK_WAIT_MS, staleMs = COMMIT_LOCK_STALE_MS, now = Date.now } = {}) {
+  const lockPath = `${dir}/${COMMIT_LOCK_FILE}`;
+  const deadline = now() + waitMs;
+  for (;;) {
+    // Only the lock ACQUISITION is tried against contention here. The task
+    // itself runs OUTSIDE this catch: a task failure (e.g. the ledger's own
+    // exclusive create hitting EEXIST) must surface verbatim, never be
+    // mistaken for lock contention.
+    let handle;
+    try {
+      handle = await open(lockPath, "wx", 0o600);
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error; // e.g. ENOENT: the dir itself is broken
+      if (now() >= deadline) {
+        const age = await commitLockAgeMs(lockPath, now);
+        if (age === null) throw new Error("COMMIT_LOCK_TIMEOUT");
+        if (age > staleMs) {
+          // Atomic steal: exactly one contender wins the rename; the losers get
+          // ENOENT and immediately re-contend on the exclusive create.
+          const stolen = lockPath + ".stolen-" + randomUUID();
+          try {
+            await rename(lockPath, stolen);
+          } catch (stealError) {
+            if (stealError.code === "ENOENT") continue; // another contender stole it first
+            throw new Error("COMMIT_LOCK_STALE");
+          }
+          await unlink(stolen).catch(() => {});
+          continue;
+        }
+        throw new Error("COMMIT_LOCK_TIMEOUT");
+      }
+      await new Promise((resolve) => setTimeout(resolve, COMMIT_LOCK_POLL_MS));
+      continue;
+    }
+    try {
+      await handle.writeFile(JSON.stringify({
+        schema: COMMIT_LOCK_SCHEMA, acquiredAt: now(),
+      }), "utf8");
+    } finally { await handle.close(); }
+    // Critical section. The release (unlink) runs even when the task throws,
+    // so an in-process failure never orphans the lock — only a process crash
+    // does, and that is what the stale policy recovers from.
+    try { return await task(); }
+    finally { await unlink(lockPath).catch(() => {}); }
+  }
 }
 
 export async function appendEvent(dir, event, fields = {}) {
@@ -184,7 +309,7 @@ export function dispatchStopSnapshot(dir, identity = null) {
   }
 }
 
-export async function prepareDispatch({ monitorDir, conversationUuid, taskSpace, pageLabel, page, payload }) {
+export async function prepareDispatch({ monitorDir, conversationUuid, taskSpace, pageLabel, page, payload, commitLock = null }) {
   const current = await readDispatchState(monitorDir);
   if (current && ACTIVE.has(current.status)) {
     throw new Error(`ACTIVE_DISPATCH_BLOCKS_SEND:${current.dispatchId}:${current.status}`);
@@ -197,40 +322,54 @@ export async function prepareDispatch({ monitorDir, conversationUuid, taskSpace,
   if (!surface.composerEmpty) throw new Error("COMPOSER_NOT_EMPTY_BEFORE_PREPARED");
   if (surface.generating) throw new Error("PREVIOUS_GENERATION_STILL_ACTIVE");
   if (surface.lastMessageRole === "user") throw new Error("PREVIOUS_USER_TURN_UNRESOLVED");
+  // #27 Batch 3 P1-C round 5 (ruling requirement 1): the PREPARED ledger
+  // establishment participates in the SAME per-conversation commit lock as the
+  // arm write section and the disarm commit. The browser surface reads above
+  // deliberately stay OUTSIDE the lock (never hold the commit lock across
+  // browser work); the ACTIVE re-check below is re-run INSIDE the lock so two
+  // concurrent sends on one conversation can no longer both pass it and race
+  // their PREPARED writes. Fail-closed: an unavailable lock aborts the prepare
+  // (the template then aborts before any fill or delivery).
+  return withCommitLock(monitorDir, async () => {
+    const inLock = await readDispatchState(monitorDir);
+    if (inLock && ACTIVE.has(inLock.status)) {
+      throw new Error(`ACTIVE_DISPATCH_BLOCKS_SEND:${inLock.dispatchId}:${inLock.status}`);
+    }
 
-  // R2.5 ledger contract: store the content fingerprint and byte length, never the payload text.
-  const payloadText = payload === undefined || payload === null ? null : String(payload);
-  const record = {
-    schema: "ego-dispatch-state/v2",
-    dispatchId: randomUUID(),
-    conversationUuid,
-    taskSpace,
-    pageLabel,
-    baselineTailKey: surface.lastMessageKey,
-    baselineTailRole: surface.lastMessageRole,
-    baselineComposerLength: surface.composerLength,
-    payload_sha256: payloadText === null ? null : createHash("sha256").update(payloadText, "utf8").digest("hex"),
-    payload_display_sha256: payloadText === null ? null : createHash("sha256").update(
-      payloadText.replace(/\r\n?/g, "\n").replace(/\n{2,}/g, "\n").trim(), "utf8").digest("hex"),
-    payload_bytes: payloadText === null ? null : Buffer.byteLength(payloadText, "utf8"),
-    composer_baseline: payloadText === null ? null : JSON.stringify({
-      composerLength: surface.composerLength,
-      composerEmpty: surface.composerEmpty,
-      lastMessageRole: surface.lastMessageRole,
-      lastMessageKey: surface.lastMessageKey,
-    }),
-    status: "PREPARED",
-    attempt: 1,
-    createdAt: Date.now(),
-  };
-  await writeJsonAtomic(fileOf(monitorDir), record);
-  await appendEvent(monitorDir, "DISPATCH_PREPARED", {
-    dispatchId: record.dispatchId,
-    pageLabel,
-    baselineTailRole: record.baselineTailRole,
-    baselineComposerLength: record.baselineComposerLength,
-  });
-  return record;
+    // R2.5 ledger contract: store the content fingerprint and byte length, never the payload text.
+    const payloadText = payload === undefined || payload === null ? null : String(payload);
+    const record = {
+      schema: "ego-dispatch-state/v2",
+      dispatchId: randomUUID(),
+      conversationUuid,
+      taskSpace,
+      pageLabel,
+      baselineTailKey: surface.lastMessageKey,
+      baselineTailRole: surface.lastMessageRole,
+      baselineComposerLength: surface.composerLength,
+      payload_sha256: payloadText === null ? null : createHash("sha256").update(payloadText, "utf8").digest("hex"),
+      payload_display_sha256: payloadText === null ? null : createHash("sha256").update(
+        payloadText.replace(/\r\n?/g, "\n").replace(/\n{2,}/g, "\n").trim(), "utf8").digest("hex"),
+      payload_bytes: payloadText === null ? null : Buffer.byteLength(payloadText, "utf8"),
+      composer_baseline: payloadText === null ? null : JSON.stringify({
+        composerLength: surface.composerLength,
+        composerEmpty: surface.composerEmpty,
+        lastMessageRole: surface.lastMessageRole,
+        lastMessageKey: surface.lastMessageKey,
+      }),
+      status: "PREPARED",
+      attempt: 1,
+      createdAt: Date.now(),
+    };
+    await writeJsonAtomic(fileOf(monitorDir), record);
+    await appendEvent(monitorDir, "DISPATCH_PREPARED", {
+      dispatchId: record.dispatchId,
+      pageLabel,
+      baselineTailRole: record.baselineTailRole,
+      baselineComposerLength: record.baselineComposerLength,
+    });
+    return record;
+  }, commitLock ?? undefined);
 }
 
 async function transition(monitorDir, dispatchId, allowed, status, fields = {}) {

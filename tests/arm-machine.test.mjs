@@ -5,7 +5,7 @@
 // 4-item resource comparison are a separate supervised phase (task brief).
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFile, writeFile, mkdir, rm, mkdtemp, readdir, chmod } from "node:fs/promises";
+import { readFile, writeFile, mkdir, rm, mkdtemp, readdir, chmod, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,7 +14,7 @@ import {
   canTransitionArmedReason, armedTransitionPatch, armedReasonOnPeerGeneration,
   armedReasonOnProbeRound, classifyFastStateFile, classifyProbeBootState, normalizeFastState, validateFastState,
 } from "../monitor/state-schema.mjs";
-import { evaluateDisarmEligibility, dispatchStormGate } from "../monitor/dispatch-state.mjs";
+import { evaluateDisarmEligibility, dispatchStormGate, prepareDispatch, withCommitLock, COMMIT_LOCK_FILE } from "../monitor/dispatch-state.mjs";
 import {
   armForDispatch, disarmAfterRelease, retryPendingDisarm, managedAcknowledge, acknowledgeWake,
   classifyPageLabelLifecycle, PAGE_LABEL_LIFECYCLE,
@@ -1278,13 +1278,14 @@ test("#27 B3 P1-C round 4: a release attempt aborts fail-closed when the stale c
   // occupied by a DIRECTORY, so the pre-attempt clear can never succeed. A
   // release must never run carrying a previous round's success: both release
   // paths abort BEFORE the release script, and the armed state is untouched.
+  // Round-5 injection correction (ruling §三): the wrappers now FORWARD the
+  // caller's hooks, so the scriptRan assertion below really monitors the
+  // callback the production path executes (the previous wrappers fixed their
+  // own runScript and silently ignored the third argument, so the assertion
+  // could never fail).
   for (const runRelease of [
-    (params, dir) => releaseDelivered(params, dir, {
-      runScript: async () => ({ code: 0, result: "AGENT_SPACE_RELEASED" }),
-    }),
-    (params, dir) => directRelease(params, dir, {
-      runScript: async () => ({ code: 0, result: "AGENT_SPACE_RELEASED" }),
-    }),
+    (params, dir, hooks = {}) => releaseDelivered(params, dir, hooks),
+    (params, dir, hooks = {}) => directRelease(params, dir, hooks),
   ]) {
     const root = await mkdtemp(join(tmpdir(), "ego-release-clear-fail-"));
     try {
@@ -1301,6 +1302,298 @@ test("#27 B3 P1-C round 4: a release attempt aborts fail-closed when the stale c
       assert.equal(JSON.parse(await readFile(join(dir, "a-fast-state.json"), "utf8")).armedReason, "DISPATCH_ACCEPTED");
     } finally { await rm(root, { recursive: true, force: true }); }
   }
+});
+
+// ---- P1-C round 5 (planner ruling reply 325e2917): commit-lock TOCTOU closure ----
+
+// A live-looking commit lock claim (schema + current acquiredAt), as a real
+// holder would leave it on disk.
+const lockHeldAt = (dir, acquiredAt = Date.now()) => writeFile(join(dir, COMMIT_LOCK_FILE),
+  JSON.stringify({ schema: "ego-commit-lock/v1", acquiredAt }), "utf8");
+
+// The lock is provably released: no claim file left behind.
+const lockReleased = (dir) => stat(join(dir, COMMIT_LOCK_FILE))
+  .then(() => false, (error) => error.code === "ENOENT" ? true : Promise.reject(error));
+
+// A pre-round-5 v4 fast state on disk: the armedSupersededDispatchId stamp
+// field does not exist yet (the tolerant-read migration shape).
+const preStampV4State = (armedReason, overrides = {}) => {
+  const { armedSupersededDispatchId, ...rest } = normalizeFastState({}, { ts: Date.now(), armedReason, ...overrides });
+  return rest;
+};
+
+// Browser DOM boundary stub for prepareDispatch (runScript precedent: only the
+// page readback is injected; prepareDispatch itself runs for real and writes
+// the real ledger). The composer must read as a verified empty slate.
+const stubComposerPage = () => ({ evaluate: async () => ({
+  hostOk: true, surfaceMode: "CHATGPT", composerCount: 1, composerPresent: true,
+  composerEmpty: true, composerLength: 0, generating: false, stopLabelCount: 0,
+  lastMessageRole: null, lastMessageKey: null, lastMessageTextLength: 0,
+}) });
+
+const assertNoDisarmEvent = async (dir) => {
+  const events = await readFile(join(dir, "a-fast-events.ndjson"), "utf8");
+  assert.equal(events.split("\n").some((line) => line.includes("DISARMED_IDLE")), false,
+    "no DISARMED_IDLE may be written through a refused commit");
+};
+
+test("#27 B3 P1-C round 5 (ruling scenario): direct release — a dispatch that arms AND prepares inside the identity-check→commit window is never clobbered", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ego-round5-direct-"));
+  try {
+    const dir = await makeConversation(root, { "a-fast-state.json": armedState("DISPATCH_ACCEPTED") });
+    await completedConsumed(dir);
+    let bDispatchId = null;
+    const result = await disarmAfterRelease(dir, {
+      rootMonitorDir: root,
+      expectedDispatchId: uuid,
+      // Ruling injection window: A's advisory identity check just passed, A
+      // holds NO lock here, and B now really runs its arm AND its PREPARED
+      // ledger establishment (real armForDispatch + real prepareDispatch on
+      // the real filesystem; only the browser DOM readback is stubbed).
+      beforeCommit: async () => {
+        await armForDispatch(dir, { conversationUuid: uuid, space: "GDC-执行A" });
+        const prepared = await prepareDispatch({
+          monitorDir: dir, conversationUuid: uuid, taskSpace: "GDC-执行A",
+          pageLabel: "p1", page: stubComposerPage(), payload: "新派单内容",
+        });
+        bDispatchId = prepared.dispatchId;
+      },
+    });
+    // A's commit re-read the ledger INSIDE the lock: it belongs to B now.
+    assert.notEqual(bDispatchId, null);
+    assert.deepEqual(result, { disarmed: false, alreadyDisarmed: false, blockers: ["DISARM_LEDGER_IDENTITY_CHANGED"] });
+    // B's armed state survived untouched — the ruling's core invariant: the
+    // old dispatch's disarm write never overwrites the new dispatch's arm.
+    const state = JSON.parse(await readFile(join(dir, "a-fast-state.json"), "utf8"));
+    assert.equal(state.armedReason, "DISPATCH_ACCEPTED");
+    assert.equal(state.armedSupersededDispatchId, uuid);
+    await assertNoDisarmEvent(dir);
+    assert.equal(await lockReleased(dir), true);
+    // Convergence: only B's own verified release disarms the conversation.
+    // (Realistic order per the round-3 test: the reply is staged while B is
+    // ACCEPTED, then the ledger completes and the reply is consumed.)
+    const bPrepared = JSON.parse(await readFile(join(dir, "a-dispatch-state.json"), "utf8"));
+    const bAccepted = { ...bPrepared, status: "ACCEPTED" };
+    await writeFile(join(dir, "a-dispatch-state.json"), JSON.stringify(bAccepted));
+    const receipt = await saveReply(dir, bAccepted, { text: "已消费回复", source: "DOM_BOUNDARY_VISIBLE" }, uuid);
+    const bCompleted = { ...bAccepted, status: "COMPLETED" };
+    await writeFile(join(dir, "a-dispatch-state.json"), JSON.stringify(bCompleted));
+    await acknowledgeReply(dir, bCompleted, receipt.sha256);
+    const converged = await disarmAfterRelease(dir, { rootMonitorDir: root, expectedDispatchId: bDispatchId });
+    assert.deepEqual(converged, { disarmed: true, alreadyDisarmed: false, blockers: [] });
+    assert.equal(JSON.parse(await readFile(join(dir, "a-fast-state.json"), "utf8")).armedReason, "DISARMED_IDLE");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("#27 B3 P1-C round 5 (ruling scenario): the arm→PREPARED gap — a concurrent arm alone (ledger still the old instance) blocks the commit", async () => {
+  // The window the one-shot ledger check cannot cover: B's arm committed (fast
+  // state stamped with A's instance) but B's template has not reached
+  // prepareDispatch yet, so the ledger still reads A COMPLETED. The in-lock
+  // armedSupersededDispatchId re-verification is what refuses here.
+  const root = await mkdtemp(join(tmpdir(), "ego-round5-armgap-"));
+  try {
+    const dir = await makeConversation(root, { "a-fast-state.json": armedState("DISPATCH_ACCEPTED") });
+    await completedConsumed(dir);
+    const result = await disarmAfterRelease(dir, {
+      rootMonitorDir: root,
+      expectedDispatchId: uuid,
+      beforeCommit: async () => {
+        await armForDispatch(dir, { conversationUuid: uuid, space: "GDC-执行A" });
+      },
+    });
+    assert.deepEqual(result, { disarmed: false, alreadyDisarmed: false, blockers: ["DISARM_ARMED_INSTANCE_SUPERSEDED"] });
+    const state = JSON.parse(await readFile(join(dir, "a-fast-state.json"), "utf8"));
+    assert.equal(state.armedReason, "DISPATCH_ACCEPTED");
+    assert.equal(state.armedSupersededDispatchId, uuid);
+    const ledger = JSON.parse(await readFile(join(dir, "a-dispatch-state.json"), "utf8"));
+    assert.equal(ledger.dispatchId, uuid);
+    assert.equal(ledger.status, "COMPLETED");
+    await assertNoDisarmEvent(dir);
+    assert.equal(await lockReleased(dir), true);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("#27 B3 P1-C round 5 (ruling scenario): the retry path — a dispatch racing the credential→commit window keeps its armed state", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ego-round5-retry-"));
+  try {
+    const dir = await makeConversation(root, { "a-fast-state.json": armedState("DISPATCH_ACCEPTED") });
+    await completedConsumed(dir);
+    // A's full deferred-disarm evidence pair (round 3/4 contract): acked
+    // DISARM_DEFERRED marker + companion credential naming A.
+    await writeFile(join(dir, "a-watch-exit.json"), JSON.stringify({
+      schema: "ego-watch-exit/v1", wakeId: otherUuid, reason: "DISARM_DEFERRED_WAKE_SUPERVISOR",
+      issuedAt: Date.now(), exitCode: 2, acknowledgedAt: Date.now(), ackAction: "investigated",
+    }));
+    await writeDisarmCredential(dir, disarmCredential());
+    const result = await retryPendingDisarm(dir, {
+      rootMonitorDir: root,
+      // Injection window: the credential pair was just verified for A, A holds
+      // NO lock, B really arms and replaces the ledger before the commit.
+      beforeCommit: async () => {
+        await armForDispatch(dir, { conversationUuid: uuid, space: "GDC-执行A" });
+        await writeFile(join(dir, "a-dispatch-state.json"), JSON.stringify(
+          dispatchRecord({ dispatchId: otherUuid, conversationUuid: uuid, status: "ACCEPTED" })));
+      },
+    });
+    assert.equal(result.disarmed, false);
+    assert.ok(result.blockers.includes("DISARM_LEDGER_IDENTITY_CHANGED"), JSON.stringify(result.blockers));
+    const state = JSON.parse(await readFile(join(dir, "a-fast-state.json"), "utf8"));
+    assert.equal(state.armedReason, "DISPATCH_ACCEPTED");
+    assert.equal(state.armedSupersededDispatchId, uuid);
+    await assertNoDisarmEvent(dir);
+    assert.equal(await lockReleased(dir), true);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("#27 B3 P1-C round 5: pre-stamp v4 fast states stay readable (tolerant read) and existing normal flows still converge the disarm", async () => {
+  // Tolerant read: a v4 ledger written before armedSupersededDispatchId existed
+  // is "current", not corrupt; normalize migrates the field in as null.
+  const legacy = preStampV4State("DISPATCH_ACCEPTED");
+  assert.equal("armedSupersededDispatchId" in legacy, false);
+  assert.equal(classifyFastStateFile(legacy), "current");
+  assert.equal(validateFastState(legacy), true);
+  assert.equal(normalizeFastState(legacy, {}).armedSupersededDispatchId, null);
+  // Migration convergence: the 存量会话 normal flow — armed pre-stamp state,
+  // terminal consumed ledger, verified release — disarms under the new
+  // serialized commit (missing stamp + in-lock ledger identity = provable).
+  const root = await mkdtemp(join(tmpdir(), "ego-round5-migrate-"));
+  try {
+    const dir = await makeConversation(root, { "a-fast-state.json": JSON.stringify(legacy) });
+    await completedConsumed(dir);
+    const result = await disarmAfterRelease(dir, { rootMonitorDir: root, expectedDispatchId: uuid });
+    assert.deepEqual(result, { disarmed: true, alreadyDisarmed: false, blockers: [] });
+    const state = JSON.parse(await readFile(join(dir, "a-fast-state.json"), "utf8"));
+    assert.equal(state.armedReason, "DISARMED_IDLE");
+    assert.equal(validateFastState(state), true);
+  } finally { await rm(root, { recursive: true, force: true }); }
+  // Positive control: a NEW-style state whose stamp names the PREVIOUS
+  // dispatch (its own arm's supersession evidence) converges for its OWN id.
+  const controlRoot = await mkdtemp(join(tmpdir(), "ego-round5-stamp-prev-"));
+  try {
+    const dir = await makeConversation(controlRoot, {
+      "a-fast-state.json": armedState("DISPATCH_ACCEPTED", { armedSupersededDispatchId: otherUuid }),
+    });
+    await completedConsumed(dir);
+    const ok = await disarmAfterRelease(dir, { rootMonitorDir: controlRoot, expectedDispatchId: uuid });
+    assert.deepEqual(ok, { disarmed: true, alreadyDisarmed: false, blockers: [] });
+  } finally { await rm(controlRoot, { recursive: true, force: true }); }
+});
+
+test("#27 B3 P1-C round 5: commit-lock contention is fail-closed for both the disarm commit and the arm section", async () => {
+  // Disarm commit: a live holder keeps the state armed (explicit blocker),
+  // never writes; once the holder releases, the same call converges.
+  {
+    const root = await mkdtemp(join(tmpdir(), "ego-round5-lock-disarm-"));
+    try {
+      const dir = await makeConversation(root, { "a-fast-state.json": armedState("DISPATCH_ACCEPTED") });
+      await completedConsumed(dir);
+      await lockHeldAt(dir);
+      const blocked = await disarmAfterRelease(dir, {
+        rootMonitorDir: root, expectedDispatchId: uuid, commitLock: { waitMs: 60 },
+      });
+      assert.deepEqual(blocked, { disarmed: false, alreadyDisarmed: false,
+        blockers: ["DISARM_COMMIT_LOCK_FAILED:COMMIT_LOCK_TIMEOUT"] });
+      assert.equal(JSON.parse(await readFile(join(dir, "a-fast-state.json"), "utf8")).armedReason, "DISPATCH_ACCEPTED");
+      await rm(join(dir, COMMIT_LOCK_FILE));
+      const ok = await disarmAfterRelease(dir, { rootMonitorDir: root, expectedDispatchId: uuid, commitLock: { waitMs: 60 } });
+      assert.deepEqual(ok, { disarmed: true, alreadyDisarmed: false, blockers: [] });
+    } finally { await rm(root, { recursive: true, force: true }); }
+  }
+  // Arm: an unavailable lock aborts the arm before ANY state write — main()
+  // would then abort before the delivery template (nothing is sent).
+  {
+    const root = await mkdtemp(join(tmpdir(), "ego-round5-lock-arm-"));
+    try {
+      const dir = await makeConversation(root);
+      await lockHeldAt(dir);
+      await assert.rejects(
+        armForDispatch(dir, { conversationUuid: uuid, space: "GDC-执行A", commitLock: { waitMs: 60 } }),
+        /ARM_COMMIT_LOCK_FAILED:COMMIT_LOCK_TIMEOUT/);
+      await assert.rejects(readFile(join(dir, "a-fast-state.json"), "utf8"), /ENOENT/);
+      await assert.rejects(readFile(join(dir, "a-fast-events.ndjson"), "utf8"), /ENOENT/);
+    } finally { await rm(root, { recursive: true, force: true }); }
+  }
+});
+
+test("#27 B3 P1-C round 5: an abandoned (stale) lock is recovered by atomic rename steal; a live claim is never stolen", async () => {
+  // Holder crashed: its claim is 40s old (> the 30s stale bound), the bounded
+  // wait is tiny — the steal path must recover the lock and leave no residue.
+  const root = await mkdtemp(join(tmpdir(), "ego-round5-stale-steal-"));
+  try {
+    const dir = await makeConversation(root);
+    await lockHeldAt(dir, Date.now() - 40_000);
+    const next = await armForDispatch(dir, { conversationUuid: uuid, space: "GDC-执行A", commitLock: { waitMs: 60 } });
+    assert.equal(next.armedReason, "DISPATCH_ACCEPTED");
+    assert.equal(await lockReleased(dir), true);
+    assert.equal((await readdir(dir)).some((name) => name.includes(".stolen-")), false,
+      "the stolen lock file is cleaned up");
+  } finally { await rm(root, { recursive: true, force: true }); }
+  // A fresh claim inside the stale window is provably alive: fail-closed
+  // timeout, never a blind overwrite.
+  const liveRoot = await mkdtemp(join(tmpdir(), "ego-round5-stale-live-"));
+  try {
+    const dir = await makeConversation(liveRoot);
+    await lockHeldAt(dir, Date.now() - 5_000);
+    await assert.rejects(
+      armForDispatch(dir, { conversationUuid: uuid, space: "GDC-执行A", commitLock: { waitMs: 60 } }),
+      /ARM_COMMIT_LOCK_FAILED:COMMIT_LOCK_TIMEOUT/);
+    await assert.rejects(readFile(join(dir, "a-fast-state.json"), "utf8"), /ENOENT/);
+  } finally { await rm(liveRoot, { recursive: true, force: true }); }
+});
+
+test("#27 B3 P1-C round 5: the commit lock really serializes concurrent participants (no interleaving, no leaked lock)", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ego-round5-serial-"));
+  try {
+    const dir = await makeConversation(root);
+    const order = [];
+    const section = (name) => withCommitLock(dir, async () => {
+      order.push(name + ":start");
+      // Real async boundaries inside the critical section.
+      const raw = await readFile(join(dir, "a-fast-state.json"), "utf8").catch(() => "{}");
+      await writeFile(join(dir, "a-fast-state.json"), raw);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      order.push(name + ":end");
+    }, { waitMs: 2_000 });
+    await Promise.all([section("A"), section("B")]);
+    // Sections never interleave: each ":end" immediately precedes the other's
+    // ":start" (single-holder mutual exclusion under real contention).
+    assert.equal(order.length, 4, JSON.stringify(order));
+    assert.match(order[0], /:start$/);
+    assert.equal(order[1], order[0].replace(":start", ":end"));
+    assert.match(order[2], /:start$/);
+    assert.equal(order[3], order[2].replace(":start", ":end"));
+    assert.notEqual(order[0], order[2]);
+    assert.equal(await lockReleased(dir), true);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("#27 B3 P1-C round 5 (ruling requirement 1): the PREPARED ledger establishment participates in the same commit lock", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ego-round5-prepare-"));
+  try {
+    const dir = await makeConversation(root);
+    // Contention: a live holder aborts the prepare before any ledger write
+    // (the template would then abort before any fill or delivery).
+    await lockHeldAt(dir);
+    await assert.rejects(
+      prepareDispatch({ monitorDir: dir, conversationUuid: uuid, taskSpace: "GDC-执行A", pageLabel: "p1",
+        page: stubComposerPage(), payload: "新派单内容", commitLock: { waitMs: 60 } }),
+      /COMMIT_LOCK_TIMEOUT/);
+    await assert.rejects(readFile(join(dir, "a-dispatch-state.json"), "utf8"), /ENOENT/);
+    await rm(join(dir, COMMIT_LOCK_FILE));
+    // Happy path: the real prepare writes the PREPARED ledger and releases the
+    // lock (short critical section — no browser work is held inside it).
+    const prepared = await prepareDispatch({ monitorDir: dir, conversationUuid: uuid, taskSpace: "GDC-执行A",
+      pageLabel: "p1", page: stubComposerPage(), payload: "新派单内容" });
+    assert.equal(prepared.status, "PREPARED");
+    assert.equal(JSON.parse(await readFile(join(dir, "a-dispatch-state.json"), "utf8")).status, "PREPARED");
+    assert.equal(await lockReleased(dir), true);
+    // In-lock ACTIVE re-check: a second send on the same conversation can no
+    // longer race its own PREPARED write past the first one.
+    await assert.rejects(
+      prepareDispatch({ monitorDir: dir, conversationUuid: uuid, taskSpace: "GDC-执行A", pageLabel: "p1",
+        page: stubComposerPage(), payload: "另一条" }),
+      /ACTIVE_DISPATCH_BLOCKS_SEND/);
+  } finally { await rm(root, { recursive: true, force: true }); }
 });
 
 // ---- Requirement 4 (ruling §四.4): two page-label lifecycles ----
