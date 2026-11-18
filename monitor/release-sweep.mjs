@@ -46,18 +46,80 @@ export async function anchoredLedgerStatus(monitorDir, uuid, space) {
 // unattributable are kept. The release target itself is handled exclusively by
 // the managed close/finish path, so a residual target page is kept, never
 // double-closed here.
-export function classifySweepPage({ uuid, conversationUuid, known, status }) {
+//
+// #27 Batch 3 fix round (P1-E): the close decision now runs through the page
+// LABEL LIFECYCLE classifier below, whose basis is the page's ORIGIN, not its
+// attribution provability — a registered fixed-session page can carry a
+// COMPLETED ledger too, so "ledger terminal + known" alone never closes a page.
+export function classifySweepPage({ uuid, conversationUuid, known, status, dispatchCreated }) {
   if (!uuid || !known.some((k) => typeof k === "string" && k.toLowerCase() === String(uuid).toLowerCase())) {
     return { decision: "kept", reason: "OWNERSHIP_UNPROVEN" };
   }
   if (String(uuid).toLowerCase() === String(conversationUuid).toLowerCase()) {
     return { decision: "kept", reason: "RELEASE_TARGET_RESIDUAL" };
   }
-  if (status && TERMINAL_DISPATCH.has(status)) {
-    return { decision: "closed", reason: "TEMP_RESULT_PAGE_FINISHED_DISPATCH" };
+  const verdict = classifyPageLabelLifecycle({ conversationUuid: uuid, known, ledgerStatus: status, dispatchCreated });
+  if (verdict.lifecycle === PAGE_LABEL_LIFECYCLE.DISPATCH_TEMP && verdict.closable) {
+    return { decision: "closed", reason: verdict.reason };
   }
-  if (status) return { decision: "kept", reason: "ACTIVE_DISPATCH_LEDGER" };
-  return { decision: "kept", reason: "LEDGER_UNPROVEN" };
+  return { decision: "kept", reason: verdict.reason };
+}
+
+// ---- #27 Batch 3 fix round (P1-E): two page-label lifecycles with a RELIABLE
+// distinction basis. The frozen ruling (§四.4) fixed-session labels are
+// long-lived: only their OWN managed release may close them; dispatch-temp
+// labels are closed once provably finished dispatch residue. The planner's
+// re-review rejected the previous basis (attribution provability) because a
+// REGISTERED fixed-session page can equally carry a COMPLETED ledger —
+// 归属 ≠ 生命周期. The basis here is the page's durable ORIGIN record:
+//   DISPATCH_TEMP  — the conversation+page was CREATED by the managed new-chat
+//     dispatch allocation flow. Durable writer-anchored evidence:
+//     a-new-request.json in the conversation's own ledger directory (written
+//     exclusively before the browser is touched, carried into conversations/
+//     by the binding rename — see dispatch-manager bindNewConversation).
+//   FIXED_SESSION — every other registry-known conversation page (standing
+//     session pages reached through `send` page recovery, no allocation
+//     record). Never closable by any sweep; only their own release closes
+//     them. Unattributable pages stay FIXED_SESSION/kept (fail-closed, the
+//     release-sweep conservative default is unchanged).
+// Lifecycle is decided at creation time and never inferred back from a ledger
+// status: a COMPLETED ledger on a fixed-session page does not make it temp.
+export const PAGE_LABEL_LIFECYCLE = Object.freeze({
+  FIXED_SESSION: "fixed-session",
+  DISPATCH_TEMP: "dispatch-temp",
+});
+
+export function classifyPageLabelLifecycle({ conversationUuid = null, known = [], ledgerStatus = null, dispatchCreated = false } = {}) {
+  const knownList = Array.isArray(known) ? known : [];
+  const ownershipProven = typeof conversationUuid === "string" &&
+    knownList.some((k) => typeof k === "string" && k.toLowerCase() === conversationUuid.toLowerCase());
+  if (!ownershipProven) {
+    return { lifecycle: PAGE_LABEL_LIFECYCLE.FIXED_SESSION, closable: false, reason: "OWNERSHIP_UNPROVEN" };
+  }
+  if (dispatchCreated !== true) {
+    return { lifecycle: PAGE_LABEL_LIFECYCLE.FIXED_SESSION, closable: false, reason: "FIXED_SESSION_PAGE" };
+  }
+  if (ledgerStatus === "COMPLETED" || ledgerStatus === "ABORTED") {
+    return { lifecycle: PAGE_LABEL_LIFECYCLE.DISPATCH_TEMP, closable: true, reason: "TEMP_RESULT_PAGE_FINISHED_DISPATCH" };
+  }
+  if (typeof ledgerStatus === "string" && ledgerStatus !== "") {
+    return { lifecycle: PAGE_LABEL_LIFECYCLE.DISPATCH_TEMP, closable: false, reason: "ACTIVE_DISPATCH_LEDGER" };
+  }
+  return { lifecycle: PAGE_LABEL_LIFECYCLE.DISPATCH_TEMP, closable: false, reason: "LEDGER_UNPROVEN" };
+}
+
+// The durable dispatch-creation evidence for one conversation: its own
+// a-new-request.json, anchored to the page's uuid AND this TaskSpace. ENOENT
+// (or any mismatch/unreadable file) is `false` — an unprovable origin is
+// never promoted to "dispatch-created" (fail-closed: the page stays open).
+export async function anchoredDispatchCreated(monitorDir, uuid, space) {
+  try {
+    const request = JSON.parse(
+      await readFile(monitorDir + "/conversations/" + String(uuid).toLowerCase() + "/a-new-request.json", "utf8"));
+    return request?.requestId === String(uuid).toLowerCase() && request?.space === space &&
+      typeof request?.agentId === "string" && request.agentId !== "" &&
+      /^[a-f\d]{64}$/i.test(request?.payloadSha256 || "");
+  } catch { return false; }
 }
 
 // ---------------------------------------------------------------------------
@@ -121,6 +183,7 @@ export async function loadSweepIntents(auditFile, { agentId, space, conversation
 export async function sweepTaskPages({
   task, monitorDir, agentId, space, conversationUuid, known, auditFile,
   ledgerStatusOf = anchoredLedgerStatus,
+  dispatchCreatedOf = anchoredDispatchCreated,
   audit = makeSweepAudit({ auditFile, agentId, space, conversationUuid }),
 }) {
   let closed = 0;
@@ -173,7 +236,10 @@ export async function sweepTaskPages({
     catch { uuid = null; }
     if (!uuid) sawUnidentifiablePage = true;
     const status = uuid ? await ledgerStatusOf(monitorDir, uuid, space) : null;
-    const verdict = classifySweepPage({ uuid, conversationUuid, known, status });
+    // P1-E: the lifecycle basis is read alongside the ledger — a page is only
+    // ever closable when its durable dispatch-creation record anchors it.
+    const dispatchCreated = uuid ? await dispatchCreatedOf(monitorDir, uuid, space) === true : false;
+    const verdict = classifySweepPage({ uuid, conversationUuid, known, status, dispatchCreated });
     const priorIntent = uuid ? open.get(uuid.toLowerCase()) : null;
     let decision = verdict.decision;
     let reason = verdict.reason;

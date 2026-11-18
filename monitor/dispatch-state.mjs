@@ -26,8 +26,14 @@ export async function dispatchStormGate(dir, timestamp = Date.now()) {
   // fields this gate reads — legacy mode, not corruption. Anything else that
   // fails the schema stays fail-closed.
   if (classifyFastStateFile(state) === "corrupt") throw new Error("FAST_STATE_INVALID");
+  // #27 Batch 3 P1-A fix: a recorded corrupt-state carry-over is a structural
+  // failure exactly like an active storm backoff. Both the probe's corrupt
+  // landing and the manager's arm-over-corrupt rewrite (armForDispatch) stamp
+  // errorCode "STATE_CORRUPT"; only a healthy probe round (errorCode null)
+  // reopens the gate — arming alone can never turn corruption into a pass.
   if ((state.backoffUntil !== null && state.backoffUntil > timestamp) ||
-      state.errorCode === "CHAT_SURFACE_STRUCTURALLY_UNAVAILABLE") {
+      state.errorCode === "CHAT_SURFACE_STRUCTURALLY_UNAVAILABLE" ||
+      state.errorCode === "STATE_CORRUPT") {
     return "STORM_BACKOFF_PENDING";
   }
   return null;

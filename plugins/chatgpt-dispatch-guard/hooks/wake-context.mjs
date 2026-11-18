@@ -142,7 +142,13 @@ const ACK_ACTIONS = new Set(["investigated", "resolved"]);
 const SUPERVISION_SCHEMA = "ego-supervision/v1";
 const DISPATCH_SCHEMA = "ego-dispatch-state/v2";
 
-function watchExitStructureError(marker) {
+// Exported for the #27 P1-B contract-equivalence pin: monitor/dispatch-manager.mjs
+// mirrors these two validators verbatim (it cannot import this module — the
+// monitor runtime copies never include the plugins tree — and this hook must
+// stay import-free of monitor/**), and the equivalence tests run BOTH
+// implementations over the same case table. Contract changes must land on
+// both sides in the same commit.
+export function watchExitStructureError(marker) {
   if (!marker || typeof marker !== "object" || Array.isArray(marker)) return "WATCH_EXIT_MARKER_INVALID";
   if (marker.schema !== WATCH_EXIT_SCHEMA) return "WATCH_EXIT_SCHEMA_INVALID";
   if (typeof marker.wakeId !== "string" || !UUID_PATTERN.test(marker.wakeId)) return "WATCH_EXIT_WAKE_ID_INVALID";
@@ -156,7 +162,8 @@ function watchExitStructureError(marker) {
   return null;
 }
 
-function supervisionStatusStructureError(status) {
+// Exported for the #27 P1-B contract-equivalence pin (see watchExitStructureError).
+export function supervisionStatusStructureError(status) {
   if (!status || typeof status !== "object" || Array.isArray(status)) return "SUPERVISION_STATUS_INVALID";
   if (status.schema !== SUPERVISION_SCHEMA) return "SUPERVISION_SCHEMA_INVALID";
   // loadStatus() contract (supervision-watchdog.mjs): the watchdog never writes
@@ -286,6 +293,20 @@ async function scanConversation(dir, name, now, io, events) {
     events.push(unknownEvent(join(dir, "a-fast-state.json"), fastRead.error));
     return;
   }
+
+  // #27 Batch 3 P1-D fix: the arm/disarm CONFLICT detection is independent of
+  // the WATCH_STALE timeout machinery. Any ACTIVE dispatch ledger — SEND_STARTED,
+  // UNCERTAIN and RETRY_AUTHORIZED included, not just ACCEPTED — paired with a
+  // structured DISARMED_IDLE claim is the forbidden "sent but disarmed" window
+  // and is reported immediately, regardless of any staleness threshold. A
+  // structured=false read (legacy v3/v2, missing, foreign reason values)
+  // carries no disarm claim, so the legacy timeout rules below are untouched.
+  const armClaim = readArmClaim(fastRead.present ? fastRead.value : null);
+  if (armClaim.structured && armClaim.armReason === "DISARMED_IDLE") {
+    events.push(unknownEvent(join(dir, "a-fast-state.json"), ARM_STATE_CONFLICT_DETAIL));
+    return;
+  }
+
   if (dispatch.status !== "ACCEPTED") return; // only ACCEPTED raises WATCH_STALE
 
   const fast = fastRead.present ? fastRead.value : null;
@@ -301,11 +322,12 @@ async function scanConversation(dir, name, now, io, events) {
   // #27 Batch 3 (ruling §四.3): the frozen WATCH_STALE exemption table,
   // consulted against the fast state's arm claim before the anomaly is raised.
   // A DISARMED_IDLE claim against an in-flight dispatch ledger is the forbidden
-  // "sent but disarmed" window and surfaces as WAKE_STATUS_UNKNOWN; a verified
-  // post-disarm shape is exempt; armed claims, legacy ledgers and unreadable
-  // state are never exempt. Wake events raised earlier in this scan are
-  // retained in every branch.
-  const armClaim = readArmClaim(fast);
+  // "sent but disarmed" window and surfaces as WAKE_STATUS_UNKNOWN (it already
+  // returned at the P1-D conflict check above for every active status); a
+  // verified post-disarm shape is exempt; armed claims, legacy ledgers and
+  // unreadable state are never exempt. Wake events raised earlier in this scan
+  // are retained in every branch. The arm claim was resolved once, before the
+  // conflict check — the same readArmClaim verdict feeds the table.
   const exemption = watchStaleExemption({
     structured: armClaim.structured,
     armReason: armClaim.armReason,

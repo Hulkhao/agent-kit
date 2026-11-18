@@ -36,6 +36,7 @@ const {
   FAST_STATE_SCHEMA,
   IN_FLIGHT_DISPATCH_STATUSES,
   armedReasonOnProbeRound,
+  classifyProbeBootState,
   decideRoundKind,
   isBackoffActive,
   navReferenceAt,
@@ -71,11 +72,14 @@ let legacyStateMigrated = false;
 try {
   const raw = await readFile(STATE, "utf8");
   const parsed = JSON.parse(raw);
-  if (parsed?.schema === FAST_STATE_SCHEMA) {
-    if (!validateFastState(parsed)) stateCorrupt = true;
-    else previous = parsed;
-  } else if (parsed && typeof parsed === "object" && !Array.isArray(parsed) &&
-      (parsed.schema == null || parsed.schema === "ego-fast-state/v2")) {
+  // #27 Batch 3 P1-D: the boot classification is the SHARED contract in
+  // state-schema.mjs (classifyProbeBootState) — v3 (the previous official
+  // schema) migrates like the pre-v3 shapes instead of falling into
+  // stateCorrupt, and corrupt stays fail-closed.
+  const bootState = classifyProbeBootState(parsed);
+  if (bootState === "current") {
+    previous = parsed;
+  } else if (bootState === "migrate") {
     // One-time migration from known legacy schemas; response text is not carried forward.
     previous = normalizeFastState(parsed, {}, now());
     legacyStateMigrated = true;

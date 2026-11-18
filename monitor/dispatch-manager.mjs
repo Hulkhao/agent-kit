@@ -429,6 +429,10 @@ export async function managedAcknowledge(p, { directory, now = Date.now() } = {}
     catch (auditError) { auditWriteFailed(auditError); }
     throw error;
   }
+  // P1-C: the ack is a managed touch of the conversation ledgers — re-run the
+  // idempotent disarm retry. Acking DISARM_DEFERRED_WAKE_SUPERVISOR clears its
+  // own unacked-wake blocker, so the deferred disarm converges right here.
+  await retryPendingDisarm(dir, { rootMonitorDir: p.monitorDir });
   // The ack succeeded: it can never be recorded as DENIED. A failed GRANTED
   // audit write is reported separately and the ack still returns 0.
   try { await audit(evidence ? { outcome: "GRANTED", evidence } : { outcome: "GRANTED" }); }
@@ -694,26 +698,117 @@ function currentArmedReasonOf(classification, value) {
   return null;
 }
 
+// P1-A (planner BLOCKED ruling §二): a corrupt fast state is durable blocking
+// evidence, never a clean slate. Arming over it must (a) preserve the original
+// bytes in an exclusive-create archive (never overwritten — collisions get
+// timestamp/counter siblings, the abort-backup precedent) and (b) leave a
+// carry-over marker the delivery-side storm gate reads (dispatch-state.mjs
+// dispatchStormGate refuses on errorCode "STATE_CORRUPT"), so a corrupted
+// ledger cannot gain delivery permission by executing arm. The archive is
+// forensics; the gate closure rests on the carry-over marker alone.
+async function archiveCorruptFastState(dir, timestamp = Date.now()) {
+  const bytes = await readFile(fastStateFileOf(dir));
+  const base = "a-fast-state.archive-corrupt-arm";
+  for (let attempt = 0; ; attempt++) {
+    const target = attempt === 0 ? `${base}.json` : `${base}-${timestamp}${attempt > 1 ? "-" + attempt : ""}.json`;
+    try {
+      const handle = await open(join(dir, target), "wx", 0o600);
+      try { await handle.writeFile(bytes); } finally { await handle.close(); }
+      return target;
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error;
+    }
+  }
+}
+
 // Persist the arm state for a new dispatch. Idempotent per state machine: an
 // already-armed state simply re-anchors DISPATCH_ACCEPTED. A missing ledger
 // arms cleanly from null; a CORRUPT fast state must not be re-read as health —
 // it lands in ARMED_UNKNOWN (fail-closed armed, never auto-disarmed, ruling
-// §四.1). A legacy v3 ledger arms from null for the new dispatch (the ruling's
-// legacy clause forbids inferring DISARM, not recording an explicit new arm).
+// §四.1) WITH the P1-A corrupt carry-over so the storm gate stays shut. A
+// legacy v3 ledger arms from null for the new dispatch (the ruling's legacy
+// clause forbids inferring DISARM, not recording an explicit new arm).
 export async function armForDispatch(dir, { conversationUuid = null, space = null, timestamp = Date.now() } = {}) {
   const { classification, value } = await readFastStateForDecision(dir);
   const current = currentArmedReasonOf(classification, value);
   const target = classification === "corrupt" ? "ARMED_UNKNOWN" : "DISPATCH_ACCEPTED";
   const decision = armedTransitionPatch(current, target, { conversation: conversationUuid, space, timestamp });
   if (!decision.ok) throw new Error(`ARM_TRANSITION_REJECTED:${current}->${target}`);
+  let corruptArchive = null;
+  if (classification === "corrupt") {
+    try { corruptArchive = await archiveCorruptFastState(dir, timestamp); }
+    catch (error) {
+      // An archive failure never unblocks delivery — the carry-over marker
+      // written below is what holds the storm gate shut; this is forensics.
+      await appendEvent(dir, "CORRUPT_STATE_ARCHIVE_FAILED", {
+        code: String(error?.code || error?.message || "UNKNOWN").slice(0, 80),
+      }).catch(() => {});
+    }
+  }
   const next = normalizeFastState(classification === "current" || classification === "legacy" ? value : {},
-    decision.patch, timestamp);
+    classification === "corrupt"
+      // P1-A carry-over: mirrors the probe's own corrupt landing (probeFailed +
+      // errorCode STATE_CORRUPT) so every reader that treats the marker as a
+      // structural failure — the storm gate included — keeps refusing.
+      ? { ...decision.patch, probeFailed: true, recoveryFailed: true, errorCode: "STATE_CORRUPT" }
+      : decision.patch, timestamp);
   await writeJsonAtomic(fastStateFileOf(dir), next);
   await appendEvent(dir, "ARMED_DISPATCH_ACCEPTED", {
     conversation: conversationUuid, space: space ?? null,
     previousReason: current, sourceClassification: classification,
+    ...(corruptArchive ? { corruptArchive, stormCarryOver: "STATE_CORRUPT" } : {}),
   });
   return next;
+}
+
+// ---- #27 Batch 3 P1-B: mirrored wake-guard structure contracts ----
+//
+// SELF-CONTAINED MIRROR of plugins/chatgpt-dispatch-guard/hooks/wake-context.mjs
+// (watchExitStructureError / supervisionStatusStructureError, exported there by
+// the same fix round). Design note (ruling §二 P1-B "复用已有校验口径，不发明
+// 新规则"): the guard hook must stay import-free of monitor/** (it cannot be
+// allowed to fail when monitor modules are mid-refresh) and the monitor
+// runtime copies never include the plugins tree, so the contract is mirrored
+// verbatim and pinned by equivalence tests that run BOTH implementations over
+// the same case table and require identical verdicts (tests/arm-machine.test.mjs).
+// Any contract change must land on both sides in the same commit.
+
+const UUID_PATTERN = /^[a-f\d]{8}-[a-f\d]{4}-[1-8][a-f\d]{3}-[89ab][a-f\d]{3}-[a-f\d]{12}$/i;
+const ACK_ACTIONS = new Set(["investigated", "resolved"]);
+const SUPERVISION_SCHEMA = "ego-supervision/v1";
+
+export function watchExitStructureError(marker) {
+  if (!marker || typeof marker !== "object" || Array.isArray(marker)) return "WATCH_EXIT_MARKER_INVALID";
+  if (marker.schema !== WATCH_EXIT_SCHEMA) return "WATCH_EXIT_SCHEMA_INVALID";
+  if (typeof marker.wakeId !== "string" || !UUID_PATTERN.test(marker.wakeId)) return "WATCH_EXIT_WAKE_ID_INVALID";
+  if (!Number.isFinite(marker.issuedAt)) return "WATCH_EXIT_ISSUED_AT_INVALID";
+  if (marker.exitCode !== 2) return "WATCH_EXIT_EXIT_CODE_INVALID";
+  // Un-acked: both ack fields null. Acked: finite acknowledgedAt plus a legal
+  // action. Any other combination violates ego-watch-exit/v1 — an illegal
+  // acknowledgedAt string is corruption, never a proof of acknowledgement.
+  const unacked = marker.acknowledgedAt === null && marker.ackAction === null;
+  const acked = Number.isFinite(marker.acknowledgedAt) && ACK_ACTIONS.has(marker.ackAction);
+  if (!unacked && !acked) return "WATCH_EXIT_ACK_COMBINATION_INVALID";
+  return null;
+}
+
+export function supervisionStatusStructureError(status) {
+  if (!status || typeof status !== "object" || Array.isArray(status)) return "SUPERVISION_STATUS_INVALID";
+  if (status.schema !== SUPERVISION_SCHEMA) return "SUPERVISION_SCHEMA_INVALID";
+  // loadStatus() contract (supervision-watchdog.mjs): the watchdog never writes
+  // a ledger without these three fields being valid.
+  if (!Number.isInteger(status.abnormalRounds) || status.abnormalRounds < 0) return "SUPERVISION_ABNORMAL_ROUNDS_INVALID";
+  if (!Number.isFinite(status.progressAt)) return "SUPERVISION_PROGRESS_AT_INVALID";
+  if (!Number.isFinite(status.lastReviewAt)) return "SUPERVISION_LAST_REVIEW_AT_INVALID";
+  // A missing pending property is NOT the same as pending: null — the watchdog's
+  // empty() always writes pending: null explicitly. A bare {} is corruption.
+  if (!("pending" in status)) return "SUPERVISION_PENDING_MISSING";
+  const pending = status.pending;
+  if (pending === null) return null; // no alarm armed
+  if (typeof pending !== "object" || Array.isArray(pending)) return "SUPERVISION_PENDING_INVALID";
+  if (typeof pending.id !== "string" || pending.id === "") return "SUPERVISION_PENDING_ID_INVALID";
+  if (!Number.isFinite(pending.issuedAt)) return "SUPERVISION_PENDING_ISSUED_AT_INVALID";
+  return null;
 }
 
 // Write DISARMED_IDLE for a conversation whose release just completed. All
@@ -735,7 +830,10 @@ export async function disarmAfterRelease(dir, { rootMonitorDir = null, timestamp
   if (classification === "missing") blockers.push("ARM_STATE_MISSING");
   else if (classification === "corrupt") blockers.push("ARM_STATE_UNREADABLE");
   else if (current === null) blockers.push("ARM_STATE_LEGACY_NO_DISARM_INFERENCE");
-  else if (current === "DISARMED_IDLE") return { disarmed: true, alreadyDisarmed: true, blockers: [] };
+  // P1-B gap 3: the already-disarmed idempotent shortcut is never trusted
+  // blindly — every remaining criterion is re-proven on fresh durable
+  // evidence below before an alreadyDisarmed success is reported.
+  const alreadyDisarmed = current === "DISARMED_IDLE";
 
   // Dispatch ledger: terminal + reply consumed.
   let record = null;
@@ -748,20 +846,31 @@ export async function disarmAfterRelease(dir, { rootMonitorDir = null, timestamp
     catch { replyConsumed = false; }
   } else if (record?.status === "ABORTED") replyConsumed = true;
 
-  // Unprocessed wake marker (un-acked ego-watch-exit ledger) and unfinished
-  // supervision handoff. Unreadable evidence counts as outstanding.
+  // Unprocessed wake marker (un-acked ego-watch-exit ledger). P1-B gap 2: the
+  // marker must pass the FULL ego-watch-exit/v1 structure contract (mirrored
+  // above from wake-context.mjs) — a parseable JSON with an illegal ack
+  // combination (e.g. a garbage acknowledgedAt string) is corruption, never
+  // a proof of acknowledgement.
   let unackedWakes = 1;
   try {
     const marker = JSON.parse(await readFile(join(dir, "a-watch-exit.json"), "utf8"));
-    unackedWakes = marker?.acknowledgedAt !== null && marker?.acknowledgedAt !== undefined ? 0 : 1;
+    const structureError = watchExitStructureError(marker);
+    if (structureError) blockers.push("WAKE_MARKER_INVALID");
+    else unackedWakes = marker.acknowledgedAt === null ? 1 : 0;
   } catch (error) {
     if (error?.code !== "ENOENT") blockers.push("WAKE_MARKER_UNREADABLE");
     else unackedWakes = 0;
   }
+
+  // Unfinished supervision handoff. P1-B gap 1: a parseable file that violates
+  // the ego-supervision/v1 structure contract (e.g. a bare {}) is corruption,
+  // never "no pending" — mirrored above from wake-context.mjs, fail-closed.
   let supervisionPending = true;
   try {
     const status = JSON.parse(await readFile(join(dir, "a-supervision-status.json"), "utf8"));
-    supervisionPending = Boolean(status?.pending);
+    const structureError = supervisionStatusStructureError(status);
+    if (structureError) blockers.push("SUPERVISION_STATUS_INVALID");
+    else supervisionPending = status.pending !== null;
   } catch (error) {
     if (error?.code !== "ENOENT") blockers.push("SUPERVISION_STATUS_UNREADABLE");
     else supervisionPending = false;
@@ -769,43 +878,57 @@ export async function disarmAfterRelease(dir, { rootMonitorDir = null, timestamp
 
   // No other in-flight dispatch anywhere in this monitor root. A sibling
   // ledger that cannot be proven terminal (unreadable or structurally
-  // invalid, P1-4 conservative default) counts as in-flight.
+  // invalid, P1-4 conservative default) counts as in-flight. P1-B gap 4: the
+  // scan also covers pending-new/ — a durable new-session request still
+  // sitting there is an in-flight dispatch (a completed binding is renamed
+  // into conversations/ by bindNewConversation, so a lingering directory
+  // means the allocation never finished).
   let otherInFlight = 0;
-  try {
-    const siblings = await readdir(join(root, "conversations"), { withFileTypes: true });
-    for (const entry of siblings) {
-      if (!entry.isDirectory() || join(root, "conversations", entry.name) === dir) continue;
+  const scanSiblingLedgers = async (base, { missingCountsInFlight }) => {
+    let entries;
+    try { entries = await readdir(base, { withFileTypes: true }); }
+    catch (error) {
+      // A missing directory proves no sibling dispatch exists; any other
+      // read failure is unconfirmable.
+      if (error?.code !== "ENOENT") blockers.push("SIBLING_LEDGERS_UNREADABLE");
+      return;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory() || join(base, entry.name) === dir) continue;
       try {
-        const sibling = JSON.parse(await readFile(
-          join(root, "conversations", entry.name, "a-dispatch-state.json"), "utf8"));
+        const sibling = JSON.parse(await readFile(join(base, entry.name, "a-dispatch-state.json"), "utf8"));
         if (!validateDispatchRecord(sibling) || IN_FLIGHT_DISPATCH_STATUSES.has(sibling.status)) otherInFlight++;
       } catch (error) {
-        if (error?.code !== "ENOENT") otherInFlight++;
+        if (error?.code !== "ENOENT" || missingCountsInFlight) otherInFlight++;
       }
     }
-  } catch (error) {
-    // A missing conversations directory proves no sibling dispatch exists;
-    // any other read failure is unconfirmable.
-    if (error?.code !== "ENOENT") blockers.push("SIBLING_LEDGERS_UNREADABLE");
-  }
+  };
+  await scanSiblingLedgers(join(root, "conversations"), { missingCountsInFlight: false });
+  await scanSiblingLedgers(join(root, "pending-new"), { missingCountsInFlight: true });
 
-  // The five ruling criteria are evaluated only on clean evidence; any
+  // The ruling criteria are evaluated only on clean evidence; any
   // unreadable/unprovable step above already carries its own blocker.
-  let verdict = { eligible: false, blockers: [] };
-  if (!blockers.length && record) {
-    verdict = evaluateDisarmEligibility({
-      armedReason: current,
-      dispatchStatus: record.status,
-      replyConsumed, unackedWakes, supervisionPending, otherInFlight,
-    });
+  if (blockers.length) return { disarmed: false, alreadyDisarmed, blockers };
+  // For the idempotent path the arm-state criterion is bypassed (it would
+  // always fire ARM_STATE_ALREADY_DISARMED) — everything else runs through
+  // the SAME frozen evaluateDisarmEligibility contract.
+  const verdict = evaluateDisarmEligibility({
+    armedReason: alreadyDisarmed ? "DISPATCH_ACCEPTED" : current,
+    dispatchStatus: record.status,
+    replyConsumed, unackedWakes, supervisionPending, otherInFlight,
+  });
+  if (verdict.blockers.length) {
+    return { disarmed: false, alreadyDisarmed, blockers: verdict.blockers };
   }
-  const merged = [...blockers, ...verdict.blockers];
-  if (merged.length) return { disarmed: false, blockers: merged };
+  if (alreadyDisarmed) {
+    // P1-B gap 3: re-verified idempotent success — no rewrite needed.
+    return { disarmed: true, alreadyDisarmed: true, blockers: [] };
+  }
 
   const decision = armedTransitionPatch(current, "DISARMED_IDLE", {
     conversation: record?.conversationUuid ?? null, space: record?.taskSpace ?? null, timestamp,
   });
-  if (!decision.ok) return { disarmed: false, blockers: [`ARM_TRANSITION_REJECTED:${current}->DISARMED_IDLE`] };
+  if (!decision.ok) return { disarmed: false, alreadyDisarmed: false, blockers: [`ARM_TRANSITION_REJECTED:${current}->DISARMED_IDLE`] };
   await writeJsonAtomic(fastStateFileOf(dir), normalizeFastState(value, decision.patch, timestamp));
   await appendEvent(dir, "DISARMED_IDLE", { conversation: record?.conversationUuid ?? null });
   return { disarmed: true, alreadyDisarmed: false, blockers: [] };
@@ -813,36 +936,20 @@ export async function disarmAfterRelease(dir, { rootMonitorDir = null, timestamp
 
 // ---- #27 Batch 3 (ruling §四.4): two page-label lifecycles ----
 //
-// FIXED_SESSION labels are long-lived: the managed release of their OWN
-// conversation is the only action that may ever close them. DISPATCH_TEMP
-// labels are closed as soon as they are provably finished dispatch residue —
-// exclusively through the release cleanup's close mechanism
-// (release-agent-space.template.mjs -> sweepTaskPages, P1-A close-intent),
-// which the disarm sequence reuses; neither the probe nor the disarm step
-// ever closes a label directly (the probe holds no close call at all).
-// The boundary mirrors release-sweep.mjs's conservative default: anything
-// unproven stays open (fail-closed), terminal ledgers are closable, active
-// ledgers are not.
-export const PAGE_LABEL_LIFECYCLE = Object.freeze({
-  FIXED_SESSION: "fixed-session",
-  DISPATCH_TEMP: "dispatch-temp",
-});
-
-export function classifyPageLabelLifecycle({ conversationUuid = null, known = [], ledgerStatus = null } = {}) {
-  const knownList = Array.isArray(known) ? known : [];
-  const ownershipProven = typeof conversationUuid === "string" &&
-    knownList.some((k) => typeof k === "string" && k.toLowerCase() === conversationUuid.toLowerCase());
-  if (!ownershipProven) {
-    return { lifecycle: PAGE_LABEL_LIFECYCLE.FIXED_SESSION, closable: false, reason: "OWNERSHIP_UNPROVEN" };
-  }
-  if (ledgerStatus === "COMPLETED" || ledgerStatus === "ABORTED") {
-    return { lifecycle: PAGE_LABEL_LIFECYCLE.DISPATCH_TEMP, closable: true, reason: "TEMP_RESULT_PAGE_FINISHED_DISPATCH" };
-  }
-  if (typeof ledgerStatus === "string" && ledgerStatus !== "") {
-    return { lifecycle: PAGE_LABEL_LIFECYCLE.DISPATCH_TEMP, closable: false, reason: "ACTIVE_DISPATCH_LEDGER" };
-  }
-  return { lifecycle: PAGE_LABEL_LIFECYCLE.DISPATCH_TEMP, closable: false, reason: "LEDGER_UNPROVEN" };
-}
+// The lifecycle classifier and its RELIABLE origin basis (P1-E fix round) live
+// in release-sweep.mjs — the module the release cleanup template actually
+// imports at runtime (dispatch-manager itself is never copied into a monitor
+// dir, so the classifier must sit in a `modules`-copied file to be usable by
+// both sides). It is re-exported here unchanged so the manager, the arm
+// machine tests and the sweep share ONE definition:
+//   FIXED_SESSION — registry-known page without a dispatch allocation record;
+//     never closed by any sweep (only its own managed release closes it).
+//   DISPATCH_TEMP — page created by the managed new-chat allocation flow
+//     (durable a-new-request.json anchored to the conversation + space);
+//     closable once its ledger is provably terminal.
+export {
+  PAGE_LABEL_LIFECYCLE, classifyPageLabelLifecycle, anchoredDispatchCreated,
+} from "./release-sweep.mjs";
 
 // Exported for testing with a runScript injection (rebuildSpace precedent);
 // production callers use the default browser path.
@@ -876,14 +983,40 @@ export async function releaseDelivered(params, dir, { runScript } = {}) {
   // with nothing in flight was just confirmed (verified release + consumption
   // above), so write the disarm BEFORE stopping the watch (returning 0 ends
   // the watch loop). A deferred disarm keeps the state armed (safe direction)
-  // and is reported; the wake-guard plus the next dispatch round own it.
+  // and MUST NOT leave the ledger stranded behind a success exit (P1-C): the
+  // watch exits through the durable wake ledger instead, the supervisor acks
+  // DISARM_DEFERRED_WAKE_SUPERVISOR, and the managed retry paths (ack /
+  // consume / a re-run release) converge the disarm afterwards.
   const disarm = await disarmAfterRelease(dir, {
     rootMonitorDir: params.rootMonitorDir ?? dirname(dirname(dir)),
   });
   if (!disarm.disarmed) {
     console.error("RESULT=DISARM_DEFERRED code=" + disarm.blockers.join(","));
+    return exitWatching(dir, "DISARM_DEFERRED_WAKE_SUPERVISOR", {
+      detail: "code=" + disarm.blockers.join(","),
+    });
   }
   return 0;
+}
+
+// P1-C: the managed idempotent disarm retry shared by every action that
+// touches a conversation's ledgers (consume, ack; release re-runs go through
+// releaseDelivered's own disarm). Best-effort by contract: a retry failure
+// never flips the hosting action's result — the structured wake (above) owns
+// the escalation when the disarm stays blocked. No background daemon, no
+// change to the existing watch scheduling.
+export async function retryPendingDisarm(dir, { rootMonitorDir = null } = {}) {
+  try {
+    const retry = await disarmAfterRelease(dir, { rootMonitorDir: rootMonitorDir ?? dirname(dirname(dir)) });
+    if (retry.disarmed && !retry.alreadyDisarmed) {
+      console.log("RESULT=DISARM_RETRY_COMPLETED");
+    }
+    return retry;
+  } catch (error) {
+    console.error("RESULT=DISARM_RETRY_FAILED code=" +
+      String(error?.code || error?.message || "UNKNOWN").slice(0, 80));
+    return { disarmed: false, alreadyDisarmed: false, blockers: ["DISARM_RETRY_FAILED"] };
+  }
 }
 
 async function readLocalProfileConfig() {
@@ -1153,6 +1286,10 @@ export async function main(args = process.argv.slice(2)) {
     }
     await acknowledgeReply(dir, record, p.replySha256);
     console.log("RESULT=REPLY_CONSUMED");
+    // P1-C: consuming the reply clears its disarm blocker (REPLY_NOT_CONSUMED)
+    // — every managed touch of the conversation ledgers re-runs the idempotent
+    // disarm retry so a previously deferred disarm converges here.
+    await retryPendingDisarm(dir, { rootMonitorDir: p.rootMonitorDir });
     return 0;
   }
   // Check before ensureMonitor or any browser invocation. An idle watch must
@@ -1324,6 +1461,12 @@ export async function main(args = process.argv.slice(2)) {
     const disarm = await disarmAfterRelease(dir, { rootMonitorDir: p.rootMonitorDir ?? dirname(dirname(dir)) });
     if (!disarm.disarmed) {
       console.error("RESULT=DISARM_DEFERRED code=" + disarm.blockers.join(","));
+      // P1-C: the direct release path hands over through the same durable
+      // wake ledger as the watch path — never a clean exit 0 over a stranded
+      // armed ledger.
+      return exitWatching(dir, "DISARM_DEFERRED_WAKE_SUPERVISOR", {
+        detail: "code=" + disarm.blockers.join(","),
+      });
     }
   }
   if (p.action === "send" && code !== 0) {

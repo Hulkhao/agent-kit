@@ -10,7 +10,7 @@ import { mkdtemp, mkdir, rm, writeFile, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  TERMINAL_DISPATCH, anchoredLedgerStatus, classifySweepPage, sweepTaskPages,
+  TERMINAL_DISPATCH, anchoredLedgerStatus, anchoredDispatchCreated, classifySweepPage, sweepTaskPages,
   makeSweepAudit, shouldFinishSpace, releaseHasNothingOutstanding,
 } from "../monitor/release-sweep.mjs";
 import {
@@ -39,6 +39,17 @@ async function writeLedger(root, uuid, record) {
   const dir = join(root, "conversations", uuid.toLowerCase());
   await mkdir(dir, { recursive: true });
   await writeFile(join(dir, "a-dispatch-state.json"), JSON.stringify(record));
+}
+
+// P1-E: the durable dispatch-creation evidence (a-new-request.json) that makes
+// a conversation's page a dispatch-temp label. Pages WITHOUT it are
+// fixed-session and are never closed by any sweep.
+async function markDispatchCreated(root, uuid, space = SPACE) {
+  const dir = join(root, "conversations", uuid.toLowerCase());
+  await mkdir(dir, { recursive: true });
+  await writeFile(join(dir, "a-new-request.json"), JSON.stringify({
+    requestId: uuid.toLowerCase(), space, agentId: AGENT, payloadSha256: "a".repeat(64),
+  }));
 }
 
 const fakePage = (url, log, closeError) => ({
@@ -105,6 +116,8 @@ test("#27 re-review P1-2: the last-conversation sweep keeps blank/active/unprove
   const root = await mkdtemp(join(tmpdir(), "ego-sweep-keep-"));
   try {
     await writeLedger(root, OTHER, validLedger(OTHER, "ACCEPTED")); // active ledger
+    await markDispatchCreated(root, OTHER); // dispatch-temp: active ledgers are temp but not yet closable
+    await markDispatchCreated(root, THIRD); // dispatch-created but no provable ledger -> LEDGER_UNPROVEN
     const pages = [
       fakePage("about:blank", null),                    // blank → OWNERSHIP_UNPROVEN
       fakePage("chrome://newtab/", null),               // blank variant → OWNERSHIP_UNPROVEN
@@ -138,7 +151,9 @@ test("#27 re-review P1-2/P1-4: valid terminal-ledger pages close; an empty space
   const root = await mkdtemp(join(tmpdir(), "ego-sweep-close-"));
   try {
     await writeLedger(root, OTHER, validLedger(OTHER, "COMPLETED"));
+    await markDispatchCreated(root, OTHER);
     await writeLedger(root, THIRD, validLedger(THIRD, "ABORTED"));
+    await markDispatchCreated(root, THIRD);
     const closed = [];
     const auditFile = join(root, "a-release-sweep-audit.ndjson");
     const sweep = await sweepTaskPages({
@@ -209,6 +224,7 @@ test("#27 re-review P1-3: a close failure keeps sweepPending; the rerun really r
   try {
     await claimAgentSpace({ agentId: AGENT, spaceName: SPACE, directory: root });
     await writeLedger(root, OTHER, validLedger(OTHER, "COMPLETED"));
+    await markDispatchCreated(root, OTHER);
     const auditFile = join(root, "a-release-sweep-audit.ndjson");
     // First attempt: page.close fails.
     const broken = new Error("ECONNRESET"); broken.code = "ECONNRESET";
@@ -297,6 +313,7 @@ test("#27 re-review② P1-A: an audit-write failure forbids the close; recovery 
   try {
     await claimAgentSpace({ agentId: AGENT, spaceName: SPACE, directory: root });
     await writeLedger(root, OTHER, validLedger(OTHER, "COMPLETED"));
+    await markDispatchCreated(root, OTHER);
     // ONE page across both runs (same task/set semantics); a successful close
     // removes it from the set.
     const pages = [];
@@ -383,6 +400,7 @@ test("#27 re-review② P1-A: a lost audit line is backfilled from the persisted 
   try {
     await claimAgentSpace({ agentId: AGENT, spaceName: SPACE, directory: root });
     await writeLedger(root, OTHER, validLedger(OTHER, "COMPLETED"));
+    await markDispatchCreated(root, OTHER);
     // ONE task and ONE page set across both runs; a successful close removes
     // the page from the set (no per-run page rebuilds).
     const pages = [];
@@ -443,6 +461,7 @@ test("#27 re-review② P1-A: a close-intent write failure forbids closing that p
   try {
     await claimAgentSpace({ agentId: AGENT, spaceName: SPACE, directory: root });
     await writeLedger(root, OTHER, validLedger(OTHER, "COMPLETED"));
+    await markDispatchCreated(root, OTHER);
     const pages = [fakePage(chatUrl(OTHER))];
     const task = { pages: async () => pages };
     const auditFile = join(root, "a-release-sweep-audit.ndjson");
@@ -470,7 +489,9 @@ test("#27 re-review② P1-A: after an audit write failure no further page is clo
   try {
     await claimAgentSpace({ agentId: AGENT, spaceName: SPACE, directory: root });
     await writeLedger(root, OTHER, validLedger(OTHER, "COMPLETED"));
+    await markDispatchCreated(root, OTHER);
     await writeLedger(root, THIRD, validLedger(THIRD, "COMPLETED"));
+    await markDispatchCreated(root, THIRD);
     const pages = [];
     const makePage = (uuid) => {
       const p = { label: "L-" + uuid.slice(0, 6), url: async () => chatUrl(uuid),
@@ -506,6 +527,7 @@ test("#27 re-review 4fa17a8: an unidentifiable page (about:blank) blocks absence
   try {
     await claimAgentSpace({ agentId: AGENT, spaceName: SPACE, directory: root });
     await writeLedger(root, OTHER, validLedger(OTHER, "COMPLETED"));
+    await markDispatchCreated(root, OTHER);
     // ONE task and ONE page set across all runs; the target page survives run 1
     // but is later found BLANKED (a live object whose identity is unknowable).
     const pages = [];
@@ -590,5 +612,70 @@ test("#27 re-review② P1-B: a legacy releasePending blocks other conversations'
     assert.equal(entry.sweepPending.conversationUuid, OTHER);
     // Same-conversation releasePending + sweepPending coexist (recovery shape).
     assert.equal(entry.releasePending.conversationUuid, entry.sweepPending.conversationUuid);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+// #27 Batch 3 P1-E: the planner's demanded coexistence scenario — one
+// TaskSpace holding BOTH a registered fixed-session page (with its own old
+// COMPLETED ledger!) and a finished dispatch-temp page. The sweep closes ONLY
+// the temp page: a fixed-session page is never inferred temp from its
+// terminal ledger (归属 ≠ 生命周期).
+test("#27 B3 P1-E: fixed-session and finished dispatch-temp pages coexist — the sweep closes only the temp page", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ego-sweep-coexist-"));
+  try {
+    // The agent's standing session page: registry-known, an old COMPLETED
+    // dispatch ledger, but NO dispatch allocation record → fixed-session.
+    await writeLedger(root, OTHER, validLedger(OTHER, "COMPLETED"));
+    // A finished one-off dispatch page: send-new allocation record anchored
+    // to its own conversation + a terminal ledger → dispatch-temp, closable.
+    await writeLedger(root, THIRD, validLedger(THIRD, "COMPLETED"));
+    await markDispatchCreated(root, THIRD);
+    const closed = [];
+    const auditFile = join(root, "a-release-sweep-audit.ndjson");
+    const sweep = await sweepTaskPages({
+      task: fakeTask([fakePage(chatUrl(OTHER), closed), fakePage(chatUrl(THIRD), closed)]),
+      monitorDir: root, agentId: AGENT, space: SPACE,
+      conversationUuid: CONV, known: [CONV, OTHER, THIRD], auditFile,
+    });
+    assert.equal(sweep.failed, 0);
+    assert.equal(sweep.closed, 1);
+    assert.deepEqual(closed, [chatUrl(THIRD)]); // exactly one close ran
+    // The fixed-session page survived with its keep reason on the audit trail.
+    const lines = (await readFile(auditFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    const keptLine = lines.find((line) => line.decision === "kept" && line.page?.uuid === OTHER);
+    assert.ok(keptLine, "the fixed-session page leaves its kept line");
+    assert.equal(keptLine.reason, "FIXED_SESSION_PAGE");
+    const closedLine = lines.find((line) => line.decision === "closed");
+    assert.equal(closedLine.page.uuid, THIRD);
+    assert.equal(closedLine.reason, "TEMP_RESULT_PAGE_FINISHED_DISPATCH");
+    // A kept page keeps the space alive (P1-2 space-fate rule unchanged).
+    assert.equal(shouldFinishSpace({ finished: true, hasTask: true, kept: sweep.kept, failed: 0 }), false);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("#27 B3 P1-E: the dispatch-creation evidence is anchored — mismatching or unreadable records never mark a page temp", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ego-sweep-origin-"));
+  try {
+    const dir = join(root, "conversations", OTHER.toLowerCase());
+    await mkdir(dir, { recursive: true });
+    // No record at all: unproven origin → not dispatch-created.
+    assert.equal(await anchoredDispatchCreated(root, OTHER, SPACE), false);
+    // A record for a DIFFERENT conversation/space is not this page's origin.
+    await writeFile(join(dir, "a-new-request.json"), JSON.stringify({
+      requestId: OTHER.toLowerCase(), space: "other-space", agentId: AGENT, payloadSha256: "a".repeat(64),
+    }));
+    assert.equal(await anchoredDispatchCreated(root, OTHER, SPACE), false);
+    await writeFile(join(dir, "a-new-request.json"), JSON.stringify({
+      requestId: CONV.toLowerCase(), space: SPACE, agentId: AGENT, payloadSha256: "a".repeat(64),
+    }));
+    assert.equal(await anchoredDispatchCreated(root, OTHER, SPACE), false);
+    // Corrupt JSON proves nothing (fail-closed: the page stays open).
+    await writeFile(join(dir, "a-new-request.json"), "{corrupted");
+    assert.equal(await anchoredDispatchCreated(root, OTHER, SPACE), false);
+    // A valid, anchored record IS the origin evidence.
+    await writeFile(join(dir, "a-new-request.json"), JSON.stringify({
+      requestId: OTHER.toLowerCase(), space: SPACE, agentId: AGENT, payloadSha256: "a".repeat(64),
+    }));
+    assert.equal(await anchoredDispatchCreated(root, OTHER, SPACE), true);
   } finally { await rm(root, { recursive: true, force: true }); }
 });

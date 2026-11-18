@@ -160,6 +160,25 @@ export function classifyFastStateFile(value) {
   return "corrupt";
 }
 
+// #27 Batch 3 P1-D: the shared BOOT-state contract for both probe variants'
+// a-fast-state.json read (ego-fast-probe.mjs / ego-fast-probe-live.mjs). One
+// classifier so the probe run chain and the manager read side cannot drift:
+//   "current"  — a structurally valid v4 ledger, used as-is;
+//   "migrate"  — a KNOWN legacy schema: v3 (the previous OFFICIAL schema —
+//                classified legacy by classifyFastStateFile, never corrupt) or
+//                the pre-v3 shapes (schema absent or "ego-fast-state/v2");
+//                normalized once, response text never carried forward;
+//   "corrupt"  — everything else, fail-closed (STATE_CORRUPT landing).
+export function classifyProbeBootState(parsed) {
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed) && parsed.schema === FAST_STATE_SCHEMA) {
+    return validateFastState(parsed) ? "current" : "corrupt";
+  }
+  if (classifyFastStateFile(parsed) === "legacy") return "migrate";
+  if (parsed && typeof parsed === "object" && !Array.isArray(parsed) &&
+      (parsed.schema == null || parsed.schema === "ego-fast-state/v2")) return "migrate";
+  return "corrupt";
+}
+
 const ARRAY_FIELDS = new Set(["buttonLabels", "activityMarkers"]);
 const BOOL_FIELDS = new Set([
   "generating", "everGenerating", "bodyChanged", "startIdle", "doneCandidate",

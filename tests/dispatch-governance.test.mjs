@@ -799,8 +799,12 @@ test("#25 WG-03: RELEASE_PENDING exits through the durable watch-exit ledger (re
     await acknowledgeWake(marker.wakeId, "investigated", dir, Date.now());
     const after = JSON.parse(await readFile(join(dir, WATCH_EXIT_FILE), "utf8"));
     assert.equal(after.ackAction, "investigated");
-    // Success path unchanged: a verified release still exits 0 without a marker.
+    // Success path unchanged: a verified release still exits 0 without a
+    // marker. P1-C: the clean pass now also converges the disarm, so the
+    // conversation carries an armed fast state whose criteria are all met.
     await rm(join(dir, WATCH_EXIT_FILE), { force: true });
+    await writeFile(join(dir, "a-fast-state.json"), JSON.stringify(
+      normalizeFastState({}, { ts: Date.now(), armedReason: "DISPATCH_ACCEPTED" })));
     console.log = (line) => logs.push(String(line));
     const clean = await releaseDelivered(params, dir, {
       runScript: async () => ({ code: 0, result: "AGENT_SPACE_RELEASED" }),

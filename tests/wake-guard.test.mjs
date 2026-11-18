@@ -1106,3 +1106,63 @@ test("#27 B3 exemption wiring: a post-disarm shape never swallows a pending wake
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("#27 B3 P1-D: the disarm conflict check is decoupled from WATCH_STALE — every active status conflicts regardless of staleness", async () => {
+  const now = 1_800_000_000_000;
+  const freshFast = (armedReason) => ({
+    schema: FAST_STATE_SCHEMA_V4, ts: now - 30_000, ...(armedReason === null ? {} : { armedReason }),
+  });
+  // A structured DISARMED_IDLE claim over ANY active dispatch ledger is the
+  // forbidden "sent but disarmed" window — the pre-fix code ran the conflict
+  // check only after the ACCEPTED-only stale ladder, so SEND_STARTED /
+  // UNCERTAIN / RETRY_AUTHORIZED / PREPARED (and fresh ACCEPTED) passed
+  // silently. Now they surface immediately, no staleness precondition.
+  for (const status of ["PREPARED", "SEND_STARTED", "ACCEPTED", "UNCERTAIN", "RETRY_AUTHORIZED"]) {
+    const { root } = await makeRoot(now, {
+      "a-dispatch-state.json": dispatchRecord(now, { status }),
+      "a-fast-state.json": freshFast("DISARMED_IDLE"),
+    });
+    const { healthy, events } = await detectWakeAnomalies([root], now);
+    assert.equal(healthy, false, status);
+    assert.equal(events.length, 1, status);
+    assert.equal(events[0].type, "WAKE_STATUS_UNKNOWN", status);
+    assert.equal(events[0].detail, ARM_STATE_CONFLICT_DETAIL, status);
+    await rm(root, { recursive: true, force: true });
+  }
+  // Armed claims over a fresh active ledger raise nothing: the legacy timeout
+  // rules (WATCH_STALE only for ACCEPTED + stale + stale record) are unchanged.
+  {
+    const { root } = await makeRoot(now, {
+      "a-dispatch-state.json": dispatchRecord(now, { status: "SEND_STARTED" }),
+      "a-fast-state.json": freshFast("DISPATCH_ACCEPTED"),
+    });
+    const { healthy, events } = await detectWakeAnomalies([root], now);
+    assert.equal(healthy, true);
+    assert.deepEqual(events, []);
+    await rm(root, { recursive: true, force: true });
+  }
+  // Legacy v3 fast state carries no arm claim: no conflict event on an active
+  // ledger, and legacy mode never invents one.
+  {
+    const { root } = await makeRoot(now, {
+      "a-dispatch-state.json": dispatchRecord(now, { status: "SEND_STARTED" }),
+      "a-fast-state.json": { schema: "ego-fast-state/v3", ts: now - 30_000 },
+    });
+    const { healthy, events } = await detectWakeAnomalies([root], now);
+    assert.equal(healthy, true);
+    assert.deepEqual(events, []);
+    await rm(root, { recursive: true, force: true });
+  }
+  // Even a fully stale SEND_STARTED ledger never raises WATCH_STALE — that
+  // legacy rule stays exactly as it was (only ACCEPTED raises stale).
+  {
+    const { root } = await makeRoot(now, {
+      "a-dispatch-state.json": dispatchRecord(now - 60 * 60_000, { status: "SEND_STARTED" }),
+      "a-fast-state.json": { schema: FAST_STATE_SCHEMA_V4, ts: now - 8 * 60_000, armedReason: "DISPATCH_ACCEPTED" },
+    });
+    const { healthy, events } = await detectWakeAnomalies([root], now);
+    assert.equal(healthy, true);
+    assert.deepEqual(events, []);
+    await rm(root, { recursive: true, force: true });
+  }
+});

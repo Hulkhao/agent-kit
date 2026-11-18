@@ -12,13 +12,19 @@ import { fileURLToPath } from "node:url";
 import {
   ARMED_REASONS, IN_FLIGHT_DISPATCH_STATUSES, FAST_STATE_DEFAULTS,
   canTransitionArmedReason, armedTransitionPatch, armedReasonOnPeerGeneration,
-  armedReasonOnProbeRound, classifyFastStateFile, normalizeFastState, validateFastState,
+  armedReasonOnProbeRound, classifyFastStateFile, classifyProbeBootState, normalizeFastState, validateFastState,
 } from "../monitor/state-schema.mjs";
-import { evaluateDisarmEligibility } from "../monitor/dispatch-state.mjs";
+import { evaluateDisarmEligibility, dispatchStormGate } from "../monitor/dispatch-state.mjs";
 import {
-  armForDispatch, disarmAfterRelease, classifyPageLabelLifecycle, PAGE_LABEL_LIFECYCLE,
+  armForDispatch, disarmAfterRelease, retryPendingDisarm, managedAcknowledge, acknowledgeWake,
+  classifyPageLabelLifecycle, PAGE_LABEL_LIFECYCLE,
   releaseDelivered,
+  watchExitStructureError, supervisionStatusStructureError,
 } from "../monitor/dispatch-manager.mjs";
+import {
+  watchExitStructureError as wakeContextWatchExitStructureError,
+  supervisionStatusStructureError as wakeContextSupervisionStructureError,
+} from "../plugins/chatgpt-dispatch-guard/hooks/wake-context.mjs";
 import { saveReply, acknowledgeReply, sha256 } from "../monitor/reply-delivery.mjs";
 
 const uuid = "11111111-1111-4111-8111-111111111111";
@@ -202,6 +208,123 @@ test("#27 B3 armForDispatch: every prior state re-arms through the matrix; corru
   }
 });
 
+test("#27 B3 P1-A: arming over a corrupt fast state archives the evidence and the storm gate stays shut", async () => {
+  // A corrupt ledger that carries live storm evidence: parses, fails the v4
+  // schema (unknown field). Under the pre-fix behavior armForDispatch rebuilt
+  // a legal v4 over it and the delivery-side gate lost its judgment basis —
+  // a corrupted block became a delivery pass.
+  const corruptBytes = JSON.stringify({
+    schema: "ego-fast-state/v4", notAField: 1,
+    backoffUntil: Date.now() + 9 * 60_000,
+    errorCode: "CHAT_SURFACE_STRUCTURALLY_UNAVAILABLE",
+  });
+  const root = await mkdtemp(join(tmpdir(), "ego-arm-corrupt-gate-"));
+  try {
+    const dir = await makeConversation(root, { "a-fast-state.json": corruptBytes });
+    const next = await armForDispatch(dir, { conversationUuid: uuid, space: "GDC-执行A" });
+    // The arm state is fail-closed ARMED_UNKNOWN WITH the readable carry-over
+    // marker the delivery-side gate refuses on.
+    assert.equal(next.armedReason, "ARMED_UNKNOWN");
+    assert.equal(next.errorCode, "STATE_CORRUPT");
+    assert.equal(next.probeFailed, true);
+    assert.equal(validateFastState(next), true);
+    // The delivery-side storm gate sees the carry-over: no delivery permission.
+    assert.equal(await dispatchStormGate(dir), "STORM_BACKOFF_PENDING");
+    // The original corrupt bytes survive verbatim in an exclusive-create
+    // archive next to the ledger.
+    const archive = join(dir, "a-fast-state.archive-corrupt-arm.json");
+    assert.equal(await readFile(archive, "utf8"), corruptBytes);
+    const events = await readFile(join(dir, "a-fast-events.ndjson"), "utf8");
+    assert.match(events, /"corruptArchive":"a-fast-state\.archive-corrupt-arm\.json"/);
+    assert.match(events, /"stormCarryOver":"STATE_CORRUPT"/);
+    // Repeated arms never reopen the gate and never overwrite the archive.
+    await armForDispatch(dir, { conversationUuid: uuid, space: "GDC-执行A" });
+    assert.equal(await dispatchStormGate(dir), "STORM_BACKOFF_PENDING");
+    assert.equal(await readFile(archive, "utf8"), corruptBytes);
+    assert.ok(!(await readFile(join(dir, "a-fast-events.ndjson"), "utf8")).split("\n")
+      .filter((line) => line.includes("ARMED_DISPATCH_ACCEPTED")).some((line) => line.includes("archive-corrupt-arm-")));
+  } finally { await rm(root, { recursive: true, force: true }); }
+  // Control: a clean (missing) ledger arms without any gate side effect.
+  {
+    const cleanRoot = await mkdtemp(join(tmpdir(), "ego-arm-clean-gate-"));
+    try {
+      const dir = await makeConversation(cleanRoot);
+      await armForDispatch(dir, { conversationUuid: uuid, space: "GDC-执行A" });
+      assert.equal(await dispatchStormGate(dir), null);
+    } finally { await rm(cleanRoot, { recursive: true, force: true }); }
+  }
+});
+
+test("#27 B3 P1-D: the shared boot contract classifies v3 as legacy-migrate, never corrupt; both probe variants use it", async () => {
+  // v3 — the previous OFFICIAL schema — is legacy (migrate), exactly the
+  // classifyFastStateFile contract; the probes' old branch missed it.
+  assert.equal(classifyProbeBootState({ schema: "ego-fast-state/v3", ts: 1 }), "migrate");
+  assert.equal(classifyProbeBootState({ schema: "ego-fast-state/v3", junk: true }), "migrate");
+  // Pre-v3 shapes keep migrating (unchanged behavior).
+  assert.equal(classifyProbeBootState({ schema: "ego-fast-state/v2", ts: 1 }), "migrate");
+  assert.equal(classifyProbeBootState({ ts: 1 }), "migrate");
+  // Valid v4 is current; v4 schema violations and unknown schemas are corrupt.
+  assert.equal(classifyProbeBootState(armedState("DISPATCH_ACCEPTED")), "current");
+  assert.equal(classifyProbeBootState({ schema: "ego-fast-state/v4", notAField: 1 }), "corrupt");
+  assert.equal(classifyProbeBootState({ schema: "ego-fast-state/v5", ts: 1 }), "corrupt");
+  assert.equal(classifyProbeBootState([1, 2, 3]), "corrupt");
+  assert.equal(classifyProbeBootState(null), "corrupt");
+  assert.equal(classifyProbeBootState("{junk"), "corrupt");
+  // Both probe variants must boot through the shared contract (source pin:
+  // the old per-probe schema branch is gone).
+  for (const probeFile of ["ego-fast-probe.mjs", "ego-fast-probe-live.mjs"]) {
+    const source = await readFile(
+      fileURLToPath(new URL("../monitor/" + probeFile, import.meta.url)), "utf8");
+    assert.match(source, /const bootState = classifyProbeBootState\(parsed\);/, probeFile);
+    assert.match(source, /bootState === "migrate"/, probeFile);
+    assert.doesNotMatch(source, /parsed\.schema == null \|\| parsed\.schema === "ego-fast-state\/v2"\)\) \{/, probeFile);
+  }
+});
+
+test("#27 B3 P1-B: the mirrored wake-guard structure contracts are verdict-equivalent to the hook's", async () => {
+  // dispatch-manager.mjs mirrors wake-context.mjs verbatim (the monitor
+  // runtime never copies the plugins tree and the hook stays import-free of
+  // monitor/**); this equivalence pin makes drift impossible to miss.
+  const markerCases = [
+    undefined, null, 42, "x", [],
+    {},
+    { schema: "ego-watch-exit/v1" },
+    { schema: "ego-watch-exit/v1", wakeId: uuid, issuedAt: Date.now(), exitCode: 2, acknowledgedAt: null, ackAction: null },
+    { schema: "ego-watch-exit/v1", wakeId: uuid, issuedAt: Date.now(), exitCode: 2, acknowledgedAt: Date.now(), ackAction: "investigated" },
+    { schema: "ego-watch-exit/v1", wakeId: uuid, issuedAt: Date.now(), exitCode: 2, acknowledgedAt: Date.now(), ackAction: "resolved" },
+    { schema: "ego-watch-exit/v1", wakeId: uuid, issuedAt: Date.now(), exitCode: 2, acknowledgedAt: "yesterday", ackAction: "investigated" },
+    { schema: "ego-watch-exit/v1", wakeId: uuid, issuedAt: Date.now(), exitCode: 2, acknowledgedAt: null, ackAction: "investigated" },
+    { schema: "ego-watch-exit/v1", wakeId: uuid, issuedAt: Date.now(), exitCode: 2, acknowledgedAt: Date.now(), ackAction: null },
+    { schema: "ego-watch-exit/v1", wakeId: uuid, issuedAt: "x", exitCode: 2, acknowledgedAt: null, ackAction: null },
+    { schema: "ego-watch-exit/v1", wakeId: "short", issuedAt: Date.now(), exitCode: 2, acknowledgedAt: null, ackAction: null },
+    { schema: "ego-watch-exit/v2", wakeId: uuid, issuedAt: Date.now(), exitCode: 2, acknowledgedAt: null, ackAction: null },
+    { schema: "ego-watch-exit/v1", wakeId: uuid, issuedAt: Date.now(), exitCode: 0, acknowledgedAt: null, ackAction: null },
+  ];
+  for (const [index, marker] of markerCases.entries()) {
+    assert.equal(watchExitStructureError(marker), wakeContextWatchExitStructureError(marker),
+      "marker case " + index);
+  }
+  const supervisionCases = [
+    undefined, null, 42, "x", [],
+    {},
+    { schema: "ego-supervision/v1" },
+    { schema: "ego-supervision/v1", abnormalRounds: 0, progressAt: 0, lastReviewAt: 0 },
+    { schema: "ego-supervision/v1", abnormalRounds: 0, progressAt: 0, lastReviewAt: 0, pending: null },
+    { schema: "ego-supervision/v1", abnormalRounds: 0, progressAt: 0, lastReviewAt: 0, pending: { id: "w1", issuedAt: 5, reason: "X" } },
+    { schema: "ego-supervision/v1", abnormalRounds: 0, progressAt: 0, lastReviewAt: 0, pending: {} },
+    { schema: "ego-supervision/v1", abnormalRounds: 0, progressAt: 0, lastReviewAt: 0, pending: { id: "", issuedAt: 5 } },
+    { schema: "ego-supervision/v1", abnormalRounds: 0, progressAt: 0, lastReviewAt: 0, pending: { id: "w1" } },
+    { schema: "ego-supervision/v1", abnormalRounds: -1, progressAt: 0, lastReviewAt: 0, pending: null },
+    { schema: "ego-supervision/v1", abnormalRounds: 0, progressAt: "x", lastReviewAt: 0, pending: null },
+    { schema: "ego-supervision/v2", abnormalRounds: 0, progressAt: 0, lastReviewAt: 0, pending: null },
+    { schema: "ego-supervision/v1", abnormalRounds: 0, progressAt: 0, lastReviewAt: 0, pending: 7 },
+  ];
+  for (const [index, status] of supervisionCases.entries()) {
+    assert.equal(supervisionStatusStructureError(status), wakeContextSupervisionStructureError(status),
+      "supervision case " + index);
+  }
+});
+
 test("#27 B3 arm-before-delivery ordering is pinned in main(): send/send-new arm before the delivery template runs, recover-draft never arms", async () => {
   const source = await readFile(
     fileURLToPath(new URL("../monitor/dispatch-manager.mjs", import.meta.url)), "utf8");
@@ -337,6 +460,105 @@ test("#27 B3 disarmAfterRelease: every unmet criterion blocks and leaves the arm
   }, "ARM_STATE_UNREADABLE");
 });
 
+test("#27 B3 P1-B: a supervision ledger that is only parseable ({}) blocks the disarm", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ego-disarm-superv-empty-"));
+  try {
+    const dir = await makeConversation(root, { "a-fast-state.json": armedState("DISPATCH_ACCEPTED") });
+    await completedConsumed(dir);
+    // The pre-fix code read Boolean(status?.pending) — a bare {} parsed fine
+    // and read as "no pending". The mirrored ego-supervision/v1 contract
+    // rejects it as corruption.
+    await writeFile(join(dir, "a-supervision-status.json"), "{}");
+    const result = await disarmAfterRelease(dir, { rootMonitorDir: root });
+    assert.equal(result.disarmed, false);
+    assert.ok(result.blockers.includes("SUPERVISION_STATUS_INVALID"),
+      JSON.stringify(result.blockers));
+    assert.equal(JSON.parse(await readFile(join(dir, "a-fast-state.json"), "utf8")).armedReason, "DISPATCH_ACCEPTED");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("#27 B3 P1-B: an illegal acknowledgedAt string is corruption, never a proof of acknowledgement", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ego-disarm-ack-invalid-"));
+  try {
+    const dir = await makeConversation(root, { "a-fast-state.json": armedState("DISPATCH_ACCEPTED") });
+    await completedConsumed(dir);
+    await writeFile(join(dir, "a-watch-exit.json"), JSON.stringify({
+      schema: "ego-watch-exit/v1", wakeId: otherUuid, reason: "FAST_PROBE_WAKE_SUPERVISOR",
+      issuedAt: Date.now(), exitCode: 2, acknowledgedAt: "yesterday", ackAction: "investigated",
+    }));
+    const result = await disarmAfterRelease(dir, { rootMonitorDir: root });
+    assert.equal(result.disarmed, false);
+    assert.ok(result.blockers.includes("WAKE_MARKER_INVALID"),
+      JSON.stringify(result.blockers));
+    // A legally acked marker keeps the disarm path open (acked: finite ts + legal action).
+    await writeFile(join(dir, "a-watch-exit.json"), JSON.stringify({
+      schema: "ego-watch-exit/v1", wakeId: otherUuid, reason: "FAST_PROBE_WAKE_SUPERVISOR",
+      issuedAt: Date.now(), exitCode: 2, acknowledgedAt: Date.now(), ackAction: "resolved",
+    }));
+    const ok = await disarmAfterRelease(dir, { rootMonitorDir: root });
+    assert.deepEqual(ok, { disarmed: true, alreadyDisarmed: false, blockers: [] });
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("#27 B3 P1-B: the already-disarmed idempotent success is re-validated on fresh evidence", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ego-disarm-idempotent-"));
+  try {
+    const dir = await makeConversation(root, { "a-fast-state.json": armedState("DISARMED_IDLE") });
+    await completedConsumed(dir);
+    // Clean evidence: the idempotent success survives re-validation.
+    const ok = await disarmAfterRelease(dir, { rootMonitorDir: root });
+    assert.deepEqual(ok, { disarmed: true, alreadyDisarmed: true, blockers: [] });
+    assert.equal(JSON.parse(await readFile(join(dir, "a-fast-state.json"), "utf8")).armedReason, "DISARMED_IDLE");
+    // Conflict 1: a new dispatch re-opened the ledger (the forbidden window) —
+    // the pre-fix code returned success before ever looking at the ledger.
+    await writeFile(join(dir, "a-dispatch-state.json"),
+      JSON.stringify(dispatchRecord({ status: "ACCEPTED" })));
+    const conflict = await disarmAfterRelease(dir, { rootMonitorDir: root });
+    assert.equal(conflict.disarmed, false);
+    assert.ok(conflict.blockers.includes("DISPATCH_NOT_TERMINAL:ACCEPTED"),
+      JSON.stringify(conflict.blockers));
+    // Conflict 2: a fresh un-acked wake marker appears after the disarm.
+    await writeFile(join(dir, "a-dispatch-state.json"), JSON.stringify(dispatchRecord()));
+    await writeFile(join(dir, "a-watch-exit.json"), JSON.stringify({
+      schema: "ego-watch-exit/v1", wakeId: otherUuid, reason: "FAST_PROBE_WAKE_SUPERVISOR",
+      issuedAt: Date.now(), exitCode: 2, acknowledgedAt: null, ackAction: null,
+    }));
+    const staled = await disarmAfterRelease(dir, { rootMonitorDir: root });
+    assert.equal(staled.disarmed, false);
+    assert.ok(staled.blockers.includes("WAKE_MARKER_UNACKNOWLEDGED"),
+      JSON.stringify(staled.blockers));
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("#27 B3 P1-B: the sibling scan covers pending-new — an in-flight new-session request blocks the disarm", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ego-disarm-pending-new-"));
+  try {
+    const dir = await makeConversation(root, { "a-fast-state.json": armedState("DISPATCH_ACCEPTED") });
+    await completedConsumed(dir);
+    const pendingDir = join(root, "pending-new", otherUuid);
+    await mkdir(pendingDir, { recursive: true });
+    // A pending-new ledger with an in-flight status is an in-flight dispatch.
+    await writeFile(join(pendingDir, "a-dispatch-state.json"),
+      JSON.stringify(dispatchRecord({ dispatchId: otherUuid, conversationUuid: otherUuid, status: "ACCEPTED" })));
+    const blocked = await disarmAfterRelease(dir, { rootMonitorDir: root });
+    assert.equal(blocked.disarmed, false);
+    assert.ok(blocked.blockers.includes("OTHER_INFLIGHT_DISPATCH"),
+      JSON.stringify(blocked.blockers));
+    // The durable request directory itself is already in-flight evidence: a
+    // pending-new conversation WITHOUT a ledger still blocks (the allocation
+    // was never reconciled into conversations/).
+    await rm(join(pendingDir, "a-dispatch-state.json"));
+    const noLedger = await disarmAfterRelease(dir, { rootMonitorDir: root });
+    assert.equal(noLedger.disarmed, false);
+    assert.ok(noLedger.blockers.includes("OTHER_INFLIGHT_DISPATCH"),
+      JSON.stringify(noLedger.blockers));
+    // An empty pending-new root is the benign state and never blocks.
+    await rm(pendingDir, { recursive: true, force: true });
+    const clean = await disarmAfterRelease(dir, { rootMonitorDir: root });
+    assert.deepEqual(clean, { disarmed: true, alreadyDisarmed: false, blockers: [] });
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test("#27 B3 disarmAfterRelease: legacy arm fields are never auto-disarmed; ARMED_UNKNOWN may disarm on explicit confirmation", async () => {
   // Legacy ledger (no arm fields): refuses even with everything else satisfied.
   const legacyRoot = await mkdtemp(join(tmpdir(), "ego-disarm-legacy-"));
@@ -402,25 +624,99 @@ test("#27 B3 releaseDelivered: the watch path disarms only after a verified rele
   }
 });
 
-// ---- Requirement 4 (ruling §四.4): two page-label lifecycles ----
+test("#27 B3 P1-C: a deferred disarm exits the watch through the durable DISARM_DEFERRED_WAKE_SUPERVISOR ledger, never a silent success", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ego-disarm-deferred-"));
+  const logs = [];
+  const originalLog = console.log;
+  const originalError = console.error;
+  try {
+    const dir = await makeConversation(root, { "a-fast-state.json": armedState("DISPATCH_ACCEPTED") });
+    await completedConsumed(dir);
+    // One outstanding criterion (an un-acked wake marker) defers the disarm.
+    await writeFile(join(dir, "a-watch-exit.json"), JSON.stringify({
+      schema: "ego-watch-exit/v1", wakeId: otherUuid, reason: "FAST_PROBE_WAKE_SUPERVISOR",
+      issuedAt: Date.now(), exitCode: 2, acknowledgedAt: null, ackAction: null,
+    }));
+    const params = { conversation: uuid, space: "GDC-执行A", agentId: "gdc-a", monitorDir: root, rootMonitorDir: root };
+    console.log = (line) => logs.push(String(line));
+    console.error = (line) => logs.push(String(line));
+    const code = await releaseDelivered(params, dir, {
+      runScript: async () => ({ code: 0, result: "AGENT_SPACE_RELEASED" }),
+    });
+    // The watch does NOT exit 0 over a stranded armed ledger: it exits through
+    // the durable wake ledger with a structured handoff reason.
+    assert.equal(code, 2);
+    assert.equal(JSON.parse(await readFile(join(dir, "a-fast-state.json"), "utf8")).armedReason, "DISPATCH_ACCEPTED");
+    const marker = JSON.parse(await readFile(join(dir, "a-watch-exit.json"), "utf8"));
+    assert.equal(marker.schema, "ego-watch-exit/v1");
+    assert.equal(marker.reason, "DISARM_DEFERRED_WAKE_SUPERVISOR");
+    assert.equal(marker.exitCode, 2);
+    assert.equal(marker.acknowledgedAt, null);
+    assert.ok(logs.some((line) => line.startsWith("RESULT=DISARM_DEFERRED_WAKE_SUPERVISOR ") && line.includes(" wakeId=")),
+      JSON.stringify(logs));
+    // The managed ack of that wake is the handoff: acking clears the marker's
+    // own blocker and the managed retry converges the disarm in the same call.
+    const ackCode = await managedAcknowledge({
+      agentId: "gdc-a", space: "GDC-执行A", conversation: uuid,
+      wakeId: marker.wakeId, ackAction: "investigated", monitorDir: root,
+    });
+    assert.equal(ackCode, 0);
+    assert.equal(JSON.parse(await readFile(join(dir, "a-fast-state.json"), "utf8")).armedReason, "DISARMED_IDLE");
+    const ackedMarker = JSON.parse(await readFile(join(dir, "a-watch-exit.json"), "utf8"));
+    assert.notEqual(ackedMarker.acknowledgedAt, null);
+    assert.ok(logs.some((line) => line === "RESULT=DISARM_RETRY_COMPLETED"), JSON.stringify(logs));
+  } finally {
+    console.log = originalLog;
+    console.error = originalError;
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
-test("#27 B4 label lifecycles: fixed-session labels are never closable; dispatch-temp labels close only on a provably terminal ledger", () => {
+test("#27 B3 P1-C: the managed retry path is idempotent, best-effort, and wired into consume/ack/release", async () => {
+  // Behavior: a blocked retry never throws nor rewrites; once the evidence
+  // clears, the retry writes DISARMED_IDLE exactly once (alreadyDisarmed after).
+  const root = await mkdtemp(join(tmpdir(), "ego-disarm-retry-"));
+  try {
+    const dir = await makeConversation(root, { "a-fast-state.json": armedState("DISPATCH_ACCEPTED") });
+    await completedConsumed(dir);
+    const first = await retryPendingDisarm(dir, { rootMonitorDir: root });
+    assert.deepEqual(first, { disarmed: true, alreadyDisarmed: false, blockers: [] });
+    const again = await retryPendingDisarm(dir, { rootMonitorDir: root });
+    assert.deepEqual(again, { disarmed: true, alreadyDisarmed: true, blockers: [] });
+  } finally { await rm(root, { recursive: true, force: true }); }
+  // Wiring pin: consume and the managed ack both run the retry after their own
+  // managed work succeeded; both deferred-disarm exits share one wake reason.
+  const source = await readFile(
+    fileURLToPath(new URL("../monitor/dispatch-manager.mjs", import.meta.url)), "utf8");
+  assert.match(source, /await acknowledgeReply\(dir, record, p\.replySha256\);[\s\S]{0,400}?await retryPendingDisarm\(dir, \{ rootMonitorDir: p\.rootMonitorDir \}\)/);
+  assert.match(source, /await retryPendingDisarm\(dir, \{ rootMonitorDir: p\.monitorDir \}\);/);
+  assert.match(source, /return exitWatching\(dir, "DISARM_DEFERRED_WAKE_SUPERVISOR"/g);
+});
+
+// ---- Requirement 4 (ruling §四.4): two page-label lifecycles ----
+test("#27 B4 label lifecycles (P1-E): the durable ORIGIN record, never attribution or ledger status alone, decides fixed-session vs dispatch-temp", () => {
   const known = [uuid.toUpperCase()];
   // Ownership unproven: fixed-session, never touched by any cleanup.
   assert.deepEqual(classifyPageLabelLifecycle({ conversationUuid: otherUuid, known, ledgerStatus: "COMPLETED" }),
     { lifecycle: PAGE_LABEL_LIFECYCLE.FIXED_SESSION, closable: false, reason: "OWNERSHIP_UNPROVEN" });
   assert.deepEqual(classifyPageLabelLifecycle({ conversationUuid: null, known, ledgerStatus: null }),
     { lifecycle: PAGE_LABEL_LIFECYCLE.FIXED_SESSION, closable: false, reason: "OWNERSHIP_UNPROVEN" });
-  // Known + terminal: dispatch-temp, closable through the shared release-sweep mechanism.
-  assert.deepEqual(classifyPageLabelLifecycle({ conversationUuid: uuid, known, ledgerStatus: "COMPLETED" }),
+  // 归属 ≠ 生命周期: a REGISTERED fixed-session page stays fixed even with a
+  // COMPLETED ledger — the planner's exact counterexample.
+  assert.deepEqual(classifyPageLabelLifecycle({ conversationUuid: uuid, known, ledgerStatus: "COMPLETED", dispatchCreated: false }),
+    { lifecycle: PAGE_LABEL_LIFECYCLE.FIXED_SESSION, closable: false, reason: "FIXED_SESSION_PAGE" });
+  assert.deepEqual(classifyPageLabelLifecycle({ conversationUuid: uuid, known, ledgerStatus: "ABORTED", dispatchCreated: false }),
+    { lifecycle: PAGE_LABEL_LIFECYCLE.FIXED_SESSION, closable: false, reason: "FIXED_SESSION_PAGE" });
+  // Dispatch-created (anchored a-new-request.json) + terminal: temp, closable
+  // through the shared release-sweep mechanism.
+  assert.deepEqual(classifyPageLabelLifecycle({ conversationUuid: uuid, known, ledgerStatus: "COMPLETED", dispatchCreated: true }),
     { lifecycle: PAGE_LABEL_LIFECYCLE.DISPATCH_TEMP, closable: true, reason: "TEMP_RESULT_PAGE_FINISHED_DISPATCH" });
-  assert.deepEqual(classifyPageLabelLifecycle({ conversationUuid: uuid, known, ledgerStatus: "ABORTED" }),
+  assert.deepEqual(classifyPageLabelLifecycle({ conversationUuid: uuid, known, ledgerStatus: "ABORTED", dispatchCreated: true }),
     { lifecycle: PAGE_LABEL_LIFECYCLE.DISPATCH_TEMP, closable: true, reason: "TEMP_RESULT_PAGE_FINISHED_DISPATCH" });
-  // Known + active ledger: temp but not yet closable.
-  assert.deepEqual(classifyPageLabelLifecycle({ conversationUuid: uuid, known, ledgerStatus: "ACCEPTED" }),
+  // Dispatch-created but still active / unproven: temp, not yet closable.
+  assert.deepEqual(classifyPageLabelLifecycle({ conversationUuid: uuid, known, ledgerStatus: "ACCEPTED", dispatchCreated: true }),
     { lifecycle: PAGE_LABEL_LIFECYCLE.DISPATCH_TEMP, closable: false, reason: "ACTIVE_DISPATCH_LEDGER" });
-  // Known but no provable ledger: conservative default keeps the label.
-  assert.deepEqual(classifyPageLabelLifecycle({ conversationUuid: uuid, known, ledgerStatus: null }),
+  assert.deepEqual(classifyPageLabelLifecycle({ conversationUuid: uuid, known, ledgerStatus: null, dispatchCreated: true }),
     { lifecycle: PAGE_LABEL_LIFECYCLE.DISPATCH_TEMP, closable: false, reason: "LEDGER_UNPROVEN" });
 });
 
