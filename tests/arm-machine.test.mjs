@@ -5,7 +5,7 @@
 // 4-item resource comparison are a separate supervised phase (task brief).
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFile, writeFile, mkdir, rm, mkdtemp } from "node:fs/promises";
+import { readFile, writeFile, mkdir, rm, mkdtemp, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -253,6 +253,45 @@ test("#27 B3 P1-A: arming over a corrupt fast state archives the evidence and th
       assert.equal(await dispatchStormGate(dir), null);
     } finally { await rm(cleanRoot, { recursive: true, force: true }); }
   }
+});
+
+test("#27 B3 P1-A round 2: an archive failure aborts the arm write and preserves the original corrupt ledger", async () => {
+  // Forcing (real filesystem behavior, no mocks): the archive's
+  // exclusive-create name is occupied by a DIRECTORY, and the collision-retry
+  // name carries a timestamp whose string conversion fails, so the archive can
+  // never be created (the exclusive-create retry loop stays bounded and
+  // deterministic on every platform: attempt 0 is EEXIST, the next attempt
+  // deterministically throws).
+  const corruptBytes = JSON.stringify({ schema: "ego-fast-state/v4", notAField: 1 });
+  const root = await mkdtemp(join(tmpdir(), "ego-arm-archive-fail-"));
+  try {
+    const dir = await makeConversation(root, { "a-fast-state.json": corruptBytes });
+    await mkdir(join(dir, "a-fast-state.archive-corrupt-arm.json"), { recursive: true });
+    const poisoned = { toString() { throw new TypeError("SIMULATED_ARCHIVE_FAILURE"); } };
+    await assert.rejects(
+      armForDispatch(dir, { conversationUuid: uuid, space: "GDC-执行A", timestamp: poisoned }),
+      /ARM_CORRUPT_STATE_ARCHIVE_FAILED/);
+    // The original corrupt ledger survives byte-for-byte — nothing overwrote it
+    // for the sake of arming (the storm gate still refuses on it, fail-closed).
+    assert.equal(await readFile(join(dir, "a-fast-state.json"), "utf8"), corruptBytes);
+    await assert.rejects(dispatchStormGate(dir), /FAST_STATE_INVALID/);
+    // No new arm state and no archive artifact: the only archive-named entry is
+    // the DIRECTORY that occupied the exclusive-create name (the forcing state).
+    const entries = await readdir(dir);
+    assert.equal(entries.includes("a-fast-state.json"), true);
+    assert.deepEqual(entries.filter((name) => name.startsWith("a-fast-state.archive-")),
+      ["a-fast-state.archive-corrupt-arm.json"]);
+    // Event audit trail: the failure is recorded, no arm event is.
+    const events = await readFile(join(dir, "a-fast-events.ndjson"), "utf8");
+    assert.match(events, /CORRUPT_STATE_ARCHIVE_FAILED/);
+    assert.equal(events.includes("ARMED_DISPATCH_ACCEPTED"), false);
+    // Recovery: a retry with a working archive path (the occupied name moves
+    // aside via the collision loop) arms again with the STATE_CORRUPT carry-over.
+    const next = await armForDispatch(dir, { conversationUuid: uuid, space: "GDC-执行A" });
+    assert.equal(next.armedReason, "ARMED_UNKNOWN");
+    assert.equal(next.errorCode, "STATE_CORRUPT");
+    assert.equal(await dispatchStormGate(dir), "STORM_BACKOFF_PENDING");
+  } finally { await rm(root, { recursive: true, force: true }); }
 });
 
 test("#27 B3 P1-D: the shared boot contract classifies v3 as legacy-migrate, never corrupt; both probe variants use it", async () => {
@@ -672,25 +711,131 @@ test("#27 B3 P1-C: a deferred disarm exits the watch through the durable DISARM_
   }
 });
 
-test("#27 B3 P1-C: the managed retry path is idempotent, best-effort, and wired into consume/ack/release", async () => {
-  // Behavior: a blocked retry never throws nor rewrites; once the evidence
-  // clears, the retry writes DISARMED_IDLE exactly once (alreadyDisarmed after).
+test("#27 B3 P1-C round 2: the managed retry path requires a release-success credential and converges exactly once", async () => {
+  // Ruling rewrite: the previous version of this test FIXED THE BUGGY BEHAVIOR —
+  // it expected a disarm from a COMPLETED + already-consumed ledger with NO
+  // release evidence at all. A retry is a convergence of a prior SUCCESSFUL
+  // release only; its credential is the durable DISARM_DEFERRED_WAKE_SUPERVISOR
+  // wake marker a verified release leaves when it defers the disarm.
   const root = await mkdtemp(join(tmpdir(), "ego-disarm-retry-"));
   try {
     const dir = await makeConversation(root, { "a-fast-state.json": armedState("DISPATCH_ACCEPTED") });
     await completedConsumed(dir);
+    // No credential: the retry is a no-op and the ledger stays armed.
+    const unproven = await retryPendingDisarm(dir, { rootMonitorDir: root });
+    assert.deepEqual(unproven, { disarmed: false, alreadyDisarmed: false, blockers: ["RELEASE_SUCCESS_UNPROVEN"] });
+    assert.equal(JSON.parse(await readFile(join(dir, "a-fast-state.json"), "utf8")).armedReason, "DISPATCH_ACCEPTED");
+    // The credential SHAPE with its own wake still unacked: blocked (fail-closed)
+    // by the wake criterion itself until the supervisor acks.
+    await writeFile(join(dir, "a-watch-exit.json"), JSON.stringify({
+      schema: "ego-watch-exit/v1", wakeId: otherUuid, reason: "DISARM_DEFERRED_WAKE_SUPERVISOR",
+      issuedAt: Date.now(), exitCode: 2, acknowledgedAt: null, ackAction: null,
+    }));
+    const unacked = await retryPendingDisarm(dir, { rootMonitorDir: root });
+    assert.equal(unacked.disarmed, false);
+    assert.ok(unacked.blockers.includes("WAKE_MARKER_UNACKNOWLEDGED"), JSON.stringify(unacked.blockers));
+    // Acked credential (the real post-ack state of the deferred wake): the retry
+    // converges the disarm exactly once.
+    await writeFile(join(dir, "a-watch-exit.json"), JSON.stringify({
+      schema: "ego-watch-exit/v1", wakeId: otherUuid, reason: "DISARM_DEFERRED_WAKE_SUPERVISOR",
+      issuedAt: Date.now(), exitCode: 2, acknowledgedAt: Date.now(), ackAction: "investigated",
+    }));
     const first = await retryPendingDisarm(dir, { rootMonitorDir: root });
     assert.deepEqual(first, { disarmed: true, alreadyDisarmed: false, blockers: [] });
+    assert.equal(JSON.parse(await readFile(join(dir, "a-fast-state.json"), "utf8")).armedReason, "DISARMED_IDLE");
+    // Repeated retries are idempotent — no rewrite, exactly one DISARMED_IDLE event.
     const again = await retryPendingDisarm(dir, { rootMonitorDir: root });
     assert.deepEqual(again, { disarmed: true, alreadyDisarmed: true, blockers: [] });
+    const events = (await readFile(join(dir, "a-fast-events.ndjson"), "utf8")).trim().split("\n");
+    assert.equal(events.filter((line) => line.includes("DISARMED_IDLE")).length, 1);
   } finally { await rm(root, { recursive: true, force: true }); }
-  // Wiring pin: consume and the managed ack both run the retry after their own
-  // managed work succeeded; both deferred-disarm exits share one wake reason.
+  // Wiring pin (unchanged): consume and the managed ack both run the retry after
+  // their own managed work succeeded; both deferred-disarm exits share one reason.
   const source = await readFile(
     fileURLToPath(new URL("../monitor/dispatch-manager.mjs", import.meta.url)), "utf8");
   assert.match(source, /await acknowledgeReply\(dir, record, p\.replySha256\);[\s\S]{0,400}?await retryPendingDisarm\(dir, \{ rootMonitorDir: p\.rootMonitorDir \}\)/);
   assert.match(source, /await retryPendingDisarm\(dir, \{ rootMonitorDir: p\.monitorDir \}\);/);
   assert.match(source, /return exitWatching\(dir, "DISARM_DEFERRED_WAKE_SUPERVISOR"/g);
+});
+
+test("#27 B3 P1-C round 2: production incident sequence — a release FAILURE followed by ack/consume never converges the disarm", async () => {
+  // The exact production sequence from the ruling: dispatch COMPLETED + reply
+  // consumed -> release FAILED (SPACE_HAS_UNREGISTERED_PAGE_STOP) ->
+  // REPLY_DELIVERED_RELEASE_PENDING -> supervisor ack -> the old un-gated retry
+  // wrote DISARMED_IDLE while the page was still open. The gated retry must
+  // keep the ledger armed through the whole sequence.
+  const root = await mkdtemp(join(tmpdir(), "ego-disarm-incident-"));
+  const logs = [];
+  const originalLog = console.log;
+  const originalError = console.error;
+  try {
+    const dir = await makeConversation(root, { "a-fast-state.json": armedState("DISPATCH_ACCEPTED") });
+    await completedConsumed(dir);
+    const params = { conversation: uuid, space: "GDC-执行A", agentId: "gdc-a", monitorDir: root, rootMonitorDir: root };
+    console.log = (line) => logs.push(String(line));
+    console.error = (line) => logs.push(String(line));
+    // Release fails through the real watch path: the durable wake marker
+    // records the failure, the arm state stays armed.
+    const code = await releaseDelivered(params, dir, {
+      runScript: async () => ({ code: 1, result: "SPACE_HAS_UNREGISTERED_PAGE_STOP" }),
+    });
+    assert.equal(code, 2);
+    assert.equal(JSON.parse(await readFile(join(dir, "a-fast-state.json"), "utf8")).armedReason, "DISPATCH_ACCEPTED");
+    const marker = JSON.parse(await readFile(join(dir, "a-watch-exit.json"), "utf8"));
+    assert.equal(marker.reason, "REPLY_DELIVERED_RELEASE_PENDING");
+    // consume-style touch after the failed release: no credential -> no disarm.
+    const consumed = await retryPendingDisarm(dir, { rootMonitorDir: root });
+    assert.deepEqual(consumed, { disarmed: false, alreadyDisarmed: false, blockers: ["RELEASE_SUCCESS_UNPROVEN"] });
+    // The supervisor acks the release-pending wake: the managed retry runs…
+    const ackCode = await managedAcknowledge({
+      agentId: "gdc-a", space: "GDC-执行A", conversation: uuid,
+      wakeId: marker.wakeId, ackAction: "investigated", monitorDir: root,
+    });
+    assert.equal(ackCode, 0);
+    // …and STILL must not converge the disarm: the page was never released.
+    assert.equal(JSON.parse(await readFile(join(dir, "a-fast-state.json"), "utf8")).armedReason, "DISPATCH_ACCEPTED");
+    // No disarm event was ever written (the events file may not even exist —
+    // no step in this sequence legitimately appends one).
+    const incidentEvents = await readFile(join(dir, "a-fast-events.ndjson"), "utf8").catch(
+      (error) => (error.code === "ENOENT" ? "" : Promise.reject(error)));
+    assert.equal(incidentEvents.includes("DISARMED_IDLE"), false);
+    // A repeated ack of the same wake fails closed and touches nothing.
+    await assert.rejects(managedAcknowledge({
+      agentId: "gdc-a", space: "GDC-执行A", conversation: uuid,
+      wakeId: marker.wakeId, ackAction: "investigated", monitorDir: root,
+    }), /WAKE_ID_ALREADY_ACKNOWLEDGED/);
+    assert.equal(JSON.parse(await readFile(join(dir, "a-fast-state.json"), "utf8")).armedReason, "DISPATCH_ACCEPTED");
+  } finally {
+    console.log = originalLog;
+    console.error = originalError;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("#27 B3 P1-C round 2: consume-before-release keeps the ledger armed — no successful release has happened yet", async () => {
+  // The normal managed order is collect -> consume -> release. At consume time
+  // no release has succeeded, so the consume-triggered retry must be a no-op
+  // even though the ledger is terminal and the reply is consumed.
+  const root = await mkdtemp(join(tmpdir(), "ego-disarm-consume-first-"));
+  try {
+    const dir = await makeConversation(root, { "a-fast-state.json": armedState("DISPATCH_ACCEPTED") });
+    await completedConsumed(dir);
+    // The realistic durable trace at this point: the watch woke the supervisor
+    // with REPLY_READY_WAKE_SUPERVISOR (unacked) when the probe saw the reply.
+    await writeFile(join(dir, "a-watch-exit.json"), JSON.stringify({
+      schema: "ego-watch-exit/v1", wakeId: otherUuid, reason: "REPLY_READY_WAKE_SUPERVISOR",
+      issuedAt: Date.now(), exitCode: 2, acknowledgedAt: null, ackAction: null,
+    }));
+    const result = await retryPendingDisarm(dir, { rootMonitorDir: root });
+    assert.deepEqual(result, { disarmed: false, alreadyDisarmed: false, blockers: ["RELEASE_SUCCESS_UNPROVEN"] });
+    assert.equal(JSON.parse(await readFile(join(dir, "a-fast-state.json"), "utf8")).armedReason, "DISPATCH_ACCEPTED");
+    // Same verdict on a conversation with no watch-exit marker at all — a
+    // normal reply wake or a bare consume never carries a release credential.
+    await rm(join(dir, "a-watch-exit.json"));
+    const bare = await retryPendingDisarm(dir, { rootMonitorDir: root });
+    assert.deepEqual(bare, { disarmed: false, alreadyDisarmed: false, blockers: ["RELEASE_SUCCESS_UNPROVEN"] });
+    assert.equal(JSON.parse(await readFile(join(dir, "a-fast-state.json"), "utf8")).armedReason, "DISPATCH_ACCEPTED");
+  } finally { await rm(root, { recursive: true, force: true }); }
 });
 
 // ---- Requirement 4 (ruling §四.4): two page-label lifecycles ----

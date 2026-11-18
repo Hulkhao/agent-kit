@@ -17,7 +17,7 @@ import {
   withAgentRegistry, claimAgentSpace, releaseAgentConversation,
   assertTaskSpaceNamingAllowed, markAgentSweepPending, clearAgentSweepPending,
 } from "../monitor/agent-space.mjs";
-import { authorizeSpaceRebuild, classifyManagerResult } from "../monitor/dispatch-manager.mjs";
+import { authorizeSpaceRebuild, classifyManagerResult, bindNewConversation } from "../monitor/dispatch-manager.mjs";
 
 const AGENT = "gdc-a";
 const SPACE = "agentkit-dispatch-gdc-a-20261116";
@@ -41,14 +41,18 @@ async function writeLedger(root, uuid, record) {
   await writeFile(join(dir, "a-dispatch-state.json"), JSON.stringify(record));
 }
 
-// P1-E: the durable dispatch-creation evidence (a-new-request.json) that makes
-// a conversation's page a dispatch-temp label. Pages WITHOUT it are
-// fixed-session and are never closed by any sweep.
+// P1-E (re-review round 2): the durable dispatch-creation evidence
+// (a-new-request.json) in the REAL send-new data shape — requestId is the
+// CLIENT dispatch UUID and never equals the real conversationUuid; the
+// association between the two is persisted by bindNewConversation at binding
+// time. Pages WITHOUT that verified association are fixed-session and are
+// never closed by any sweep.
 async function markDispatchCreated(root, uuid, space = SPACE) {
   const dir = join(root, "conversations", uuid.toLowerCase());
   await mkdir(dir, { recursive: true });
   await writeFile(join(dir, "a-new-request.json"), JSON.stringify({
-    requestId: uuid.toLowerCase(), space, agentId: AGENT, payloadSha256: "a".repeat(64),
+    requestId: randomUUID(), conversationUuid: uuid.toLowerCase(),
+    space, agentId: AGENT, payloadSha256: "a".repeat(64),
   }));
 }
 
@@ -653,7 +657,7 @@ test("#27 B3 P1-E: fixed-session and finished dispatch-temp pages coexist — th
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
-test("#27 B3 P1-E: the dispatch-creation evidence is anchored — mismatching or unreadable records never mark a page temp", async () => {
+test("#27 B3 P1-E: the dispatch-creation evidence is anchored — real send-new shape (client requestId ≠ conversationUuid)", async () => {
   const root = await mkdtemp(join(tmpdir(), "ego-sweep-origin-"));
   try {
     const dir = join(root, "conversations", OTHER.toLowerCase());
@@ -662,20 +666,106 @@ test("#27 B3 P1-E: the dispatch-creation evidence is anchored — mismatching or
     assert.equal(await anchoredDispatchCreated(root, OTHER, SPACE), false);
     // A record for a DIFFERENT conversation/space is not this page's origin.
     await writeFile(join(dir, "a-new-request.json"), JSON.stringify({
-      requestId: OTHER.toLowerCase(), space: "other-space", agentId: AGENT, payloadSha256: "a".repeat(64),
+      requestId: CONV, conversationUuid: OTHER.toLowerCase(), space: "other-space",
+      agentId: AGENT, payloadSha256: "a".repeat(64),
     }));
     assert.equal(await anchoredDispatchCreated(root, OTHER, SPACE), false);
+    // The association field pointing at ANOTHER conversation is not this
+    // page's origin either.
     await writeFile(join(dir, "a-new-request.json"), JSON.stringify({
-      requestId: CONV.toLowerCase(), space: SPACE, agentId: AGENT, payloadSha256: "a".repeat(64),
+      requestId: CONV, conversationUuid: CONV, space: SPACE,
+      agentId: AGENT, payloadSha256: "a".repeat(64),
+    }));
+    assert.equal(await anchoredDispatchCreated(root, OTHER, SPACE), false);
+    // The PRE-FIX bound shape (no association field at all) is unproven too:
+    // before the fix this shape was the production norm and yet was tested
+    // with a fabricated requestId === conversationUuid record.
+    await writeFile(join(dir, "a-new-request.json"), JSON.stringify({
+      requestId: CONV, space: SPACE, agentId: AGENT, payloadSha256: "a".repeat(64),
     }));
     assert.equal(await anchoredDispatchCreated(root, OTHER, SPACE), false);
     // Corrupt JSON proves nothing (fail-closed: the page stays open).
     await writeFile(join(dir, "a-new-request.json"), "{corrupted");
     assert.equal(await anchoredDispatchCreated(root, OTHER, SPACE), false);
-    // A valid, anchored record IS the origin evidence.
+    // The REAL production record IS the origin evidence: requestId is the
+    // client dispatch UUID (≠ the conversation UUID) and the association was
+    // persisted by bindNewConversation.
     await writeFile(join(dir, "a-new-request.json"), JSON.stringify({
-      requestId: OTHER.toLowerCase(), space: SPACE, agentId: AGENT, payloadSha256: "a".repeat(64),
+      requestId: CONV, conversationUuid: OTHER.toLowerCase(), space: SPACE,
+      agentId: AGENT, payloadSha256: "a".repeat(64),
     }));
     assert.equal(await anchoredDispatchCreated(root, OTHER, SPACE), true);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+// #27 B3 P1-E (re-review round 2): the FULL production binding path — a real
+// send-new data shape (requestId = client dispatch UUID ≠ conversationUuid)
+// run through the real bindNewConversation, then the planner's demanded
+// coexistence scenario: the temp page built this way closes, a registered
+// fixed-session page with its own COMPLETED ledger does not.
+test("#27 B3 P1-E: real send-new binding maps client requestId → conversationUuid; coexistence sweep closes only the temp page", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ego-sweep-bindmap-"));
+  try {
+    const requestId = randomUUID(); // the CLIENT dispatch UUID, never the conversation uuid
+    const digest = "b".repeat(64);
+    const pending = join(root, "pending-new", requestId.toLowerCase());
+    await mkdir(pending, { recursive: true });
+    // Exactly what the managed send-new flow persists BEFORE the browser
+    // allocation: ledger + origin record still carry the client requestId as
+    // the conversation identity; a-new-conversation.json holds the
+    // browser-derived real UUID.
+    await writeFile(join(pending, "a-dispatch-state.json"), JSON.stringify({
+      schema: "ego-dispatch-state/v2", dispatchId: requestId, conversationUuid: requestId,
+      taskSpace: SPACE, pageLabel: "p1", status: "ACCEPTED", baselineTailKey: null,
+      baselineTailRole: null, baselineComposerLength: 0, attempt: 1, createdAt: Date.now(),
+      payload_sha256: digest,
+    }));
+    await writeFile(join(pending, "a-new-request.json"), JSON.stringify({
+      requestId: requestId.toLowerCase(), space: SPACE, agentId: AGENT, payloadSha256: digest,
+    }));
+    await writeFile(join(pending, "a-new-conversation.json"), JSON.stringify({
+      requestId: requestId.toLowerCase(), conversationUuid: THIRD,
+    }));
+    // Before binding, nothing proves the association — the page would be kept.
+    assert.equal(await anchoredDispatchCreated(root, THIRD, SPACE), false);
+    // The real binding maps client requestId → conversationUuid.
+    assert.equal(await bindNewConversation(root, requestId, SPACE, AGENT, digest), THIRD);
+    const boundPath = join(root, "conversations", THIRD.toLowerCase(), "a-new-request.json");
+    const bound = JSON.parse(await readFile(boundPath, "utf8"));
+    // The ORIGINAL client requestId field is kept and the association added.
+    assert.equal(bound.requestId, requestId.toLowerCase());
+    assert.notEqual(bound.requestId, THIRD.toLowerCase());
+    assert.equal(bound.conversationUuid, THIRD.toLowerCase());
+    assert.ok(Number.isFinite(bound.boundAt));
+    assert.equal(bound.space, SPACE);
+    assert.equal(bound.agentId, AGENT);
+    // The persisted association is exactly what makes the page dispatch-temp.
+    assert.equal(await anchoredDispatchCreated(root, THIRD, SPACE), true);
+    assert.equal(await anchoredDispatchCreated(root, THIRD, "other-space"), false);
+    // An idempotent replay does not rewrite the bound record.
+    assert.equal(await bindNewConversation(root, requestId, SPACE, AGENT, digest), THIRD);
+    assert.deepEqual(JSON.parse(await readFile(boundPath, "utf8")), bound);
+    // Coexistence: the just-built temp page (ledger now terminal) next to a
+    // registered fixed-session page with its own old COMPLETED ledger — the
+    // sweep closes ONLY the temp page.
+    await writeLedger(root, THIRD, validLedger(THIRD, "COMPLETED"));
+    await writeLedger(root, OTHER, validLedger(OTHER, "COMPLETED"));
+    const closed = [];
+    const auditFile = join(root, "a-release-sweep-audit.ndjson");
+    const sweep = await sweepTaskPages({
+      task: fakeTask([fakePage(chatUrl(OTHER), closed), fakePage(chatUrl(THIRD), closed)]),
+      monitorDir: root, agentId: AGENT, space: SPACE,
+      conversationUuid: CONV, known: [CONV, OTHER, THIRD], auditFile,
+    });
+    assert.equal(sweep.failed, 0);
+    assert.equal(sweep.closed, 1);
+    assert.deepEqual(closed, [chatUrl(THIRD)]);
+    const lines = (await readFile(auditFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    const keptLine = lines.find((line) => line.decision === "kept" && line.page?.uuid === OTHER);
+    assert.ok(keptLine, "the fixed-session page leaves its kept line");
+    assert.equal(keptLine.reason, "FIXED_SESSION_PAGE");
+    const closedLine = lines.find((line) => line.decision === "closed");
+    assert.equal(closedLine.page.uuid, THIRD);
+    assert.equal(closedLine.reason, "TEMP_RESULT_PAGE_FINISHED_DISPATCH");
   } finally { await rm(root, { recursive: true, force: true }); }
 });

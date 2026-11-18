@@ -109,14 +109,26 @@ export function classifyPageLabelLifecycle({ conversationUuid = null, known = []
 }
 
 // The durable dispatch-creation evidence for one conversation: its own
-// a-new-request.json, anchored to the page's uuid AND this TaskSpace. ENOENT
-// (or any mismatch/unreadable file) is `false` — an unprovable origin is
-// never promoted to "dispatch-created" (fail-closed: the page stays open).
+// a-new-request.json, verifying the client requestId ↔ real conversationUuid
+// ASSOCIATION bindNewConversation persists at binding time, anchored to the
+// page's uuid AND this TaskSpace. P1-E (re-review round 2): the pre-fix check
+// compared request.requestId (the CLIENT dispatch UUID) against the real
+// conversation UUID — a comparison that never holds in the real send-new flow,
+// so every production temp page read as FIXED_SESSION. ENOENT, a missing
+// association field (pre-fix bound records — they heal in place on the next
+// send-new replay of the same requestId, see bindNewConversation) or any
+// mismatch/unreadable file is `false` — an unprovable origin is never promoted
+// to "dispatch-created" (fail-closed: the page stays open).
+const REQUEST_ID_PATTERN = /^[a-f\d]{8}-[a-f\d]{4}-[1-8][a-f\d]{3}-[89ab][a-f\d]{3}-[a-f\d]{12}$/i;
+
 export async function anchoredDispatchCreated(monitorDir, uuid, space) {
   try {
     const request = JSON.parse(
       await readFile(monitorDir + "/conversations/" + String(uuid).toLowerCase() + "/a-new-request.json", "utf8"));
-    return request?.requestId === String(uuid).toLowerCase() && request?.space === space &&
+    return typeof request?.requestId === "string" && REQUEST_ID_PATTERN.test(request.requestId) &&
+      typeof request?.conversationUuid === "string" &&
+      request.conversationUuid.toLowerCase() === String(uuid).toLowerCase() &&
+      request?.space === space &&
       typeof request?.agentId === "string" && request.agentId !== "" &&
       /^[a-f\d]{64}$/i.test(request?.payloadSha256 || "");
   } catch { return false; }

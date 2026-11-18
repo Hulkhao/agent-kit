@@ -119,6 +119,14 @@ export function conversationDir(params) {
 
 // A pending first-message request is durable before the browser allocates a Page.
 // Retrying this request only completes a verified binding, never sends again.
+// P1-E (re-review round 2): at binding time the origin record (a-new-request.json)
+// is rewritten — the original client requestId field is KEPT and conversationUuid
+// (the real browser-allocated UUID) plus boundAt are added — so the durable
+// record moved into conversations/ self-verifies the client requestId ↔ real
+// conversationUuid association the release sweep's anchoredDispatchCreated
+// checks. The rewrite happens BEFORE the pending→conversations rename (the
+// rename carries the complete record; a crash leaves no half-bound shape) and
+// is idempotent: an already-associated record is left byte-identical.
 export async function bindNewConversation(root, requestId, space, agentId, payloadHash) {
   const pending = join(root, "pending-new", requestId.toLowerCase());
   const mappingFile = join(root, "new-requests", requestId.toLowerCase() + ".json");
@@ -167,6 +175,15 @@ export async function bindNewConversation(root, requestId, space, agentId, paylo
       record = { ...record, conversationUuid: mapping.conversationUuid };
       await writeJsonAtomic(join(pending, "a-dispatch-state.json"), record);
     }
+    // P1-E: persist the client requestId ↔ real conversationUuid association in
+    // the origin record BEFORE the rename (same writeJsonAtomic tmp+rename
+    // precedent as the ledger rewrite above — no open-handle window on Windows,
+    // and the directory rename then carries the complete record atomically).
+    if (pendingRequest.conversationUuid !== mapping.conversationUuid) {
+      await writeJsonAtomic(join(pending, "a-new-request.json"), {
+        ...pendingRequest, conversationUuid: mapping.conversationUuid, boundAt: Date.now(),
+      });
+    }
     await mkdir(dirname(target), { recursive: true });
     try {
       await stat(target);
@@ -183,6 +200,16 @@ export async function bindNewConversation(root, requestId, space, agentId, paylo
       record.taskSpace !== space || record.conversationUuid.toLowerCase() !== mapping.conversationUuid ||
       record.payload_sha256 !== payloadHash || !["ACCEPTED", "COMPLETED"].includes(record.status)) {
     throw new Error("NEW_CHAT_BOUND_RECORD_INVALID");
+  }
+  // P1-E heal (idempotent): bound directories written before the association
+  // field existed get conversationUuid/boundAt backfilled here, so a replay of
+  // the same send-new request upgrades the durable origin record in place.
+  // Without it, a pre-fix record would read as unproven origin forever (the
+  // sweep would keep the page FIXED_SESSION — fail-closed, never destructive).
+  if (request.conversationUuid !== mapping.conversationUuid) {
+    await writeJsonAtomic(join(target, "a-new-request.json"), {
+      ...request, conversationUuid: mapping.conversationUuid, boundAt: Date.now(),
+    });
   }
   return mapping.conversationUuid;
 }
@@ -431,7 +458,9 @@ export async function managedAcknowledge(p, { directory, now = Date.now() } = {}
   }
   // P1-C: the ack is a managed touch of the conversation ledgers — re-run the
   // idempotent disarm retry. Acking DISARM_DEFERRED_WAKE_SUPERVISOR clears its
-  // own unacked-wake blocker, so the deferred disarm converges right here.
+  // own unacked-wake blocker, so the deferred disarm converges right here; the
+  // retry itself first verifies the release-success credential inside
+  // retryPendingDisarm, so acks of release-FAILURE wakes never disarm.
   await retryPendingDisarm(dir, { rootMonitorDir: p.monitorDir });
   // The ack succeeded: it can never be recorded as DENIED. A failed GRANTED
   // audit write is reported separately and the ack still returns 0.
@@ -738,11 +767,16 @@ export async function armForDispatch(dir, { conversationUuid = null, space = nul
   if (classification === "corrupt") {
     try { corruptArchive = await archiveCorruptFastState(dir, timestamp); }
     catch (error) {
-      // An archive failure never unblocks delivery — the carry-over marker
-      // written below is what holds the storm gate shut; this is forensics.
+      // P1-A (re-review round 2): an archive failure aborts THIS arm write.
+      // The original corrupt ledger is durable blocking evidence the storm
+      // gate refuses on as-is, so it is never overwritten just to arm — the
+      // write below (and the ARMED_DISPATCH_ACCEPTED event) never run. The
+      // failure stays in the event audit, then the whole arm fails closed and
+      // the send surfaces MANAGER_FAILURE without any delivery.
       await appendEvent(dir, "CORRUPT_STATE_ARCHIVE_FAILED", {
         code: String(error?.code || error?.message || "UNKNOWN").slice(0, 80),
       }).catch(() => {});
+      throw new Error("ARM_CORRUPT_STATE_ARCHIVE_FAILED");
     }
   }
   const next = normalizeFastState(classification === "current" || classification === "legacy" ? value : {},
@@ -809,6 +843,32 @@ export function supervisionStatusStructureError(status) {
   if (typeof pending.id !== "string" || pending.id === "") return "SUPERVISION_PENDING_ID_INVALID";
   if (!Number.isFinite(pending.issuedAt)) return "SUPERVISION_PENDING_ISSUED_AT_INVALID";
   return null;
+}
+
+// P1-C (re-review round 2): the release-success credential for DEFERRED disarm
+// retries. Two different release outcomes leave two different durable wake
+// reasons in the conversation's ego-watch-exit ledger (exitWatching): a
+// VERIFIED release (AGENT_SPACE_RELEASED) whose disarm was blocked writes
+// DISARM_DEFERRED_WAKE_SUPERVISOR; a FAILED release writes
+// REPLY_DELIVERED_RELEASE_PENDING. Only the first is proof a real release
+// succeeded. The credential rides the existing wake marker (the ruling's
+// sanctioned carrier — no new file format, no daemon): every watch exit
+// overwrites it, so a later failed release automatically invalidates a stale
+// credential, and the frozen ego-watch-exit/v1 structure contract keeps a
+// hand-edited or corrupt marker from counting. This closes the production
+// incident: dispatch COMPLETED + reply consumed -> release FAILED
+// (SPACE_HAS_UNREGISTERED_PAGE_STOP) -> REPLY_DELIVERED_RELEASE_PENDING ->
+// supervisor ack -> an un-gated retry wrote DISARMED_IDLE while the page was
+// still open. Normal reply wakes, normal acks and normal consumes carry no
+// credential and can never disarm through the retry path.
+const DISARM_DEFERRED_REASON = "DISARM_DEFERRED_WAKE_SUPERVISOR";
+
+async function hasDeferredReleaseCredential(dir) {
+  try {
+    const marker = JSON.parse(await readFile(join(dir, "a-watch-exit.json"), "utf8"));
+    if (watchExitStructureError(marker)) return false;
+    return marker.reason === DISARM_DEFERRED_REASON;
+  } catch { return false; } // absent/unreadable = unproven (fail-closed)
 }
 
 // Write DISARMED_IDLE for a conversation whose release just completed. All
@@ -1001,12 +1061,20 @@ export async function releaseDelivered(params, dir, { runScript } = {}) {
 
 // P1-C: the managed idempotent disarm retry shared by every action that
 // touches a conversation's ledgers (consume, ack; release re-runs go through
-// releaseDelivered's own disarm). Best-effort by contract: a retry failure
+// releaseDelivered's own disarm, which runs only after a release just verified
+// as successful in the same call). P1-C re-review round 2: a retry only
+// CONVERGES a prior successful release whose disarm was deferred — the
+// DISARM_DEFERRED_WAKE_SUPERVISOR credential is verified BEFORE any arm-state
+// touch, so release-failure wakes, normal reply wakes, normal acks and normal
+// consumes never disarm through here. Best-effort by contract: a retry failure
 // never flips the hosting action's result — the structured wake (above) owns
 // the escalation when the disarm stays blocked. No background daemon, no
 // change to the existing watch scheduling.
 export async function retryPendingDisarm(dir, { rootMonitorDir = null } = {}) {
   try {
+    if (!(await hasDeferredReleaseCredential(dir))) {
+      return { disarmed: false, alreadyDisarmed: false, blockers: ["RELEASE_SUCCESS_UNPROVEN"] };
+    }
     const retry = await disarmAfterRelease(dir, { rootMonitorDir: rootMonitorDir ?? dirname(dirname(dir)) });
     if (retry.disarmed && !retry.alreadyDisarmed) {
       console.log("RESULT=DISARM_RETRY_COMPLETED");
@@ -1287,8 +1355,9 @@ export async function main(args = process.argv.slice(2)) {
     await acknowledgeReply(dir, record, p.replySha256);
     console.log("RESULT=REPLY_CONSUMED");
     // P1-C: consuming the reply clears its disarm blocker (REPLY_NOT_CONSUMED)
-    // — every managed touch of the conversation ledgers re-runs the idempotent
-    // disarm retry so a previously deferred disarm converges here.
+    // — every managed touch re-runs the idempotent disarm retry, which first
+    // verifies the durable release-success credential, so a consume that
+    // happens before (or after a failed) release never converges the disarm.
     await retryPendingDisarm(dir, { rootMonitorDir: p.rootMonitorDir });
     return 0;
   }
