@@ -5,7 +5,7 @@
 // 4-item resource comparison are a separate supervised phase (task brief).
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFile, writeFile, mkdir, rm, mkdtemp, readdir } from "node:fs/promises";
+import { readFile, writeFile, mkdir, rm, mkdtemp, readdir, chmod } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -18,7 +18,7 @@ import { evaluateDisarmEligibility, dispatchStormGate } from "../monitor/dispatc
 import {
   armForDispatch, disarmAfterRelease, retryPendingDisarm, managedAcknowledge, acknowledgeWake,
   classifyPageLabelLifecycle, PAGE_LABEL_LIFECYCLE,
-  releaseDelivered,
+  releaseDelivered, directRelease,
   watchExitStructureError, supervisionStatusStructureError,
 } from "../monitor/dispatch-manager.mjs";
 import {
@@ -426,7 +426,7 @@ test("#27 B3 disarmAfterRelease: satisfied criteria write DISARMED_IDLE after te
   try {
     const dir = await makeConversation(root, { "a-fast-state.json": armedState("PEER_GENERATING") });
     await completedConsumed(dir);
-    const result = await disarmAfterRelease(dir, { rootMonitorDir: root });
+    const result = await disarmAfterRelease(dir, { rootMonitorDir: root, expectedDispatchId: uuid });
     assert.deepEqual(result, { disarmed: true, alreadyDisarmed: false, blockers: [] });
     const state = JSON.parse(await readFile(join(dir, "a-fast-state.json"), "utf8"));
     assert.equal(state.armedReason, "DISARMED_IDLE");
@@ -434,7 +434,7 @@ test("#27 B3 disarmAfterRelease: satisfied criteria write DISARMED_IDLE after te
     const events = await readFile(join(dir, "a-fast-events.ndjson"), "utf8");
     assert.match(events, /DISARMED_IDLE/);
     // Idempotent: a repeat reports success without touching the state.
-    const again = await disarmAfterRelease(dir, { rootMonitorDir: root });
+    const again = await disarmAfterRelease(dir, { rootMonitorDir: root, expectedDispatchId: uuid });
     assert.deepEqual(again, { disarmed: true, alreadyDisarmed: true, blockers: [] });
   } finally { await rm(root, { recursive: true, force: true }); }
 });
@@ -445,7 +445,7 @@ test("#27 B3 disarmAfterRelease: every unmet criterion blocks and leaves the arm
     try {
       const dir = await makeConversation(root, { "a-fast-state.json": armedState("DISPATCH_ACCEPTED") });
       await mutate(dir, root);
-      const result = await disarmAfterRelease(dir, { rootMonitorDir: root });
+      const result = await disarmAfterRelease(dir, { rootMonitorDir: root, expectedDispatchId: uuid });
       assert.equal(result.disarmed, false, name);
       assert.ok(result.blockers.includes(expectBlocker), name + " -> " + JSON.stringify(result.blockers));
       const rawState = await readFile(join(dir, "a-fast-state.json"), "utf8");
@@ -517,7 +517,7 @@ test("#27 B3 P1-B: a supervision ledger that is only parseable ({}) blocks the d
     // and read as "no pending". The mirrored ego-supervision/v1 contract
     // rejects it as corruption.
     await writeFile(join(dir, "a-supervision-status.json"), "{}");
-    const result = await disarmAfterRelease(dir, { rootMonitorDir: root });
+    const result = await disarmAfterRelease(dir, { rootMonitorDir: root, expectedDispatchId: uuid });
     assert.equal(result.disarmed, false);
     assert.ok(result.blockers.includes("SUPERVISION_STATUS_INVALID"),
       JSON.stringify(result.blockers));
@@ -534,7 +534,7 @@ test("#27 B3 P1-B: an illegal acknowledgedAt string is corruption, never a proof
       schema: "ego-watch-exit/v1", wakeId: otherUuid, reason: "FAST_PROBE_WAKE_SUPERVISOR",
       issuedAt: Date.now(), exitCode: 2, acknowledgedAt: "yesterday", ackAction: "investigated",
     }));
-    const result = await disarmAfterRelease(dir, { rootMonitorDir: root });
+    const result = await disarmAfterRelease(dir, { rootMonitorDir: root, expectedDispatchId: uuid });
     assert.equal(result.disarmed, false);
     assert.ok(result.blockers.includes("WAKE_MARKER_INVALID"),
       JSON.stringify(result.blockers));
@@ -543,7 +543,7 @@ test("#27 B3 P1-B: an illegal acknowledgedAt string is corruption, never a proof
       schema: "ego-watch-exit/v1", wakeId: otherUuid, reason: "FAST_PROBE_WAKE_SUPERVISOR",
       issuedAt: Date.now(), exitCode: 2, acknowledgedAt: Date.now(), ackAction: "resolved",
     }));
-    const ok = await disarmAfterRelease(dir, { rootMonitorDir: root });
+    const ok = await disarmAfterRelease(dir, { rootMonitorDir: root, expectedDispatchId: uuid });
     assert.deepEqual(ok, { disarmed: true, alreadyDisarmed: false, blockers: [] });
   } finally { await rm(root, { recursive: true, force: true }); }
 });
@@ -554,14 +554,14 @@ test("#27 B3 P1-B: the already-disarmed idempotent success is re-validated on fr
     const dir = await makeConversation(root, { "a-fast-state.json": armedState("DISARMED_IDLE") });
     await completedConsumed(dir);
     // Clean evidence: the idempotent success survives re-validation.
-    const ok = await disarmAfterRelease(dir, { rootMonitorDir: root });
+    const ok = await disarmAfterRelease(dir, { rootMonitorDir: root, expectedDispatchId: uuid });
     assert.deepEqual(ok, { disarmed: true, alreadyDisarmed: true, blockers: [] });
     assert.equal(JSON.parse(await readFile(join(dir, "a-fast-state.json"), "utf8")).armedReason, "DISARMED_IDLE");
     // Conflict 1: a new dispatch re-opened the ledger (the forbidden window) —
     // the pre-fix code returned success before ever looking at the ledger.
     await writeFile(join(dir, "a-dispatch-state.json"),
       JSON.stringify(dispatchRecord({ status: "ACCEPTED" })));
-    const conflict = await disarmAfterRelease(dir, { rootMonitorDir: root });
+    const conflict = await disarmAfterRelease(dir, { rootMonitorDir: root, expectedDispatchId: uuid });
     assert.equal(conflict.disarmed, false);
     assert.ok(conflict.blockers.includes("DISPATCH_NOT_TERMINAL:ACCEPTED"),
       JSON.stringify(conflict.blockers));
@@ -571,7 +571,7 @@ test("#27 B3 P1-B: the already-disarmed idempotent success is re-validated on fr
       schema: "ego-watch-exit/v1", wakeId: otherUuid, reason: "FAST_PROBE_WAKE_SUPERVISOR",
       issuedAt: Date.now(), exitCode: 2, acknowledgedAt: null, ackAction: null,
     }));
-    const staled = await disarmAfterRelease(dir, { rootMonitorDir: root });
+    const staled = await disarmAfterRelease(dir, { rootMonitorDir: root, expectedDispatchId: uuid });
     assert.equal(staled.disarmed, false);
     assert.ok(staled.blockers.includes("WAKE_MARKER_UNACKNOWLEDGED"),
       JSON.stringify(staled.blockers));
@@ -588,7 +588,7 @@ test("#27 B3 P1-B: the sibling scan covers pending-new — an in-flight new-sess
     // A pending-new ledger with an in-flight status is an in-flight dispatch.
     await writeFile(join(pendingDir, "a-dispatch-state.json"),
       JSON.stringify(dispatchRecord({ dispatchId: otherUuid, conversationUuid: otherUuid, status: "ACCEPTED" })));
-    const blocked = await disarmAfterRelease(dir, { rootMonitorDir: root });
+    const blocked = await disarmAfterRelease(dir, { rootMonitorDir: root, expectedDispatchId: uuid });
     assert.equal(blocked.disarmed, false);
     assert.ok(blocked.blockers.includes("OTHER_INFLIGHT_DISPATCH"),
       JSON.stringify(blocked.blockers));
@@ -596,13 +596,13 @@ test("#27 B3 P1-B: the sibling scan covers pending-new — an in-flight new-sess
     // pending-new conversation WITHOUT a ledger still blocks (the allocation
     // was never reconciled into conversations/).
     await rm(join(pendingDir, "a-dispatch-state.json"));
-    const noLedger = await disarmAfterRelease(dir, { rootMonitorDir: root });
+    const noLedger = await disarmAfterRelease(dir, { rootMonitorDir: root, expectedDispatchId: uuid });
     assert.equal(noLedger.disarmed, false);
     assert.ok(noLedger.blockers.includes("OTHER_INFLIGHT_DISPATCH"),
       JSON.stringify(noLedger.blockers));
     // An empty pending-new root is the benign state and never blocks.
     await rm(pendingDir, { recursive: true, force: true });
-    const clean = await disarmAfterRelease(dir, { rootMonitorDir: root });
+    const clean = await disarmAfterRelease(dir, { rootMonitorDir: root, expectedDispatchId: uuid });
     assert.deepEqual(clean, { disarmed: true, alreadyDisarmed: false, blockers: [] });
   } finally { await rm(root, { recursive: true, force: true }); }
 });
@@ -615,7 +615,7 @@ test("#27 B3 disarmAfterRelease: legacy arm fields are never auto-disarmed; ARME
       "a-fast-state.json": JSON.stringify({ schema: "ego-fast-state/v3", ts: 5 }),
     });
     await completedConsumed(dir);
-    const result = await disarmAfterRelease(dir, { rootMonitorDir: legacyRoot });
+    const result = await disarmAfterRelease(dir, { rootMonitorDir: legacyRoot, expectedDispatchId: uuid });
     assert.equal(result.disarmed, false);
     assert.deepEqual(result.blockers, ["ARM_STATE_LEGACY_NO_DISARM_INFERENCE"]);
     // The legacy v3 ledger is untouched: still schema v3, still no arm field.
@@ -629,7 +629,7 @@ test("#27 B3 disarmAfterRelease: legacy arm fields are never auto-disarmed; ARME
   try {
     const dir = await makeConversation(unknownRoot, { "a-fast-state.json": armedState("ARMED_UNKNOWN") });
     await completedConsumed(dir);
-    const result = await disarmAfterRelease(dir, { rootMonitorDir: unknownRoot });
+    const result = await disarmAfterRelease(dir, { rootMonitorDir: unknownRoot, expectedDispatchId: uuid });
     assert.equal(result.disarmed, true);
     const state = JSON.parse(await readFile(join(dir, "a-fast-state.json"), "utf8"));
     assert.equal(state.armedReason, "DISARMED_IDLE");
@@ -1010,6 +1010,297 @@ test("#27 B3 P1-C round 3: armForDispatch fails closed when a stale credential c
     await assert.rejects(readFile(join(dir, "a-fast-state.json"), "utf8"), /ENOENT/);
     await assert.rejects(readFile(join(dir, "a-fast-events.ndjson"), "utf8"), /ENOENT/);
   } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+// ---- P1-C round 4 (planner ruling reply 2d9bdde7): credential lifecycle + identity isolation ----
+
+test("#27 B3 P1-C round 4: a structurally incomplete credential (missing or non-finite issuedAt) is unproven — stays armed", async () => {
+  // The marker side of the pair is fully valid AND acked in every step — the
+  // only variable under test is the companion credential's structure. The
+  // round-3 gap: a bare {schema, dispatchId} credential passed the gate.
+  const root = await mkdtemp(join(tmpdir(), "ego-credential-shape-"));
+  try {
+    const dir = await makeConversation(root, { "a-fast-state.json": armedState("DISPATCH_ACCEPTED") });
+    await completedConsumed(dir);
+    await writeFile(join(dir, "a-watch-exit.json"), JSON.stringify({
+      schema: "ego-watch-exit/v1", wakeId: otherUuid, reason: "DISARM_DEFERRED_WAKE_SUPERVISOR",
+      issuedAt: Date.now(), exitCode: 2, acknowledgedAt: Date.now(), ackAction: "investigated",
+    }));
+    // Missing issuedAt (ruling gap 1): corruption, never a proof of release.
+    await writeDisarmCredential(dir, { schema: "ego-disarm-credential/v1", dispatchId: uuid });
+    const missing = await retryPendingDisarm(dir, { rootMonitorDir: root });
+    assert.deepEqual(missing, { disarmed: false, alreadyDisarmed: false, blockers: ["RELEASE_SUCCESS_UNPROVEN"] });
+    assert.equal(JSON.parse(await readFile(join(dir, "a-fast-state.json"), "utf8")).armedReason, "DISPATCH_ACCEPTED");
+    // Wrong type (string issuedAt): equally unproven.
+    await writeDisarmCredential(dir, { schema: "ego-disarm-credential/v1", dispatchId: uuid, issuedAt: "yesterday" });
+    const wrongType = await retryPendingDisarm(dir, { rootMonitorDir: root });
+    assert.deepEqual(wrongType, { disarmed: false, alreadyDisarmed: false, blockers: ["RELEASE_SUCCESS_UNPROVEN"] });
+    assert.equal(JSON.parse(await readFile(join(dir, "a-fast-state.json"), "utf8")).armedReason, "DISPATCH_ACCEPTED");
+    // A non-finite number never survives JSON (NaN/Infinity serialize to
+    // null) — equally unproven.
+    await writeDisarmCredential(dir, { schema: "ego-disarm-credential/v1", dispatchId: uuid, issuedAt: null });
+    const nonFinite = await retryPendingDisarm(dir, { rootMonitorDir: root });
+    assert.deepEqual(nonFinite, { disarmed: false, alreadyDisarmed: false, blockers: ["RELEASE_SUCCESS_UNPROVEN"] });
+    assert.equal(JSON.parse(await readFile(join(dir, "a-fast-state.json"), "utf8")).armedReason, "DISPATCH_ACCEPTED");
+    // No disarm was ever written through the incomplete shapes.
+    await assert.rejects(readFile(join(dir, "a-fast-events.ndjson"), "utf8"), /ENOENT/);
+    // Positive control: the COMPLETE credential is the proof — same marker,
+    // the retry converges the disarm.
+    await writeDisarmCredential(dir, disarmCredential());
+    const ok = await retryPendingDisarm(dir, { rootMonitorDir: root });
+    assert.deepEqual(ok, { disarmed: true, alreadyDisarmed: false, blockers: [] });
+    assert.equal(JSON.parse(await readFile(join(dir, "a-fast-state.json"), "utf8")).armedReason, "DISARMED_IDLE");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("#27 B3 P1-C round 4 (ruling scenario): a repeated release attempt clears the stale credential first — a failed retry with a surviving old marker never disarms", async () => {
+  // The exact sequence from the ruling gap 3: success deferred -> ack ->
+  // the SAME dispatch releases again and FAILS -> its wake marker write
+  // fails too (the old acked DISARM_DEFERRED marker survives, exactly like a
+  // swallowed exitWatching write error) -> a repeated consume retriggers the
+  // retry. The pre-attempt credential clear breaks the stale pair, so the
+  // old marker alone can never disarm. Forcing (real fs, no mocks): the
+  // marker file is made read-only, so writeJsonAtomic's rename is refused
+  // with EPERM and exitWatching's swallowed error leaves the old bytes.
+  const root = await mkdtemp(join(tmpdir(), "ego-retry-inherit-"));
+  const logs = [];
+  const originalLog = console.log;
+  const originalError = console.error;
+  try {
+    const dir = await makeConversation(root, { "a-fast-state.json": armedState("DISPATCH_ACCEPTED") });
+    const record = dispatchRecord();
+    await writeFile(join(dir, "a-dispatch-state.json"), JSON.stringify(record));
+    const receipt = await saveReply(dir, record, { text: "已消费回复", source: "DOM_BOUNDARY_VISIBLE" }, uuid);
+    await acknowledgeReply(dir, record, receipt.sha256);
+    // Sibling in flight -> the first successful release defers its disarm.
+    const sibling = join(root, "conversations", otherUuid);
+    await mkdir(sibling, { recursive: true });
+    await writeFile(join(sibling, "a-dispatch-state.json"),
+      JSON.stringify(dispatchRecord({ dispatchId: otherUuid, conversationUuid: otherUuid, status: "ACCEPTED" })));
+    const params = { conversation: uuid, space: "GDC-执行A", agentId: "gdc-a", monitorDir: root, rootMonitorDir: root };
+    console.log = (line) => logs.push(String(line));
+    console.error = (line) => logs.push(String(line));
+    // 1. Success deferred: credential issued for THIS dispatch, marker written.
+    const first = await releaseDelivered(params, dir, {
+      runScript: async () => ({ code: 0, result: "AGENT_SPACE_RELEASED" }),
+    });
+    assert.equal(first, 2);
+    let marker = JSON.parse(await readFile(join(dir, "a-watch-exit.json"), "utf8"));
+    assert.equal(marker.reason, "DISARM_DEFERRED_WAKE_SUPERVISOR");
+    const credential = JSON.parse(await readFile(join(dir, "a-disarm-credential.json"), "utf8"));
+    assert.equal(credential.dispatchId, record.dispatchId);
+    // 2. Supervisor acks; the sibling keeps the retry blocked, credential retained.
+    const ackCode = await managedAcknowledge({
+      agentId: "gdc-a", space: "GDC-执行A", conversation: uuid,
+      wakeId: marker.wakeId, ackAction: "investigated", monitorDir: root,
+    });
+    assert.equal(ackCode, 0);
+    marker = JSON.parse(await readFile(join(dir, "a-watch-exit.json"), "utf8"));
+    assert.notEqual(marker.acknowledgedAt, null);
+    // 3. The same dispatch releases AGAIN, this attempt fails, and its marker
+    //    write fails as well — the OLD acked deferred marker survives. Inside
+    //    the release script the stale credential must ALREADY be gone: a
+    //    release attempt never runs carrying a previous round's success.
+    await chmod(join(dir, "a-watch-exit.json"), 0o444);
+    let credentialGoneAtScriptTime = null;
+    const second = await releaseDelivered(params, dir, {
+      runScript: async () => {
+        credentialGoneAtScriptTime = await readFile(join(dir, "a-disarm-credential.json"), "utf8")
+          .then(() => false, (error) => error.code === "ENOENT");
+        return { code: 1, result: "SPACE_RELEASE_ACCOUNT_UNPROVEN" };
+      },
+    });
+    await chmod(join(dir, "a-watch-exit.json"), 0o666);
+    assert.equal(second, 2);
+    assert.equal(credentialGoneAtScriptTime, true, "the stale credential must be cleared before the release attempt runs");
+    // The pre-attempt clear (not the release failure) removed the credential.
+    assert.equal(await readFile(join(dir, "a-disarm-credential.json"), "utf8")
+      .then(() => true, (error) => error.code === "ENOENT" ? false : Promise.reject(error)), false);
+    // The old marker survived the failed write: the stale pair's marker half.
+    marker = JSON.parse(await readFile(join(dir, "a-watch-exit.json"), "utf8"));
+    assert.equal(marker.reason, "DISARM_DEFERRED_WAKE_SUPERVISOR");
+    assert.notEqual(marker.acknowledgedAt, null);
+    // 4. Repeated consume (acknowledgeReply allows repeat receipts) retriggers
+    //    the retry — without the credential the pair is unproven: stays armed.
+    await acknowledgeReply(dir, record, receipt.sha256);
+    const repeat = await retryPendingDisarm(dir, { rootMonitorDir: root });
+    assert.deepEqual(repeat, { disarmed: false, alreadyDisarmed: false, blockers: ["RELEASE_SUCCESS_UNPROVEN"] });
+    assert.equal(JSON.parse(await readFile(join(dir, "a-fast-state.json"), "utf8")).armedReason, "DISPATCH_ACCEPTED");
+    const events = await readFile(join(dir, "a-fast-events.ndjson"), "utf8")
+      .catch((error) => error.code === "ENOENT" ? "" : Promise.reject(error));
+    assert.equal(events.includes("DISARMED_IDLE"), false);
+    // 5. Recovery contract: only a NEW successful release re-issues a
+    //    credential (the sibling is gone, so this one disarms outright — no
+    //    credential is even needed).
+    await rm(sibling, { recursive: true, force: true });
+    const third = await releaseDelivered(params, dir, {
+      runScript: async () => ({ code: 0, result: "AGENT_SPACE_RELEASED" }),
+    });
+    assert.equal(third, 0);
+    assert.equal(JSON.parse(await readFile(join(dir, "a-fast-state.json"), "utf8")).armedReason, "DISARMED_IDLE");
+    assert.equal(await readFile(join(dir, "a-disarm-credential.json"), "utf8")
+      .then(() => true, (error) => error.code === "ENOENT" ? false : Promise.reject(error)), false);
+  } finally {
+    console.log = originalLog;
+    console.error = originalError;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("#27 B3 P1-C round 4 (ruling scenario): direct release keeps the verified dispatch identity across a concurrent send — A's success never disarms or credentials B", async () => {
+  const logs = [];
+  const originalLog = console.log;
+  const originalError = console.error;
+  try {
+    // Happy-path control: the extracted direct release keeps its plain flow —
+    // verified success converges the disarm with the entry-verified identity.
+    const controlRoot = await mkdtemp(join(tmpdir(), "ego-direct-release-ok-"));
+    const controlDir = await makeConversation(controlRoot, { "a-fast-state.json": armedState("DISPATCH_ACCEPTED") });
+    await completedConsumed(controlDir);
+    console.log = (line) => logs.push(String(line));
+    console.error = (line) => logs.push(String(line));
+    const ok = await directRelease(
+      { conversation: uuid, space: "GDC-执行A", agentId: "gdc-a", monitorDir: controlRoot, rootMonitorDir: controlRoot, action: "release" },
+      controlDir, { runScript: async () => ({ code: 0, result: "AGENT_SPACE_RELEASED" }) });
+    assert.equal(ok, 0);
+    assert.equal(JSON.parse(await readFile(join(controlDir, "a-fast-state.json"), "utf8")).armedReason, "DISARMED_IDLE");
+    await assert.rejects(readFile(join(controlDir, "a-watch-exit.json"), "utf8"), /ENOENT/);
+    await assert.rejects(readFile(join(controlDir, "a-disarm-credential.json"), "utf8"), /ENOENT/);
+    await rm(controlRoot, { recursive: true, force: true });
+
+    // The ruling's attack path: A verified at release entry, B's send starts
+    // mid-release (the send template only guards in-flight ledgers, so a
+    // COMPLETED ledger is lawfully replaced), A's release then SUCCEEDS.
+    const root = await mkdtemp(join(tmpdir(), "ego-direct-identity-"));
+    const dir = await makeConversation(root, { "a-fast-state.json": armedState("DISPATCH_ACCEPTED") });
+    const oldRecord = await completedConsumed(dir);
+    const params = { conversation: uuid, space: "GDC-执行A", agentId: "gdc-a", monitorDir: root, rootMonitorDir: root, action: "release" };
+    logs.length = 0;
+    const code = await directRelease(params, dir, {
+      runScript: async () => {
+        // B starts while A's release is in flight: re-arm + replace the ledger.
+        await armForDispatch(dir, { conversationUuid: uuid, space: "GDC-执行A" });
+        await writeFile(join(dir, "a-dispatch-state.json"), JSON.stringify(
+          dispatchRecord({ dispatchId: otherUuid, conversationUuid: uuid, status: "ACCEPTED" })));
+        return { code: 0, result: "AGENT_SPACE_RELEASED" };
+      },
+    });
+    // A's deferred handoff: exit through the durable wake ledger, armed state
+    // untouched, explicit identity blocker — never a silent misbinding.
+    assert.equal(code, 2);
+    assert.equal(JSON.parse(await readFile(join(dir, "a-fast-state.json"), "utf8")).armedReason, "DISPATCH_ACCEPTED");
+    assert.ok(logs.some((line) => line.startsWith("RESULT=DISARM_DEFERRED") &&
+      line.includes("DISARM_LEDGER_IDENTITY_CHANGED")), JSON.stringify(logs));
+    const marker = JSON.parse(await readFile(join(dir, "a-watch-exit.json"), "utf8"));
+    assert.equal(marker.reason, "DISARM_DEFERRED_WAKE_SUPERVISOR");
+    // The credential names the ORIGINALLY VERIFIED dispatchId (A) — never the
+    // ledger's current id after the swap (the round-3 misbinding gap).
+    const credential = JSON.parse(await readFile(join(dir, "a-disarm-credential.json"), "utf8"));
+    assert.equal(credential.dispatchId, oldRecord.dispatchId);
+    assert.notEqual(credential.dispatchId, otherUuid);
+    // B completes and consumes its own reply.
+    const bAccepted = JSON.parse(await readFile(join(dir, "a-dispatch-state.json"), "utf8"));
+    assert.equal(bAccepted.dispatchId, otherUuid);
+    const bReceipt = await saveReply(dir, bAccepted, { text: "已消费回复", source: "DOM_BOUNDARY_VISIBLE" }, uuid);
+    const bCompleted = { ...bAccepted, status: "COMPLETED" };
+    await writeFile(join(dir, "a-dispatch-state.json"), JSON.stringify(bCompleted));
+    await acknowledgeReply(dir, bCompleted, bReceipt.sha256);
+    // B's consume-triggered retry: A's credential names A, not B — the gate
+    // is unproven and B stays armed (RELEASE_SUCCESS_UNPROVEN).
+    const bRetry = await retryPendingDisarm(dir, { rootMonitorDir: root });
+    assert.deepEqual(bRetry, { disarmed: false, alreadyDisarmed: false, blockers: ["RELEASE_SUCCESS_UNPROVEN"] });
+    assert.equal(JSON.parse(await readFile(join(dir, "a-fast-state.json"), "utf8")).armedReason, "DISPATCH_ACCEPTED");
+    const events = await readFile(join(dir, "a-fast-events.ndjson"), "utf8");
+    assert.equal(events.includes("DISARMED_IDLE"), false);
+    // Wiring pins: main() routes release through directRelease, and both
+    // release paths thread the entry-verified dispatchId into the disarm.
+    const source = await readFile(
+      fileURLToPath(new URL("../monitor/dispatch-manager.mjs", import.meta.url)), "utf8");
+    assert.match(source, /if \(p\.action === "release"\) return directRelease\(p, dir\);/);
+    // Three threading sites: the watch path, the direct path and the managed
+    // retry all carry the dispatchId they verified into the disarm write.
+    assert.equal((source.match(/expectedDispatchId: verifiedDispatchId/g) || []).length, 3);
+  } finally {
+    console.log = originalLog;
+    console.error = originalError;
+  }
+});
+
+test("#27 B3 P1-C round 4: the watch release path is bound by the same dispatch identity contract", async () => {
+  // Same interleaving as the direct path, through releaseDelivered: the two
+  // release paths must share ONE identity contract (ruling gap 2 closing).
+  const root = await mkdtemp(join(tmpdir(), "ego-watch-identity-"));
+  const logs = [];
+  const originalLog = console.log;
+  const originalError = console.error;
+  try {
+    const dir = await makeConversation(root, { "a-fast-state.json": armedState("DISPATCH_ACCEPTED") });
+    const oldRecord = await completedConsumed(dir);
+    const params = { conversation: uuid, space: "GDC-执行A", agentId: "gdc-a", monitorDir: root, rootMonitorDir: root };
+    console.log = (line) => logs.push(String(line));
+    console.error = (line) => logs.push(String(line));
+    const code = await releaseDelivered(params, dir, {
+      runScript: async () => {
+        await armForDispatch(dir, { conversationUuid: uuid, space: "GDC-执行A" });
+        await writeFile(join(dir, "a-dispatch-state.json"), JSON.stringify(
+          dispatchRecord({ dispatchId: otherUuid, conversationUuid: uuid, status: "ACCEPTED" })));
+        return { code: 0, result: "AGENT_SPACE_RELEASED" };
+      },
+    });
+    assert.equal(code, 2);
+    assert.equal(JSON.parse(await readFile(join(dir, "a-fast-state.json"), "utf8")).armedReason, "DISPATCH_ACCEPTED");
+    assert.ok(logs.some((line) => line.startsWith("RESULT=DISARM_DEFERRED") &&
+      line.includes("DISARM_LEDGER_IDENTITY_CHANGED")), JSON.stringify(logs));
+    const marker = JSON.parse(await readFile(join(dir, "a-watch-exit.json"), "utf8"));
+    assert.equal(marker.reason, "DISARM_DEFERRED_WAKE_SUPERVISOR");
+    const credential = JSON.parse(await readFile(join(dir, "a-disarm-credential.json"), "utf8"));
+    assert.equal(credential.dispatchId, oldRecord.dispatchId);
+    assert.notEqual(credential.dispatchId, otherUuid);
+    const bAccepted = JSON.parse(await readFile(join(dir, "a-dispatch-state.json"), "utf8"));
+    const bReceipt = await saveReply(dir, bAccepted, { text: "已消费回复", source: "DOM_BOUNDARY_VISIBLE" }, uuid);
+    const bCompleted = { ...bAccepted, status: "COMPLETED" };
+    await writeFile(join(dir, "a-dispatch-state.json"), JSON.stringify(bCompleted));
+    await acknowledgeReply(dir, bCompleted, bReceipt.sha256);
+    const bRetry = await retryPendingDisarm(dir, { rootMonitorDir: root });
+    assert.deepEqual(bRetry, { disarmed: false, alreadyDisarmed: false, blockers: ["RELEASE_SUCCESS_UNPROVEN"] });
+    assert.equal(JSON.parse(await readFile(join(dir, "a-fast-state.json"), "utf8")).armedReason, "DISPATCH_ACCEPTED");
+    const events = await readFile(join(dir, "a-fast-events.ndjson"), "utf8");
+    assert.equal(events.includes("DISARMED_IDLE"), false);
+  } finally {
+    console.log = originalLog;
+    console.error = originalError;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("#27 B3 P1-C round 4: a release attempt aborts fail-closed when the stale credential cannot be cleared (both release paths)", async () => {
+  // Forcing (real filesystem behavior, no mocks): the credential's path is
+  // occupied by a DIRECTORY, so the pre-attempt clear can never succeed. A
+  // release must never run carrying a previous round's success: both release
+  // paths abort BEFORE the release script, and the armed state is untouched.
+  for (const runRelease of [
+    (params, dir) => releaseDelivered(params, dir, {
+      runScript: async () => ({ code: 0, result: "AGENT_SPACE_RELEASED" }),
+    }),
+    (params, dir) => directRelease(params, dir, {
+      runScript: async () => ({ code: 0, result: "AGENT_SPACE_RELEASED" }),
+    }),
+  ]) {
+    const root = await mkdtemp(join(tmpdir(), "ego-release-clear-fail-"));
+    try {
+      const dir = await makeConversation(root, { "a-fast-state.json": armedState("DISPATCH_ACCEPTED") });
+      await completedConsumed(dir);
+      await mkdir(join(dir, "a-disarm-credential.json"), { recursive: true });
+      let scriptRan = false;
+      await assert.rejects(
+        runRelease({ conversation: uuid, space: "GDC-执行A", agentId: "gdc-a", monitorDir: root, rootMonitorDir: root, action: "release" }, dir, {
+          runScript: async () => { scriptRan = true; return { code: 0, result: "AGENT_SPACE_RELEASED" }; },
+        }),
+        /RELEASE_DISARM_CREDENTIAL_CLEAR_FAILED/);
+      assert.equal(scriptRan, false, "the release script must never run behind an unclearable stale credential");
+      assert.equal(JSON.parse(await readFile(join(dir, "a-fast-state.json"), "utf8")).armedReason, "DISPATCH_ACCEPTED");
+    } finally { await rm(root, { recursive: true, force: true }); }
+  }
 });
 
 // ---- Requirement 4 (ruling §四.4): two page-label lifecycles ----

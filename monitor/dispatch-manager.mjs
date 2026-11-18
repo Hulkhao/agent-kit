@@ -897,6 +897,25 @@ export function supervisionStatusStructureError(status) {
 //     untouched; the marker's ack discipline is still enforced by the
 //     WAKE_MARKER_UNACKNOWLEDGED criterion of the frozen
 //     evaluateDisarmEligibility contract — no second close-page channel.
+//
+// P1-C (re-review round 4): three closures on top of the companion credential:
+//   structure — the credential must carry a finite issuedAt as well; an
+//     incomplete {schema, dispatchId} credential is corruption, never proof.
+//   lifecycle — every REAL release attempt (watch releaseDelivered AND the
+//     direct release action) first clears THIS dispatch's leftover credential
+//     (clearDisarmCredential); a failed clear aborts the release before any
+//     browser work, so a release never runs while carrying a previous round's
+//     success. A credential is (re)issued only when THIS attempt verifies
+//     successful and defers its disarm.
+//   identity — the dispatchId verified at release entry (terminal + consumed)
+//     is carried through the whole flow: disarmAfterRelease requires the
+//     ledger to STILL belong to that instance (blocker
+//     DISARM_LEDGER_IDENTITY_CHANGED — a concurrent send may lawfully replace
+//     a COMPLETED ledger, the send template only guards in-flight states) and
+//     the credential is written with the ORIGINALLY VERIFIED dispatchId, never
+//     a re-read of a possibly replaced ledger. Both release paths share this
+//     one contract; the retry path (retryPendingDisarm) re-proves the same
+//     instance between credential verification and the disarm write.
 const DISARM_DEFERRED_REASON = "DISARM_DEFERRED_WAKE_SUPERVISOR";
 const DISARM_CREDENTIAL_SCHEMA = "ego-disarm-credential/v1";
 const DISARM_CREDENTIAL_FILE = "a-disarm-credential.json";
@@ -917,6 +936,30 @@ async function issueDisarmCredential(dir, dispatchId, timestamp = Date.now()) {
   }
 }
 
+// P1-C round 4 (gap 3): clear THIS dispatch's previous release-success
+// credential before a real release attempt starts. The only legitimate way a
+// credential exists while a release begins is a stale one from a prior attempt
+// of the same dispatch (success deferred, then acked, then the retry failed) —
+// carrying it through a FAILED attempt would leave the stale pair (old
+// deferred marker + old credential) armed behind a release failure, and a
+// repeated consume would then converge a disarm this dispatch never re-proved.
+// Fail-closed: a failed clear aborts the release before any browser work.
+async function clearDisarmCredential(dir) {
+  try {
+    await unlink(join(dir, DISARM_CREDENTIAL_FILE));
+  } catch (error) {
+    if (error.code !== "ENOENT") throw new Error("RELEASE_DISARM_CREDENTIAL_CLEAR_FAILED");
+  }
+}
+
+// Verify the deferred-disarm evidence pair (wake marker + companion
+// credential). Returns the dispatchId the pair is bound to — which must equal
+// the dispatch ledger's CURRENT dispatchId — or null when unproven, so the
+// caller re-proves the SAME dispatch instance at disarm time (closing the
+// check/write race between this verification and the arm-state write).
+// Fail-closed: absent, unreadable, corrupt, foreign-schema, structurally
+// incomplete (no finite issuedAt, round 4 gap 1), or foreign-instance
+// evidence all read as unproven and the state stays armed.
 async function hasDeferredReleaseCredential(dir) {
   // Criterion 1: the wake marker still records a deferred disarm of a verified
   // release (the frozen round-2 structure contract still applies). Any later
@@ -924,24 +967,28 @@ async function hasDeferredReleaseCredential(dir) {
   // the marker and invalidates the pair.
   try {
     const marker = JSON.parse(await readFile(join(dir, "a-watch-exit.json"), "utf8"));
-    if (watchExitStructureError(marker)) return false;
-    if (marker.reason !== DISARM_DEFERRED_REASON) return false;
-  } catch { return false; } // absent/unreadable = unproven (fail-closed)
+    if (watchExitStructureError(marker)) return null;
+    if (marker.reason !== DISARM_DEFERRED_REASON) return null;
+  } catch { return null; } // absent/unreadable = unproven (fail-closed)
   // Criterion 2: the companion credential exists, carries the frozen schema,
-  // and names the dispatch ledger's CURRENT dispatchId. Anything else —
-  // absent, unreadable, corrupt, foreign-schema, or issued for a previous
-  // dispatch instance (the cross-dispatch inheritance gap) — cannot prove
-  // that THIS dispatch ever released, so the state stays armed.
+  // a finite issuedAt (round 4 gap 1: an incomplete {schema, dispatchId}
+  // credential is corruption, never proof), and names the dispatch ledger's
+  // CURRENT dispatchId. Anything else — absent, unreadable, corrupt,
+  // foreign-schema, or issued for a previous dispatch instance (the
+  // cross-dispatch inheritance gap) — cannot prove that THIS dispatch ever
+  // released, so the state stays armed.
   let credential = null;
   try { credential = JSON.parse(await readFile(join(dir, DISARM_CREDENTIAL_FILE), "utf8")); }
-  catch { return false; }
+  catch { return null; }
   if (!credential || typeof credential !== "object" || Array.isArray(credential) ||
       credential.schema !== DISARM_CREDENTIAL_SCHEMA ||
-      typeof credential.dispatchId !== "string") return false;
+      typeof credential.dispatchId !== "string" ||
+      !Number.isFinite(credential.issuedAt)) return null;
   let record = null;
   try { record = await readDispatchState(dir); }
-  catch { return false; } // unreadable ledger = unprovable ownership (fail-closed)
-  return Boolean(record) && credential.dispatchId === record.dispatchId;
+  catch { return null; } // unreadable ledger = unprovable ownership (fail-closed)
+  if (!record || credential.dispatchId !== record.dispatchId) return null;
+  return credential.dispatchId;
 }
 
 // Write DISARMED_IDLE for a conversation whose release just completed. All
@@ -954,7 +1001,14 @@ async function hasDeferredReleaseCredential(dir) {
 // auto-disarmed (ruling §四.1). The caller sequence already confirmed the
 // terminal state with nothing in flight (verified release + consumption), so
 // this function re-proves the criteria on the durable ledgers before writing.
-export async function disarmAfterRelease(dir, { rootMonitorDir = null, timestamp = Date.now() } = {}) {
+// P1-C round 4 (gap 2): the caller must also carry the dispatchId whose
+// release it actually VERIFIED (expectedDispatchId) — the disarm only fires
+// while the ledger still belongs to that instance. The send template only
+// guards in-flight ledgers, so a new dispatch may lawfully start while a
+// release of the previous COMPLETED dispatch is running; without this binding
+// the disarm would read the replaced ledger's terminal/consumption state and
+// the credential would be misbound to the new instance.
+export async function disarmAfterRelease(dir, { rootMonitorDir = null, timestamp = Date.now(), expectedDispatchId = null } = {}) {
   const root = rootMonitorDir ?? dirname(dirname(dir));
   const blockers = [];
   // Arm state (current fast state). Missing/corrupt = unconfirmable.
@@ -973,6 +1027,12 @@ export async function disarmAfterRelease(dir, { rootMonitorDir = null, timestamp
   try { record = await readDispatchState(dir); }
   catch { blockers.push("DISPATCH_LEDGER_UNREADABLE"); }
   if (!record && !blockers.includes("DISPATCH_LEDGER_UNREADABLE")) blockers.push("DISPATCH_LEDGER_ABSENT");
+  // P1-C round 4 (gap 2): identity binding — an absent expectedDispatchId is
+  // exactly as unprovable as a changed one (fail-closed; no caller may disarm
+  // on the strength of a ledger state it never verified for an instance).
+  if (record && (typeof expectedDispatchId !== "string" || record.dispatchId !== expectedDispatchId)) {
+    blockers.push("DISARM_LEDGER_IDENTITY_CHANGED");
+  }
   let replyConsumed = false;
   if (record?.status === "COMPLETED") {
     try { await verifiedConsumption(dir, record); replyConsumed = true; }
@@ -1093,6 +1153,16 @@ export async function releaseDelivered(params, dir, { runScript } = {}) {
     throw new Error("RELEASE_REQUIRES_VERIFIED_COMPLETION");
   }
   await verifiedConsumption(dir, record);
+  // P1-C round 4 (gap 2): bind THIS release to the dispatch instance verified
+  // at entry; the id rides through the script run, the disarm and the
+  // credential write below — never re-read from a ledger a concurrent send
+  // may have replaced in the meantime (same identity contract as the direct
+  // release path).
+  const verifiedDispatchId = record.dispatchId;
+  // P1-C round 4 (gap 3): a real release attempt never carries a previous
+  // attempt's success credential — clear it first; a failed clear aborts the
+  // release fail-closed (the error surfaces as watch scope above).
+  await clearDisarmCredential(dir);
   const template = await readFile(templates.release, "utf8");
   const released = runScript
     ? await runScript(adaptTemplate(template, params), dir)
@@ -1122,14 +1192,80 @@ export async function releaseDelivered(params, dir, { runScript } = {}) {
   // consume / a re-run release) converge the disarm afterwards.
   const disarm = await disarmAfterRelease(dir, {
     rootMonitorDir: params.rootMonitorDir ?? dirname(dirname(dir)),
+    expectedDispatchId: verifiedDispatchId,
   });
   if (!disarm.disarmed) {
     console.error("RESULT=DISARM_DEFERRED code=" + disarm.blockers.join(","));
     // P1-C round 3: the deferred handoff issues the companion release-success
-    // credential bound to THIS dispatchId (best-effort — a failed write just
-    // leaves the retry gate unproven and the ledger armed) before the marker
-    // write; the retry gate then requires the marker+credential pair.
-    await issueDisarmCredential(dir, record.dispatchId);
+    // credential (best-effort — a failed write just leaves the retry gate
+    // unproven and the ledger armed) before the marker write; the retry gate
+    // then requires the marker+credential pair. P1-C round 4 (gap 2): the
+    // credential names the ORIGINALLY VERIFIED dispatchId even when the
+    // ledger was replaced mid-release (the identity blocker above already
+    // keeps the retry from ever converging on a foreign instance).
+    await issueDisarmCredential(dir, verifiedDispatchId);
+    return exitWatching(dir, "DISARM_DEFERRED_WAKE_SUPERVISOR", {
+      detail: "code=" + disarm.blockers.join(","),
+    });
+  }
+  return 0;
+}
+
+// P1-C round 4 (gap 2): the direct `release` action of main(), extracted so
+// the dispatch identity binding is behaviorally testable (runScript
+// injection, the releaseDelivered precedent). The dispatch instance verified
+// at entry (terminal + consumed) is carried through the whole flow: the
+// release script, the disarm convergence and the companion credential all
+// bind to THAT id — the ledger is never re-read for a newer dispatchId, so a
+// concurrent send on the same conversation (lawful while the previous ledger
+// is COMPLETED) can never receive this release's success credential or have
+// its ledger disarmed by it. Same identity contract as the watch path.
+// NOTE: the first parameter is named `p` on purpose — it is the parsed arg
+// object of the release action and the sweep-failure guidance line below
+// keeps its pinned source form.
+export async function directRelease(p, dir, { runScript } = {}) {
+  const record = await readDispatchState(dir);
+  if (!record || record.status !== "COMPLETED" ||
+      record.conversationUuid.toLowerCase() !== p.conversation.toLowerCase() || record.taskSpace !== p.space) {
+    throw new Error("RELEASE_REQUIRES_VERIFIED_COMPLETION");
+  }
+  await verifiedConsumption(dir, record);
+  const verifiedDispatchId = record.dispatchId;
+  // P1-C round 4 (gap 3): same pre-attempt credential clear as the watch
+  // path — fail-closed (the error surfaces as MANAGER_FAILURE, exit 2).
+  await clearDisarmCredential(dir);
+  const template = await readFile(templates.release, "utf8");
+  const observation = runScript
+    ? await runScript(adaptTemplate(template, p), dir)
+    : await runEgo(adaptTemplate(template, p), dir, "release");
+  // agent-kit#33: takeover guidance on release failures, same as the watch path.
+  if (observation.code !== 0) {
+    announceTaskspaceOwnershipLoss(observation, p.space);
+  }
+  // #27 Batch 2: same truthful reporting for the direct `release` action —
+  // the sweep-failure RESULT is already classified as exit 2 by
+  // classifyManagerResult below.
+  if (p.action === "release" && observation.result === "AGENT_SPACE_RELEASE_SWEEP_FAILED") {
+    console.error("OPERATOR_ACTION=release 临时页清理未完整完成（明细见监控根 a-release-sweep-audit.ndjson）：处置后重跑 release，幂等收尾。");
+  }
+  const code = classifyManagerResult("release", observation, null, p);
+  if (code !== 0) return code;
+  // #27 Batch 3 (ruling §四.2): the direct release action follows the same
+  // end sequence as the watch path — terminal confirmed (verified completion +
+  // consumption + AGENT_SPACE_RELEASED), then write the disarm. No watch
+  // process is involved here, so a deferred disarm is reported and left armed,
+  // handing over through the same durable wake ledger as the watch path —
+  // never a clean exit 0 over a stranded armed ledger.
+  const disarm = await disarmAfterRelease(dir, {
+    rootMonitorDir: p.rootMonitorDir ?? dirname(dirname(dir)),
+    expectedDispatchId: verifiedDispatchId,
+  });
+  if (!disarm.disarmed) {
+    console.error("RESULT=DISARM_DEFERRED code=" + disarm.blockers.join(","));
+    // P1-C round 4 (gap 2): the credential is written with the ORIGINALLY
+    // VERIFIED dispatchId — never a re-read of a ledger the concurrent send
+    // may have replaced (the cross-dispatch misbinding this round closes).
+    await issueDisarmCredential(dir, verifiedDispatchId);
     return exitWatching(dir, "DISARM_DEFERRED_WAKE_SUPERVISOR", {
       detail: "code=" + disarm.blockers.join(","),
     });
@@ -1148,16 +1284,24 @@ export async function releaseDelivered(params, dir, { runScript } = {}) {
 // check is bound to the dispatch INSTANCE (marker reason + companion
 // a-disarm-credential.json naming the ledger's current dispatchId — see
 // hasDeferredReleaseCredential), so a stale surviving marker from a previous
-// dispatch can never authorize this dispatch's disarm. Best-effort by
-// contract: a retry failure never flips the hosting action's result — the
-// structured wake (above) owns the escalation when the disarm stays blocked.
-// No background daemon, no change to the existing watch scheduling.
+// dispatch can never authorize this dispatch's disarm. P1-C re-review round 4
+// (gap 2): the instance proven at verification time is carried into the
+// disarm (expectedDispatchId), so a ledger replaced between the check and the
+// write cannot be disarmed on evidence verified for the previous instance.
+// Best-effort by contract: a retry failure never flips the hosting action's
+// result — the structured wake (above) owns the escalation when the disarm
+// stays blocked. No background daemon, no change to the existing watch
+// scheduling.
 export async function retryPendingDisarm(dir, { rootMonitorDir = null } = {}) {
   try {
-    if (!(await hasDeferredReleaseCredential(dir))) {
+    const verifiedDispatchId = await hasDeferredReleaseCredential(dir);
+    if (!verifiedDispatchId) {
       return { disarmed: false, alreadyDisarmed: false, blockers: ["RELEASE_SUCCESS_UNPROVEN"] };
     }
-    const retry = await disarmAfterRelease(dir, { rootMonitorDir: rootMonitorDir ?? dirname(dirname(dir)) });
+    const retry = await disarmAfterRelease(dir, {
+      rootMonitorDir: rootMonitorDir ?? dirname(dirname(dir)),
+      expectedDispatchId: verifiedDispatchId,
+    });
     if (retry.disarmed && !retry.alreadyDisarmed) {
       console.log("RESULT=DISARM_RETRY_COMPLETED");
     }
@@ -1478,13 +1622,12 @@ export async function main(args = process.argv.slice(2)) {
     await readDispatchState(dir);
   }
   if (p.action === "collect") return collectCompleted(p, dir);
-  if (p.action === "release") {
-    const record = await readDispatchState(dir);
-    if (!record || record.status !== "COMPLETED" || record.conversationUuid.toLowerCase() !== p.conversation.toLowerCase() || record.taskSpace !== p.space) {
-      throw new Error("RELEASE_REQUIRES_VERIFIED_COMPLETION");
-    }
-    await verifiedConsumption(dir, record);
-  }
+  // P1-C round 4 (gap 2): the whole direct release flow — entry verification,
+  // pre-attempt credential clear, release run, disarm convergence and
+  // credential write — lives in directRelease(), where the dispatch identity
+  // verified at entry is carried through every step (behaviorally testable,
+  // releaseDelivered precedent).
+  if (p.action === "release") return directRelease(p, dir);
   if (p.action === "watch") {
     // Branch-external initialization above (requireArmedDispatch / ensureMonitor)
     // runs before watch identity is confirmed and keeps its MANAGER_FAILURE
@@ -1577,13 +1720,9 @@ export async function main(args = process.argv.slice(2)) {
   const observation = await runEgo(adaptTemplate(template, p), dir, p.action);
   // agent-kit#33: takeover guidance on send-family failures. The probe announces
   // it at its own takeover exits, so it is not repeated here for probe runs.
+  // (The direct release action keeps the same guidance inside directRelease.)
   if (observation.code !== 0 && p.action !== "probe") {
     announceTaskspaceOwnershipLoss(observation, p.space);
-  }
-  // #27 Batch 2: same truthful reporting for the direct `release` action —
-  // the sweep-failure RESULT is already classified as exit 2 above.
-  if (p.action === "release" && observation.result === "AGENT_SPACE_RELEASE_SWEEP_FAILED") {
-    console.error("OPERATOR_ACTION=release 临时页清理未完整完成（明细见监控根 a-release-sweep-audit.ndjson）：处置后重跑 release，幂等收尾。");
   }
   if (p.recoverOnly) {
     const recovered = await readDispatchState(dir);
@@ -1604,30 +1743,6 @@ export async function main(args = process.argv.slice(2)) {
   if (p.action === "probe") return classifyProbeResult(observation).wake ? 2 : 0;
   const record = p.action === "send" ? await readDispatchState(dir) : null;
   const code = classifyManagerResult(p.action, observation, record, p);
-  // #27 Batch 3 (ruling §四.2): the direct release action follows the same
-  // end sequence as the watch path — terminal confirmed (verified completion +
-  // consumption + AGENT_SPACE_RELEASED), then write the disarm. No watch
-  // process is involved here, so a deferred disarm is reported and left armed.
-  if (p.action === "release" && code === 0) {
-    const disarm = await disarmAfterRelease(dir, { rootMonitorDir: p.rootMonitorDir ?? dirname(dirname(dir)) });
-    if (!disarm.disarmed) {
-      console.error("RESULT=DISARM_DEFERRED code=" + disarm.blockers.join(","));
-      // P1-C: the direct release path hands over through the same durable
-      // wake ledger as the watch path — never a clean exit 0 over a stranded
-      // armed ledger.
-      // P1-C round 3: same companion credential as the watch path, bound to
-      // the ledger's CURRENT dispatchId (best-effort: a read or write failure
-      // only leaves the retry gate unproven — the wake handoff below is the
-      // escalation, never a clean success).
-      try {
-        const releaseRecord = await readDispatchState(dir);
-        if (releaseRecord) await issueDisarmCredential(dir, releaseRecord.dispatchId);
-      } catch { /* fail-closed: no credential, no retry convergence */ }
-      return exitWatching(dir, "DISARM_DEFERRED_WAKE_SUPERVISOR", {
-        detail: "code=" + disarm.blockers.join(","),
-      });
-    }
-  }
   if (p.action === "send" && code !== 0) {
     console.error("RESULT=MANAGER_SEND_REQUIRES_RECONCILIATION status=" + (record?.status || "ABSENT"));
   }
