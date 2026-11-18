@@ -535,7 +535,19 @@ await page.keyboard.press("Escape");
 await page.waitForTimeout(600);
 const modelOk = menuInfo && menuInfo.radios.some((r) => r.label === "GPT-6" && r.checked === "true");
 const levelOk = menuInfo && menuInfo.sliders.some((s) => String(s.now) === "2" && String(s.max) === "2");
-if (!menuInfo || !modelOk || !levelOk) abort("LEVEL_GATE_FAIL_ABORT");
+if (!menuInfo || !modelOk || !levelOk) {
+  // Gate 7a diagnosability (2026-11-19): abort used to be blind — a UI drift
+  // (radio label change, effort-slider scale recalibration) was indistinguishable
+  // from a genuinely wrong level. Print the sanitized readback so the mismatch
+  // is provable from the output stream alone. Read-only evidence; the fail-closed
+  // pass criteria above are unchanged.
+  console.log("LEVEL_GATE_READBACK=" + JSON.stringify({
+    radios: menuInfo ? menuInfo.radios : null,
+    sliders: menuInfo ? menuInfo.sliders : null,
+    modelOk: Boolean(modelOk), levelOk: Boolean(levelOk),
+  }));
+  abort("LEVEL_GATE_FAIL_ABORT");
+}
 
 // ---- Gate 7.1: model_slug NEGATIVE diagnostic (r45 LIMITED GO — auxiliary evidence, NEVER a pass key).
 // It records which model produced PAST assistant turns; it cannot prove the next send's model or
