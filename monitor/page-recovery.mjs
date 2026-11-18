@@ -63,7 +63,12 @@ export async function selectUniqueConversationPage(pages, conversationUuid) {
   return matches[0];
 }
 
-const recoveryError = (code) => Object.assign(new Error(code), { code });
+const recoveryError = (code, detail = "") => Object.assign(
+  new Error(detail ? `${code} ${detail}` : code), { code });
+// 2026-11-19 diagnosability: SPACE_HAS_UNREGISTERED_PAGE_STOP used to abort
+// blind — which page/tab violated was unprovable from the output stream alone
+// (same failure shape as the Gate 7a readback gap). Code stays unchanged for
+// programmatic handling; the offending label+URL rides in the message.
 // Chrome renders its new-tab page under two spellings: the live Page URL reports
 // "chrome://new-tab-page/" while persisted/restored tab metadata (task.tabs()) can
 // report the short "chrome://newtab/" form for the same targetId (field-observed
@@ -79,7 +84,7 @@ export async function assertManagedReleasePages(pages, tabs, known) {
   for (const { page, url } of pageUrls) {
     const id = conversationIdFromUrl(url, true);
     if (id && knownIds.has(id)) continue;
-    if (!blankPageUrl(url)) throw recoveryError("SPACE_HAS_UNREGISTERED_PAGE_STOP");
+    if (!blankPageUrl(url)) throw recoveryError("SPACE_HAS_UNREGISTERED_PAGE_STOP", `page=${page.label} url=${String(url).slice(0, 140)}`);
     const matchingTabs = tabs.filter((tab) => tab.label === page.label ||
       (page.targetId && tab.targetId === page.targetId));
     if (matchingTabs.some((tab) => tab.openedBy !== "agent" ||
@@ -95,7 +100,16 @@ export async function assertManagedReleasePages(pages, tabs, known) {
     if (!blankPageUrl(tab.url) || !pageUrls.some(({ page, url }) =>
       blankPageUrl(url) && page.label === tab.label &&
       (!tab.targetId || !page.targetId || tab.targetId === page.targetId))) {
-      throw recoveryError("SPACE_HAS_UNREGISTERED_PAGE_STOP");
+      // 2026-11-19 field evidence (releases aborted twice on `tab=undefined
+      // url=about:blank`): an agent-owned blank TAB with no live Page wrapper
+      // (label undefined) is a browser-restart metadata remnant — the release
+      // contract above already allows finishing "managed blank Pages left by a
+      // browser restart", and no Page object exists to close for it. A LABELED
+      // blank still must pair with its Page object: that fail-closed pairing
+      // is unchanged.
+      if (blankPageUrl(tab.url) && (tab.label === undefined || tab.label === null)) continue;
+      throw recoveryError("SPACE_HAS_UNREGISTERED_PAGE_STOP",
+        `tab=${tab.label} url=${String(tab.url).slice(0, 140)}`);
     }
   }
 }
