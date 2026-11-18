@@ -196,6 +196,7 @@ const r = await page.fetch("/backend-api/conversation/" + uuid,
 | `CONVERSATION_DEAD_WAKE_SUPERVISOR`（脚本1） | 死页梯子 3 strikes，会话判死 | 深查/重派/迁移 → 全套重启 |
 | `WAKE_SUPERVISOR reason=NO_SUBSTANTIVE_PROGRESS`（脚本2） | 配置窗口无实质进展 | 本地 Agent 检查状态/工具/页面，按 wakeId 回执并重新布防 |
 | `WAKE_SUPERVISOR reason=REPLY_UNHANDLED` | 回复到达但还未交付 | 立即提取、处理结果，再回执 |
+| `DELIVERY_SUSPECTED_WAKE_SUPERVISOR`（#38） | 账本 ACCEPTED 但发送疑似未持久化（vanish-mode：非生成态下 tail==派单 baseline，或乐观 user 轮悬空无回复；assistant 尾部越过 baseline 则永不触发） | 受管 probe 复核尾部（必要时全新 goto 取服务端真态）：确认未落 → 按证据受控更正账本 ABORTED（备份先行）并按 §3.1 重派；确认已落 → 正常监控；禁止当完成候选、禁止盲重发 |
 | `USER_ESCALATION_REQUIRED` | 连续 3 轮异常且没有实质进展 | 联系 PO；不能把第三次告警直接当“会话死亡” |
 | `STATE_MISSING / WATCHDOG_TRIGGER(stale>=7min)` | 快轮询死亡 | 修快轮询（页面失附→重新 goto）→全套重启 |
 | `startIdle=true` | 监视器启动/恢复时页面已空闲（基线时序风险） | 「启动即提取」：单次 API 比对派单基线，防吞已到达回复 |
@@ -224,6 +225,12 @@ const r = await page.fetch("/backend-api/conversation/" + uuid,
 **收到唤醒后**：先读 §6.3 的具体信号和状态文件，判断是完整回复、正常长工具链、页面不可用、进程崩溃还是疑似僵尸轮（§5.2）；保留证据后选 `collect`、继续等待、有限恢复、人工停轮或迁移。完成实际诊断后执行 `ack` 并重新运行受管 `watch`；管理器在完整提取并写入校验回执后才能执行 `release`。2026-11-16 起 watch 的每条 exit 2 路径同步落盘 `a-watch-exit.json`（schema `ego-watch-exit/v1`，不存正文）；`ack` 为双账本：同 wakeId 同时命中监督 pending 与 watch-exit 时一次 ack 双清，已 ack 的 watch-exit 记录保留作历史证据，重复 ack 报 `WAKE_ID_ALREADY_ACKNOWLEDGED`。
 
 **异常处理闭环**：脚本退出或某条 `WAKE_SUPERVISOR` 日志出现后，本地 Agent 若未实际接到通知，按“监控能力缺失”上报 §9.1，不能把写日志视为恢复成功。未能照预案恢复的实战问题同样进入 Issues；普通执行 Agent 不私改 `monitor/` 或 Skill。
+
+**接管交接审计（2026-11-19 起，#38 案后新设；handoff = 假设，监控根全量盘点 = 证据）**：凡从交接文档或前任会话接管一个监控根（正常交接与故障接管同规），执行任何处置动作前必须先建立全量事实基线，不得直接采信交接文档的关键断言：
+
+1. 盘点 `<监控根>/conversations/` 下**每一个**会话目录：各 `a-dispatch-state.json` 的 status 与终态证据、`reply-*.txt` 与 `a-reply-consumed.json`（回复是否已提取/消费）、`a-watch-exit.json` / `a-supervision-status.json`（监控残留）、`.archive/`。交接文档只字未提的第二个会话目录是最常见的丢线索形态——实测 2026-11-19（#38 案）：交接称「回复从未到达，需重派终审」，而并行 send-new 线的终审 FINAL PASS 已在另一会话目录闭环（账本 COMPLETED / API_FINAL_VERIFIED / 回复已消费），按交接文档执行的重派因此白做，并撞出新的 send 持久化故障。
+2. 交接文档的每一条可行动断言（「回复未到达」「账本卡死」「需要重派」）必须被盘上证据证实后才可作为行动依据；被证伪或无法证实 → 停止按该断言拟定的动作，先向 PO 汇报差异，再定路径。
+3. 盘点结果落盘 `<监控根>/EVIDENCE-<主题>.md`（脱敏，不含 payload 正文），后续处置与 Issue 上报统一引用它。
 
 ### 6.5 空间注册表丢失的受管重建（rebuild-space，#31）
 

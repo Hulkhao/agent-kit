@@ -2,8 +2,8 @@
 name: chatgpt-web-dispatch
 description: 两人项目组的 ChatGPT 网页派单工作流（ego-browser）——GitHub 优先交接材料、双循环监控与异常接管、回复提取、会话迁移、GitHub Issues 反馈。凡涉及 chatgpt.com 会话派单、监控、提取、迁移或故障上报必读本 skill。Use for ChatGPT web dispatch, GitHub handoff, reply monitoring, recovery, and issue reporting.
 metadata:
-  version: "1.7.0"
-  date: "2026-11-11"
+  version: "1.8.0"
+  date: "2026-11-19"
 ---
 
 # ChatGPT 网页派单（ego-browser 工作流）
@@ -68,6 +68,7 @@ metadata:
 2. **查重并报 Issue**：先搜索 `Hulkhao/agent-kit` 的现有 Issues；重复问题补充脱敏证据，新问题直接创建。GitHub 明确拒绝读写时报告原始错误并停止该上报动作，不能声称“已上报”；不要换仓库或账号绕过权限。
 3. **通知 PO**：提交成功才通知“Issue #编号 已上报”，附链接、当前任务能否继续；失败则明确“未上报”及错误。由 PO 的 **Skill 维护 Agent** 统一处理，普通执行 Agent 不自行修改 Skill/监控脚本。
 4. **继续主线**：能恢复则按手册既有路径恢复并重新布防；不能继续则保留当前进度、定位阻塞，通知 PO，不盲目重派。
+5. **接管/交接先审计**（2026-11-19，#38 案教训）：从交接文档接管监控根时，先按手册 §6.4「接管交接审计」对 `conversations/` 全部会话目录做事实基线盘点——handoff 是假设，盘上证据才是事实；关键断言被证伪即停止按其拟定的动作并先向 PO 汇报差异。
 
 这样其他 Agent 遇到同类问题能直接查 issue 看到已知现象与修复进度，避免各自踩坑、各自打补丁。
 
