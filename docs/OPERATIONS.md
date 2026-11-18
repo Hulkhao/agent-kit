@@ -155,3 +155,24 @@ release(CONV)
 - 无 arm 字段的账本（v3/v2/无 schema）按**旧模式**运行：读取侧 `classifyFastStateFile` 判 `legacy`（迁移读不写）；**不得自动推断撤防**（`evaluateDisarmEligibility` 把 `armedReason=null` 计为阻断 `ARM_STATE_LEGACY_NO_DISARM_INFERENCE`）；**不得自动推断升级**（探针对 legacy null 保持 null，除 ARMED_UNKNOWN 兜底）。
 - wake-guard 对 legacy 账本零行为变化（无 arm 信息 = 永不豁免，与 Batch 1 基线一致）。
 - `dispatchStormGate` 等既有账本读取方对 armed v4 / legacy v3 均容忍，损坏仍 fail-closed（测试钉死）。
+
+## 7. 受管 abort 合同（#38 修复3，2026-11-19）
+
+> 落点：`monitor/dispatch-manager.mjs`（`abortDispatch` / `evaluateAbortEvidence` / `backupLedgerBytes`，纯账本操作、零浏览器依赖）、`monitor/ego-fast-probe.mjs`（+live 变体，ABORTED 视同终态）。
+
+```
+node monitor/dispatch-manager.mjs abort --monitor-dir <根> --agent-id <ID> --space <空间> \
+  --conversation <会话UUID> --dispatch-id <账本dispatchId> --reason <CODE>
+```
+
+- **用途**：#37/#38 案中账本卡 ACCEPTED/UNCERTAIN（发送服务端未持久化的 vanish-mode）时，受管关闭在途账本，替代手工字节级备份+改 JSON。
+- **证据门（fail-closed，三选一才放行）**：
+  1. `a-supervision-status.json` 的 `pending.reason === "DELIVERY_SUSPECTED"`（来源码 `SUPERVISION_DELIVERY_SUSPECTED`）；
+  2. `a-fast-state.json` 的 `deliveryFailedCandidate === true`（来源码 `FAST_STATE_DELIVERY_FAILED_CANDIDATE`）；
+  3. 账本 `status === "UNCERTAIN"` 且 fast-state 尾部 `lastMessageKey === 账本 baselineTailKey` 且 `generating === false`（来源码 `BASELINE_TAIL_UNADVANCED_UNCERTAIN`）。
+  证据不成立或**不可读/损坏/缺失**一律拒绝：输出 `RESULT=ABORT_EVIDENCE_REQUIRED evidence=<脱敏摘要JSON>`，exit 2，账本零改动。
+- **身份门**：`--dispatch-id` 必须等于账本当前 `dispatchId`（不匹配 → `ABORT_DISPATCH_ID_MISMATCH`）；conversation/space 锚定同 consume 先例（不匹配 → `ABORT_IDENTITY_MISMATCH`）；账本已终态（COMPLETED/ABORTED）→ 拒绝重复 abort，输出 `RESULT=ABORT_NOT_APPLICABLE status=<现态>`。
+- **备份语义（先于一切写）**：`a-dispatch-state.json` 按原字节（无再序列化）复制为 `a-dispatch-state.archive-<dispatchId前8>-abort.json`；同名文件已存在则**永不覆盖**，改写时间戳兄弟文件 `...-abort-<ts>.json`（再撞加计数）。独占创建（`wx`）防竞态。
+- **写路径**：既有 `writeJsonAtomic` 原子写把账本转 `ABORTED`，追加 `abortReason`（=--reason）、`abortedAt`、`abortedBy`（=--agent-id，与 #38 手工手术字段一致）；随后 `appendEvent` 写 `DISPATCH_ABORTED` 审计事件（含 `reason`、`evidence` 来源码、`backupFile`）。成功输出 `RESULT=DISPATCH_ABORTED ... evidence=<来源码> backup=<备份文件名>`，exit 0。
+- **reason 代码纪律**：`^[A-Z0-9_]{3,48}$`（同 markUncertain/retry 先例），如 `DELIVERY_FAILED_SUSPECTED`、`PO_ORDERED_EXPIRE`。
+- **观测接线**：probe（两变体）把 ABORTED 视同 COMPLETED 终态（非在途、永不 doneCandidate/deliveryFailedCandidate），观测到即报 `RESULT=DISPATCH_ABORTED_WAKE_SUPERVISOR`；watch 主循环在同款终态短路位（启动态与轮询 RESULT 两处）经 `exitWatching("DISPATCH_ABORTED_WAKE_SUPERVISOR")` 唤醒主管（手册 §6.3 已补行）。ABORTED 无回复——collect/consume 均不适用；arm 状态保持布防（安全方向，撤防仍由 release 路径独占）。

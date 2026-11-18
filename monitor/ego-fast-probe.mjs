@@ -682,7 +682,11 @@ const tailKeyEqualsBaseline = ["SEND_STARTED", "ACCEPTED"].includes(dispatchResu
   Boolean(probe.lastMessageKey) && probe.lastMessageKey === ledgerBaselineTailKey;
 const sameGeneration = previous.generationKey === (dispatchId || "conversation");
 const completedDispatch = dispatchResult.record?.status === "COMPLETED";
-const everGenerating = completedDispatch ? false :
+// #38 fix 3: an ABORTED ledger is terminal — same non-in-flight treatment as
+// COMPLETED (never a done candidate, never a delivery-failure candidate).
+const abortedDispatch = dispatchResult.record?.status === "ABORTED";
+const terminalDispatch = completedDispatch || abortedDispatch;
+const everGenerating = terminalDispatch ? false :
   (sameGeneration ? previous.everGenerating || probe.generating : probe.generating);
 const bodyChanged = previous.len !== probe.bodyLen;
 const substantiveProgress = (probe.lastMessageRole === "assistant" && (
@@ -699,8 +703,8 @@ const state = await writeState({
   bodyChanged,
   lastProgressAt: substantiveProgress || !sameGeneration ? now() : (previous.lastProgressAt ?? previous.ts ?? now()),
   startIdle: recovered && !probe.generating,
-  doneCandidate: completedDispatch ? false : (sameGeneration ? previous.doneCandidate : false),
-  deliveryFailedCandidate: completedDispatch ? false : tailKeyEqualsBaseline,
+  doneCandidate: terminalDispatch ? false : (sameGeneration ? previous.doneCandidate : false),
+  deliveryFailedCandidate: terminalDispatch ? false : tailKeyEqualsBaseline,
   // #27 Batch 3 (ruling §四.1/.2): the peer-confirmed generation upgrade and
   // the fail-closed ARMED_UNKNOWN catch-all for a missing arm field over an
   // in-flight ledger. The probe never writes DISARMED_IDLE — disarm is
@@ -741,6 +745,13 @@ console.log("state=" + JSON.stringify({
   bodyChanged, composerEmpty: state.composerEmpty,
   dispatchStatus: state.dispatchStatus, toolState: state.toolState,
 }));
+if (abortedDispatch) {
+  // #38 fix 3: the ledger was closed by the managed abort — terminal, no reply
+  // exists, so never fall through to the DONE_CANDIDATE window; wake the watch.
+  await appendEvent(MON, "DISPATCH_ABORTED_OBSERVED", { dispatchId });
+  console.log("RESULT=DISPATCH_ABORTED_WAKE_SUPERVISOR");
+  process.exit(0);
+}
 
 const responseTailAdvanced = dispatchResult.record?.status === "ACCEPTED" &&
   probe.composerEmpty && hasResponseTailAdvanced(dispatchResult.record, probe);

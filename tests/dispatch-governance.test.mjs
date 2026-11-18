@@ -1608,7 +1608,12 @@ test("#38: both probes refuse a done candidate whose stable tail equals the disp
     const source = await readFile(new URL(`../monitor/${name}`, import.meta.url), "utf8");
     // The ledger baseline feeds both the per-round flag and the confirm window.
     assert.match(source, /const tailKeyEqualsBaseline = \["SEND_STARTED", "ACCEPTED"\]\.includes\(dispatchResult\.record\?\.status\) &&/, name);
-    assert.match(source, /deliveryFailedCandidate: completedDispatch \? false : tailKeyEqualsBaseline/, name);
+    // #38 fix 3: an ABORTED ledger is terminal at the same slot as COMPLETED.
+    assert.match(source, /const abortedDispatch = dispatchResult\.record\?\.status === "ABORTED";/, name);
+    assert.match(source, /const terminalDispatch = completedDispatch \|\| abortedDispatch;/, name);
+    assert.match(source, /const everGenerating = terminalDispatch \? false :/, name);
+    assert.match(source, /deliveryFailedCandidate: terminalDispatch \? false : tailKeyEqualsBaseline/, name);
+    assert.match(source, /RESULT=DISPATCH_ABORTED_WAKE_SUPERVISOR/, name);
     // The refusal branch sits BEFORE the done-candidate branch in the confirm window.
     const window = source.slice(source.indexOf("const stable ="), source.indexOf("TRANSITION_GENERATING_TO_IDLE_CONFIRMED"));
     assert.match(window, /if \(stable && ledgerBaselineTailKey && second\.lastMessageKey === ledgerBaselineTailKey\) \{/, name);

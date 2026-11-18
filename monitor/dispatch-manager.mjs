@@ -37,7 +37,7 @@ const templates = {
   claim: join(sourceDir, "claim-space.template.mjs"),
 };
 const modules = ["agent-space.mjs", "release-sweep.mjs", "dispatch-state.mjs", "reply-delivery.mjs", "page-recovery.mjs", "state-schema.mjs", "taskspace-takeover.mjs", "supervision-policy.mjs"];
-const allowed = new Set(["send", "send-new", "recover-draft", "probe", "watch", "collect", "consume", "release", "ack", "rebuild-space", "claim"]);
+const allowed = new Set(["send", "send-new", "recover-draft", "probe", "watch", "collect", "consume", "release", "ack", "abort", "rebuild-space", "claim"]);
 const uuid = /^[a-f\d]{8}-[a-f\d]{4}-[1-8][a-f\d]{3}-[89ab][a-f\d]{3}-[a-f\d]{12}$/i;
 
 export function parseArgs(args) {
@@ -47,7 +47,7 @@ export function parseArgs(args) {
   const params = { action };
   for (let i = 0; i < rest.length; i += 2) {
     const key = rest[i];
-    if (!/^--(?:agent-id|space|conversation|request-id|message|attachments-file|monitor-dir|wake-id|ack-action|reply-sha256|archived-record)$/.test(key) || !rest[i + 1] ||
+    if (!/^--(?:agent-id|space|conversation|request-id|message|attachments-file|monitor-dir|wake-id|ack-action|reply-sha256|archived-record|dispatch-id|reason)$/.test(key) || !rest[i + 1] ||
         Object.hasOwn(params, key.slice(2))) throw new Error("MANAGER_ARG_INVALID");
     const normalized = key.replace(/^--/, "").replace(/-([a-z])/g, (_, c) => c.toUpperCase());
     params[normalized] = rest[i + 1];
@@ -74,6 +74,15 @@ export function parseArgs(args) {
     (params.newChat && (params.conversation !== params.requestId || !uuid.test(params.requestId))) ||
     (!params.newChat && params.requestId)) throw new Error("MANAGER_IDENTITY_INVALID");
   if (action === "ack" && (!params.wakeId || !["investigated", "resolved"].includes(params.ackAction))) throw new Error("ACK_ARGS_INVALID");
+  // #38 fix 3: abort is the only consumer of --dispatch-id / --reason (same
+  // exclusive-arg precedent as ARCHIVED_RECORD_RECOVERY_ONLY). The dispatch id
+  // must be a full ledger UUID and the reason a fail-closed code.
+  if (action === "abort") {
+    if (!uuid.test(params.dispatchId || "")) throw new Error("ABORT_DISPATCH_ID_REQUIRED");
+    if (typeof params.reason !== "string" || !/^[A-Z0-9_]{3,48}$/.test(params.reason)) throw new Error("ABORT_REASON_CODE_INVALID");
+    return params;
+  }
+  if ((params.reason || params.dispatchId) && action !== "abort") throw new Error("ABORT_ARGS_ABORT_ONLY");
   if (action === "consume" && !/^[\da-f]{64}$/i.test(params.replySha256 || "")) throw new Error("REPLY_SHA256_REQUIRED");
   if (["send", "send-new", "recover-draft"].includes(action) && !params.message) throw new Error("MESSAGE_REQUIRED");
   if (params.attachmentsFile && !["send", "send-new"].includes(action)) throw new Error("ATTACHMENTS_SEND_ONLY");
@@ -186,7 +195,10 @@ export async function requireArmedDispatch(dir, params, action) {
   if (!record || record.conversationUuid.toLowerCase() !== params.conversation.toLowerCase() ||
       record.taskSpace !== params.space ||
       (action === "probe" ? !["SEND_STARTED", "UNCERTAIN", "ACCEPTED"].includes(record.status) :
-        !["SEND_STARTED", "UNCERTAIN", "ACCEPTED", "COMPLETED"].includes(record.status))) {
+        // #38 fix 3: watch may arm on a freshly ABORTED ledger — its terminal
+        // short-circuit below then exits with DISPATCH_ABORTED_WAKE_SUPERVISOR
+        // instead of a bare DISPATCH_NOT_ARMED.
+        !["SEND_STARTED", "UNCERTAIN", "ACCEPTED", "COMPLETED", "ABORTED"].includes(record.status))) {
     throw new Error("DISPATCH_NOT_ARMED");
   }
   return record;
@@ -421,6 +433,177 @@ export async function managedAcknowledge(p, { directory, now = Date.now() } = {}
   // audit write is reported separately and the ack still returns 0.
   try { await audit(evidence ? { outcome: "GRANTED", evidence } : { outcome: "GRANTED" }); }
   catch (error) { auditWriteFailed(error); }
+  return 0;
+}
+
+// ---- #38 fix 3 (Issue #38 repair option 3): managed abort / expire semantics ----
+//
+// A ledger stuck ACCEPTED/UNCERTAIN with the send never persisted server-side
+// (vanish mode) previously had no managed close path — only manual byte-level
+// backups plus hand-edited JSON. `abort` closes that in-flight ledger WITHOUT
+// any browser dependency, fail-closed:
+//   identity gate — --dispatch-id must match the ledger's current dispatchId
+//     (plus conversation/space anchoring, consume-branch precedent); a terminal
+//     ledger (COMPLETED/ABORTED) refuses a repeated abort;
+//   evidence gate — aborting a delivery verdict requires DELIVERY-FAILURE
+//     evidence, any one of:
+//     (a) the conversation's a-supervision-status.json pending.reason ===
+//         "DELIVERY_SUSPECTED" (#38 F3 supervision classification);
+//     (b) the conversation's a-fast-state.json deliveryFailedCandidate === true
+//         (#38/#37 probe vanish-mode signature);
+//     (c) the ledger status === "UNCERTAIN" AND the fast-state tail
+//         lastMessageKey still equals the ledger's dispatch-time baselineTailKey
+//         AND generating === false (nothing ever advanced past the baseline).
+//     Unreadable/missing evidence is never evidence (fail-closed): the gate
+//     emits ABORT_EVIDENCE_REQUIRED with a sanitized evidence summary.
+// Write path: byte-level backup of a-dispatch-state.json FIRST
+// (a-dispatch-state.archive-<dispatchId前8>-abort.json; an existing backup is
+// never overwritten — a timestamped sibling is created instead), then the
+// existing atomic write pattern transitions the ledger to ABORTED with
+// abortReason/abortedAt/abortedBy (same fields the #38 manual surgery used),
+// plus a DISPATCH_ABORTED audit event carrying the reason and evidence source.
+
+export const ABORT_EVIDENCE_REQUIRED = "ABORT_EVIDENCE_REQUIRED";
+
+// Pure evidence gate (fail-closed). `null` means "unprovable" — an unreadable
+// or absent file never satisfies its branch. Exported for unit tests; the
+// abort flow gathers the durable values around it.
+export function evaluateAbortEvidence({
+  ledgerStatus = null,
+  supervisionPendingReason = null,
+  deliveryFailedCandidate = null,
+  fastStateGenerating = null,
+  fastTailKeyEqualsBaseline = null,
+} = {}) {
+  if (supervisionPendingReason === "DELIVERY_SUSPECTED") {
+    return { ok: true, source: "SUPERVISION_DELIVERY_SUSPECTED" };
+  }
+  if (deliveryFailedCandidate === true) {
+    return { ok: true, source: "FAST_STATE_DELIVERY_FAILED_CANDIDATE" };
+  }
+  if (ledgerStatus === "UNCERTAIN" && fastTailKeyEqualsBaseline === true && fastStateGenerating === false) {
+    return { ok: true, source: "BASELINE_TAIL_UNADVANCED_UNCERTAIN" };
+  }
+  return { ok: false, source: null };
+}
+
+// Byte-level, exclusive-create backup of the dispatch ledger. The raw bytes
+// are copied verbatim (no re-serialization), so the backup is a byte-exact
+// pre-abort restore point. An existing backup file is never overwritten: the
+// first candidate gets a timestamp suffix, and further collisions get a
+// counter, so a backup can never destroy another backup.
+const ABORT_BACKOFF_SUFFIX = "abort";
+
+async function backupLedgerBytes(dir, dispatchId, now = Date.now()) {
+  const bytes = await readFile(join(dir, "a-dispatch-state.json"));
+  const base = `a-dispatch-state.archive-${dispatchId.slice(0, 8)}-${ABORT_BACKOFF_SUFFIX}`;
+  for (let attempt = 0; ; attempt++) {
+    const target = attempt === 0 ? `${base}.json` : `${base}-${now}${attempt > 1 ? "-" + attempt : ""}.json`;
+    try {
+      const handle = await open(join(dir, target), "wx", 0o600);
+      try { await handle.writeFile(bytes); } finally { await handle.close(); }
+      return { file: target, bytes: bytes.byteLength };
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error;
+    }
+  }
+}
+
+function abortSummaryLine(summary) {
+  return "evidence=" + JSON.stringify(summary);
+}
+
+export async function abortDispatch(p, { now = Date.now() } = {}) {
+  const dir = conversationDir(p);
+  const summary = {
+    ledger: "ABSENT", dispatchIdMatch: false, conversationMatch: false, spaceMatch: false,
+    supervisionPendingReason: null, fastState: "MISSING", deliveryFailedCandidate: null,
+    fastStateGenerating: null, fastTailKeyEqualsBaseline: null,
+  };
+  const evidenceRequired = () => {
+    console.error("RESULT=" + ABORT_EVIDENCE_REQUIRED + " " + abortSummaryLine(summary));
+    console.error("OPERATOR_ACTION=abort 仅在交付失败证据成立时可用（DELIVERY_SUSPECTED 监督告警 / fast-state deliveryFailedCandidate / UNCERTAIN+尾部未越派单基线）。请先用受管 probe 复核服务端真态，再凭证据重试。");
+    return 2;
+  };
+  let record = null;
+  try { record = await readDispatchState(dir); }
+  catch (error) {
+    summary.ledger = "UNREADABLE:" + String(error.code || error.message || "UNKNOWN").slice(0, 80);
+    return evidenceRequired();
+  }
+  if (!record) return evidenceRequired();
+  summary.ledger = record.status;
+  summary.dispatchIdMatch = record.dispatchId === p.dispatchId;
+  summary.conversationMatch = typeof record.conversationUuid === "string" &&
+    record.conversationUuid.toLowerCase() === p.conversation.toLowerCase();
+  summary.spaceMatch = record.taskSpace === p.space;
+  // Identity gate first: an abort against the wrong ledger must never look at
+  // (let alone act on) any other dispatch's evidence.
+  if (!summary.dispatchIdMatch) {
+    console.error("RESULT=ABORT_DISPATCH_ID_MISMATCH " + abortSummaryLine(summary));
+    return 2;
+  }
+  if (!summary.conversationMatch || !summary.spaceMatch) {
+    console.error("RESULT=ABORT_IDENTITY_MISMATCH " + abortSummaryLine(summary));
+    return 2;
+  }
+  if (record.status === "COMPLETED" || record.status === "ABORTED") {
+    console.error("RESULT=ABORT_NOT_APPLICABLE status=" + record.status);
+    return 2;
+  }
+  // Evidence gathering — every unreadable step degrades to "unprovable" (null),
+  // never to a truthy value.
+  try {
+    const status = JSON.parse(await readFile(join(dir, "a-supervision-status.json"), "utf8"));
+    summary.supervisionPendingReason = status?.pending && typeof status.pending.reason === "string"
+      ? status.pending.reason : null;
+  } catch (error) {
+    summary.supervisionPendingReason = error?.code === "ENOENT" ? null : "UNREADABLE";
+  }
+  let fast = null;
+  try { fast = JSON.parse(await readFile(join(dir, "a-fast-state.json"), "utf8")); }
+  catch (error) {
+    summary.fastState = error?.code === "ENOENT" ? "MISSING" : "UNREADABLE";
+  }
+  if (fast) {
+    // A structurally invalid fast state proves nothing — same fail-closed
+    // classification the arm/disarm decisions use.
+    if (classifyFastStateFile(fast) === "corrupt") {
+      summary.fastState = "CORRUPT";
+    } else {
+      summary.fastState = "READ";
+      summary.deliveryFailedCandidate = fast.deliveryFailedCandidate === true;
+      summary.fastStateGenerating = fast.generating === true;
+      summary.fastTailKeyEqualsBaseline = typeof fast.lastMessageKey === "string" &&
+        Boolean(fast.lastMessageKey) && typeof record.baselineTailKey === "string" &&
+        fast.lastMessageKey === record.baselineTailKey;
+    }
+  }
+  const verdict = evaluateAbortEvidence({
+    ledgerStatus: record.status,
+    supervisionPendingReason: summary.supervisionPendingReason === "UNREADABLE" ? null : summary.supervisionPendingReason,
+    deliveryFailedCandidate: summary.deliveryFailedCandidate,
+    fastStateGenerating: summary.fastStateGenerating,
+    fastTailKeyEqualsBaseline: summary.fastTailKeyEqualsBaseline,
+  });
+  if (!verdict.ok) return evidenceRequired();
+  // Backup BEFORE any mutation; then the existing atomic write pattern.
+  const backup = await backupLedgerBytes(dir, record.dispatchId, now);
+  const next = {
+    ...record,
+    status: "ABORTED",
+    abortReason: p.reason,
+    abortedAt: now,
+    abortedBy: p.agentId,
+    updatedAt: now,
+  };
+  await writeJsonAtomic(join(dir, "a-dispatch-state.json"), next);
+  await appendEvent(dir, "DISPATCH_ABORTED", {
+    dispatchId: record.dispatchId, reason: p.reason,
+    evidence: verdict.source, abortedBy: p.agentId, backupFile: backup.file,
+  });
+  console.log("RESULT=DISPATCH_ABORTED dispatchId=" + record.dispatchId +
+    " reason=" + p.reason + " evidence=" + verdict.source + " backup=" + backup.file);
   return 0;
 }
 
@@ -958,6 +1141,11 @@ export async function main(args = process.argv.slice(2)) {
     }
   }
   if (p.action === "ack") return managedAcknowledge(p);
+  // #38 fix 3: managed abort is a pure ledger operation — it runs before the
+  // armed check and ensureMonitor, so it never touches the browser, the
+  // registry or module copies, and it works on ACCEPTED/UNCERTAIN ledgers the
+  // armed check would refuse.
+  if (p.action === "abort") return abortDispatch(p);
   if (p.action === "consume") {
     const record = await readDispatchState(dir);
     if (!record || record.conversationUuid.toLowerCase() !== p.conversation.toLowerCase() || record.taskSpace !== p.space) {
@@ -1020,6 +1208,11 @@ export async function main(args = process.argv.slice(2)) {
       await writeFile(join(dir, "a-watch-uuid.txt"), p.conversation + "\n", "utf8");
       // Restart after delivery must finish the page release, even though the
       // probe deliberately suppresses DONE_CANDIDATE for completed dispatches.
+      // #38 fix 3: an already-aborted dispatch is terminal with no reply —
+      // the same terminal short-circuit slot wakes the supervisor instead.
+      if (armed.status === "ABORTED") {
+        return await exitWatching(dir, "DISPATCH_ABORTED_WAKE_SUPERVISOR", { detail: "action=watch" });
+      }
       if (armed.status === "COMPLETED") {
         try { await verifiedConsumption(dir, armed); }
         catch (error) {
@@ -1041,6 +1234,11 @@ export async function main(args = process.argv.slice(2)) {
           // A completed turn needs the owning Agent to inspect and consume the
           // reply before page release. A process exit is only a wake request.
           return await exitWatching(dir, "REPLY_READY_WAKE_SUPERVISOR", { detail: "action=collect" });
+        }
+        // #38 fix 3: the probe reports a terminal ABORTED ledger observed
+        // mid-watch — no reply exists, so collect/consume must never run.
+        if (observation.code === 0 && observation.result === "DISPATCH_ABORTED_WAKE_SUPERVISOR") {
+          return await exitWatching(dir, "DISPATCH_ABORTED_WAKE_SUPERVISOR", { detail: "action=probe" });
         }
         const verdict = classifyProbeResult(observation, benignStreak);
         benignStreak = verdict.streak;

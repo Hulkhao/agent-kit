@@ -196,7 +196,8 @@ const r = await page.fetch("/backend-api/conversation/" + uuid,
 | `CONVERSATION_DEAD_WAKE_SUPERVISOR`（脚本1） | 死页梯子 3 strikes，会话判死 | 深查/重派/迁移 → 全套重启 |
 | `WAKE_SUPERVISOR reason=NO_SUBSTANTIVE_PROGRESS`（脚本2） | 配置窗口无实质进展 | 本地 Agent 检查状态/工具/页面，按 wakeId 回执并重新布防 |
 | `WAKE_SUPERVISOR reason=REPLY_UNHANDLED` | 回复到达但还未交付 | 立即提取、处理结果，再回执 |
-| `DELIVERY_SUSPECTED_WAKE_SUPERVISOR`（#38） | 账本 ACCEPTED 但发送疑似未持久化（vanish-mode：非生成态下 tail==派单 baseline，或乐观 user 轮悬空无回复；assistant 尾部越过 baseline 则永不触发） | 受管 probe 复核尾部（必要时全新 goto 取服务端真态）：确认未落 → 按证据受控更正账本 ABORTED（备份先行）并按 §3.1 重派；确认已落 → 正常监控；禁止当完成候选、禁止盲重发 |
+| `DELIVERY_SUSPECTED_WAKE_SUPERVISOR`（#38） | 账本 ACCEPTED 但发送疑似未持久化（vanish-mode：非生成态下 tail==派单 baseline，或乐观 user 轮悬空无回复；assistant 尾部越过 baseline 则永不触发） | 受管 probe 复核尾部（必要时全新 goto 取服务端真态）：确认未落 → 用受管 `abort` 按证据关闭账本（见下行与 docs/OPERATIONS.md §7，备份先行）并按 §3.1 重派；确认已落 → 正常监控；禁止当完成候选、禁止盲重发 |
+| `DISPATCH_ABORTED_WAKE_SUPERVISOR`（#38 修复3） | 受管 `abort` 已按证据门把在途账本关闭为 ABORTED（账本含 abortReason/abortedAt/abortedBy；原账本字节级备份 `a-dispatch-state.archive-<dispatchId前8>-abort.json`；probe 观测到 ABORTED 账本即报此信号） | 读 `DISPATCH_ABORTED` 事件与备份核对 reason/证据来源；确认后 `ack` 该 wakeId；ABORTED 无回复可言——禁止 collect/consume，禁止重复 abort（`ABORT_NOT_APPLICABLE`）；按 §3.1 决定是否重派 |
 | `USER_ESCALATION_REQUIRED` | 连续 3 轮异常且没有实质进展 | 联系 PO；不能把第三次告警直接当“会话死亡” |
 | `STATE_MISSING / WATCHDOG_TRIGGER(stale>=7min)` | 快轮询死亡 | 修快轮询（页面失附→重新 goto）→全套重启 |
 | `startIdle=true` | 监视器启动/恢复时页面已空闲（基线时序风险） | 「启动即提取」：单次 API 比对派单基线，防吞已到达回复 |
