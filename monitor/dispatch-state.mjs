@@ -2,7 +2,7 @@
 import { appendFile, readFile, rename, writeFile } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
-import { spacePhaseMs, stormBackoffDeadline, classifyFastStateFile } from "./state-schema.mjs";
+import { spacePhaseMs, stormBackoffDeadline, classifyFastStateFile, ARMED_REASONS } from "./state-schema.mjs";
 import { verifiedReply } from "./reply-delivery.mjs";
 
 const ACTIVE = new Set(["PREPARED", "SEND_STARTED", "ACCEPTED", "UNCERTAIN", "RETRY_AUTHORIZED"]);
@@ -375,6 +375,40 @@ export async function reconcileDispatch(monitorDir, conversationUuid, surface) {
     return { record: next, result: "UNCERTAIN" };
   }
   return { record, result: record.status };
+}
+
+// ---- #27 Batch 3 (ruling §四.2): disarm criteria — pure in-flight check ----
+//
+// Every condition of the ruling must hold before a conversation's fast state
+// may transition to DISARMED_IDLE:
+//   1. all related dispatches COMPLETED/RELEASED — the ledger-side truth set
+//      is { COMPLETED, ABORTED } (release-sweep.mjs TERMINAL_DISPATCH / P1-4:
+//      the v2 validator never writes RELEASED; a RELEASED record is
+//      structurally invalid and surfaces as a blocker, never as finality);
+//   2. no reply awaiting collection (a COMPLETED dispatch must have its reply
+//      consumed first; an ABORTED dispatch has no reply by definition);
+//   3. no other in-flight dispatch (counted by the caller across the monitor
+//      root; sibling ledgers it cannot prove terminal count as in-flight);
+//   4. no unprocessed wake marker (un-acked a-watch-exit.json);
+//   5. no unfinished supervision handoff (pending supervision alarm).
+// A ledger without arm fields (legacy, ruling §四.1) is NEVER auto-disarmed:
+// armedReason null is itself a blocker. The function is pure — the caller
+// gathers the evidence, so unit tests inject every branch.
+export function evaluateDisarmEligibility({
+  armedReason = null, dispatchStatus = null, replyConsumed = false,
+  unackedWakes = 0, supervisionPending = false, otherInFlight = 0,
+} = {}) {
+  const blockers = [];
+  if (!ARMED_REASONS.has(armedReason)) blockers.push("ARM_STATE_LEGACY_NO_DISARM_INFERENCE");
+  if (armedReason === "DISARMED_IDLE") blockers.push("ARM_STATE_ALREADY_DISARMED");
+  if (!["COMPLETED", "ABORTED"].includes(dispatchStatus)) {
+    blockers.push("DISPATCH_NOT_TERMINAL:" + (dispatchStatus ?? "ABSENT"));
+  }
+  if (dispatchStatus === "COMPLETED" && replyConsumed !== true) blockers.push("REPLY_NOT_CONSUMED");
+  if (!(Number.isInteger(unackedWakes) && unackedWakes === 0)) blockers.push("WAKE_MARKER_UNACKNOWLEDGED");
+  if (supervisionPending) blockers.push("SUPERVISION_HANDOFF_PENDING");
+  if (!(Number.isInteger(otherInFlight) && otherInFlight === 0)) blockers.push("OTHER_INFLIGHT_DISPATCH");
+  return { eligible: blockers.length === 0, blockers };
 }
 
 // ---- R2.5 Composer delivery reliability (planner ruling reply-r43.txt) ----

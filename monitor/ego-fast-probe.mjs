@@ -34,6 +34,8 @@ const {
 const {
   FAST_STATE_DEFAULTS,
   FAST_STATE_SCHEMA,
+  IN_FLIGHT_DISPATCH_STATUSES,
+  armedReasonOnProbeRound,
   decideRoundKind,
   isBackoffActive,
   navReferenceAt,
@@ -107,7 +109,10 @@ async function saveFailureScreenshot(page, kind) {
 }
 
 if (stateCorrupt) {
-  await writeState({ probeFailed: true, recoveryFailed: true, errorCode: "STATE_CORRUPT", uiSchema: "UNKNOWN" });
+  // #27 Batch 3 (ruling §四.1): a corrupt fast state is unconfirmable — it
+  // lands in the ARMED_UNKNOWN catch-all (fail-closed armed, never a silent
+  // clean slate the next reader could mistake for a legal disarm claim).
+  await writeState({ probeFailed: true, recoveryFailed: true, errorCode: "STATE_CORRUPT", uiSchema: "UNKNOWN", armedReason: "ARMED_UNKNOWN" });
   await appendEvent(MON, "STATE_CORRUPT", {});
   console.log("RESULT=STATE_CORRUPT");
   process.exit(0);
@@ -696,6 +701,14 @@ const state = await writeState({
   startIdle: recovered && !probe.generating,
   doneCandidate: completedDispatch ? false : (sameGeneration ? previous.doneCandidate : false),
   deliveryFailedCandidate: completedDispatch ? false : tailKeyEqualsBaseline,
+  // #27 Batch 3 (ruling §四.1/.2): the peer-confirmed generation upgrade and
+  // the fail-closed ARMED_UNKNOWN catch-all for a missing arm field over an
+  // in-flight ledger. The probe never writes DISARMED_IDLE — disarm is
+  // manager-owned (disarmAfterRelease).
+  armedReason: armedReasonOnProbeRound(previous.armedReason, {
+    generating: probe.generating === true,
+    dispatchInFlight: IN_FLIGHT_DISPATCH_STATUSES.has(dispatchResult.record?.status || ""),
+  }),
   probeFailed: false,
   backoffUntil: null,
   unavailableStrikes: 0,

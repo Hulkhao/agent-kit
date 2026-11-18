@@ -10,7 +10,7 @@ import { join, resolve } from "node:path";
 import { normalizeFastState, validateFastState, classifyFastStateFile } from "../monitor/state-schema.mjs";
 import { tick, acknowledge } from "../monitor/supervision-watchdog.mjs";
 import { shouldReviewStartupIdle, classifySupervision, deliverySuspected } from "../monitor/supervision-policy.mjs";
-import { parseArgs, adaptTemplate, bindNewConversation, classifyManagerResult, loadAttachments, requireArmedDispatch, main, readEgoOutcome, ensureMonitor, authorizeSpaceRebuild, rebuildSpace, claimSpace, taskspaceOwnershipLost, announceTaskspaceOwnershipLoss, exitWatching, acknowledgeWake, releaseDelivered, managedAcknowledge, ackOwnershipEvidence, ACK_RESOLVED_OWNERSHIP_REQUIRED, ACK_AUDIT_FILE, SUPERVISION_WAKE_REASON_MAP } from "../monitor/dispatch-manager.mjs";
+import { parseArgs, adaptTemplate, bindNewConversation, classifyManagerResult, loadAttachments, requireArmedDispatch, main, readEgoOutcome, ensureMonitor, authorizeSpaceRebuild, rebuildSpace, claimSpace, taskspaceOwnershipLost, announceTaskspaceOwnershipLoss, exitWatching, acknowledgeWake, releaseDelivered, managedAcknowledge, ackOwnershipEvidence, armForDispatch, ACK_RESOLVED_OWNERSHIP_REQUIRED, ACK_AUDIT_FILE, SUPERVISION_WAKE_REASON_MAP } from "../monitor/dispatch-manager.mjs";
 import { withAgentRegistry, isValidNewTaskSpaceName, assertTaskSpaceNamingAllowed } from "../monitor/agent-space.mjs";
 import { taskspaceOperatorAction } from "../monitor/taskspace-takeover.mjs";
 import { checkDispatchTool } from "../plugins/chatgpt-dispatch-guard/hooks/policy.mjs";
@@ -1904,4 +1904,50 @@ test("#27 B2: claim audit rows carry owner attribution without touching the #33 
     assert.match(authorize, /SPACE_REBUILD_NOT_AUTHORIZED/);
     assert.doesNotMatch(authorize, /ownerAgentId|taskSpaceId|taskSpaceName/);
   } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+// ---- #27 Batch 3 (ruling §四): arm-on-wait integration at the manager layer ----
+
+test("#27 B3: ledger readers and the storm gate tolerate armed v4 fast state; legacy v3 stays valid, junk stays fail-closed", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ego-gov-arm-state-"));
+  try {
+    // Armed v4 state with an active storm backoff: the gate still blocks.
+    const armed = normalizeFastState({}, { ts: Date.now(), armedReason: "DISPATCH_ACCEPTED", backoffUntil: Date.now() + 60_000 });
+    await writeFile(join(dir, "a-fast-state.json"), JSON.stringify(armed));
+    assert.equal(await dispatchStormGate(dir, Date.now()), "STORM_BACKOFF_PENDING");
+    // Clean armed state: no storm gate.
+    await writeFile(join(dir, "a-fast-state.json"), JSON.stringify(
+      normalizeFastState(armed, { backoffUntil: null })));
+    assert.equal(await dispatchStormGate(dir, Date.now()), null);
+    // Legacy v3 ledger (pre-arm fields): legacy mode, not corruption.
+    await writeFile(join(dir, "a-fast-state.json"),
+      JSON.stringify({ schema: "ego-fast-state/v3", ts: 1 }));
+    assert.equal(await dispatchStormGate(dir, Date.now()), null);
+    // Junk stays fail-closed.
+    // A parsed-but-schema-invalid file is corruption for the gate (a raw
+    // JSON syntax error propagates as its own read failure — equally fail-closed).
+    await writeFile(join(dir, "a-fast-state.json"), JSON.stringify({ schema: "ego-fast-state/v4", notAField: 1 }));
+    await assert.rejects(dispatchStormGate(dir, Date.now()), /FAST_STATE_INVALID/);
+    await writeFile(join(dir, "a-fast-state.json"), "{corrupted");
+    await assert.rejects(dispatchStormGate(dir, Date.now()), /Expected property name/);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("#27 B3: an armed ledger keeps the watch/probe gate semantics; arm writes never loosen requireArmedDispatch", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ego-gov-arm-gate-"));
+  try {
+    await mkdir(dir, { recursive: true });
+    const record = { schema: "ego-dispatch-state/v2", dispatchId: uuid,
+      conversationUuid: uuid, taskSpace: "GDC-执行A", pageLabel: "p1", status: "ACCEPTED",
+      baselineTailKey: null, baselineTailRole: null, baselineComposerLength: 0,
+      attempt: 1, createdAt: Date.now(), payload_sha256: sha256("任务") };
+    await writeFile(join(dir, "a-dispatch-state.json"), JSON.stringify(record));
+    const params = { monitorDir: dir, agentId: "gdc-a", space: "GDC-执行A", conversation: uuid };
+    assert.equal((await requireArmedDispatch(dir, params, "watch")).status, "ACCEPTED");
+    // Arming the fast state does not touch the dispatch ledger gate.
+    const armed = await armForDispatch(dir, { conversationUuid: uuid, space: "GDC-执行A" });
+    assert.equal(armed.armedReason, "DISPATCH_ACCEPTED");
+    assert.equal((await requireArmedDispatch(dir, params, "watch")).status, "ACCEPTED");
+    assert.equal((await readDispatchState(dir)).status, "ACCEPTED");
+  } finally { await rm(dir, { recursive: true, force: true }); }
 });

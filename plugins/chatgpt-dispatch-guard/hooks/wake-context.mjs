@@ -22,6 +22,61 @@ export const TERMINAL_DISPATCH_STATUSES = new Set(["COMPLETED", "ABORTED", "RELE
 // of a silent pass (must never interpret read failure as health).
 export const ACTIVE_DISPATCH_STATUSES = new Set(["PREPARED", "SEND_STARTED", "ACCEPTED", "UNCERTAIN", "RETRY_AUTHORIZED"]);
 
+// ---- #27 Batch 3 (ruling §四.1/.3): armed-state awareness ----
+//
+// Schema pin mirrored from monitor/state-schema.mjs (this module stays
+// self-contained and imports nothing from monitor/**). Only a structurally
+// valid v4 fast state carries an arm claim; legacy v3/v2/no-schema ledgers
+// (and foreign reason values) carry NO arm information — legacy mode, the
+// exemption table never fires on inference.
+export const FAST_STATE_SCHEMA_V4 = "ego-fast-state/v4";
+const ARMED_REASONS_V4 = new Set(["DISPATCH_ACCEPTED", "PEER_GENERATING", "DISARMED_IDLE", "ARMED_UNKNOWN"]);
+// Frozen exemption verdicts (ruling §四.3 table rows).
+export const WATCH_STALE_EXEMPTION = Object.freeze({
+  EXEMPT: "EXEMPT",                       // DISARMED_IDLE + cross-validation passed
+  CONFLICT_UNKNOWN: "CONFLICT_UNKNOWN",   // DISARMED_IDLE but an in-flight dispatch exists
+  KEEP_WAKE_EVENTS: "KEEP_WAKE_EVENTS",   // DISARMED_IDLE + un-acked wake: wakes stay visible
+  NOT_EXEMPT: "NOT_EXEMPT",               // armed claims, legacy, missing, unreadable
+});
+export const ARM_STATE_CONFLICT_DETAIL = "ARM_STATE_CONFLICT_DISARMED_WITH_INFLIGHT_DISPATCH";
+
+// Read the arm claim out of a parsed a-fast-state.json value (null = file
+// absent). Structured ONLY for a v4 file whose armedReason is null or one of
+// the frozen four states; anything else (legacy schema, foreign value) has no
+// trustworthy arm information and must never enable the exemption.
+export function readArmClaim(fast) {
+  if (!fast || typeof fast !== "object" || Array.isArray(fast)) return { structured: false, armReason: null };
+  if (fast.schema !== FAST_STATE_SCHEMA_V4) return { structured: false, armReason: null };
+  const reason = fast.armedReason;
+  if (reason !== null && !ARMED_REASONS_V4.has(reason)) return { structured: false, armReason: null };
+  return { structured: true, armReason: reason ?? null };
+}
+
+// WATCH_STALE exemption table (ruling §四.3), frozen rows:
+//   DISARMED_IDLE 且交叉验证通过            -> EXEMPT (the stale fast state is the
+//        expected post-disarm shape; no stale anomaly is raised)
+//   DISARMED_IDLE 但 dispatch-state 有在途  -> CONFLICT_UNKNOWN (the forbidden
+//        "sent but disarmed" window; fail-closed UNKNOWN instead of exemption)
+//   DISARMED_IDLE 但有未 ack wake           -> KEEP_WAKE_EVENTS (the stale
+//        anomaly is exempt but corresponding wake events stay raised — in the
+//        wiring they are pushed before this table is consulted and are never
+//        suppressed by it in any branch)
+//   WAKE_PENDING / SUPERVISION_PENDING / 读取失败 -> NOT_EXEMPT (separate event
+//        types are never suppressed here; an unreadable fast state proves no
+//        legitimate disarm, so the stale anomaly stands)
+//   Any armed claim (DISPATCH_ACCEPTED / PEER_GENERATING / ARMED_UNKNOWN) is
+//   NOT_EXEMPT: while armed the watch must be running and a stale fast state
+//   is a real WATCH_STALE.
+export function watchStaleExemption({ structured = false, armReason = null, dispatchActive = false, hasUnackedWake = false } = {}) {
+  if (!structured) return WATCH_STALE_EXEMPTION.NOT_EXEMPT;
+  if (armReason === "DISARMED_IDLE") {
+    if (dispatchActive) return WATCH_STALE_EXEMPTION.CONFLICT_UNKNOWN;
+    if (hasUnackedWake) return WATCH_STALE_EXEMPTION.KEEP_WAKE_EVENTS;
+    return WATCH_STALE_EXEMPTION.EXEMPT;
+  }
+  return WATCH_STALE_EXEMPTION.NOT_EXEMPT;
+}
+
 // Frozen thresholds (ruling §2.3).
 // FAST_STATE_STALE_MS deliberately equals the 7 * 60_000 FAST_POLL_STALE check
 // in monitor/supervision-policy.mjs classifySupervision() — one time standard,
@@ -150,6 +205,11 @@ function dispatchStructureError(record) {
 }
 
 async function scanConversation(dir, name, now, io, events) {
+  // #27 Batch 3 (ruling §四.3): whether this scan already raised a wake event
+  // (WAKE_PENDING / SUPERVISION_PENDING). The WATCH_STALE exemption table
+  // never suppresses these events in any branch — it only ever decides the
+  // fate of the stale-fast-state anomaly itself.
+  let unackedWakeSeen = false;
   // a-watch-exit.json: an un-acknowledged watch exit is reported immediately
   // (no grace threshold). Parse or structure failure is UNKNOWN, never health.
   const exitFile = join(dir, "a-watch-exit.json");
@@ -162,6 +222,7 @@ async function scanConversation(dir, name, now, io, events) {
     if (structureError) {
       events.push(unknownEvent(exitFile, structureError));
     } else if (marker.acknowledgedAt === null) {
+      unackedWakeSeen = true;
       events.push({
         type: "WAKE_PENDING",
         key: `wake:${marker.wakeId ?? name}`,
@@ -187,6 +248,7 @@ async function scanConversation(dir, name, now, io, events) {
     } else if (status.pending) {
       const issuedAt = status.pending.issuedAt;
       if (now - issuedAt >= SUPERVISION_PENDING_MS) {
+        unackedWakeSeen = true;
         events.push({
           type: "SUPERVISION_PENDING",
           key: `wake:${status.pending.id ?? name}`,
@@ -235,6 +297,26 @@ async function scanConversation(dir, name, now, io, events) {
   const recordTs = Number.isFinite(dispatch.updatedAt) ? dispatch.updatedAt : dispatch.createdAt;
   const recordStale = !Number.isFinite(recordTs) || now - recordTs > FAST_STATE_STALE_MS;
   if (!recordStale) return;
+
+  // #27 Batch 3 (ruling §四.3): the frozen WATCH_STALE exemption table,
+  // consulted against the fast state's arm claim before the anomaly is raised.
+  // A DISARMED_IDLE claim against an in-flight dispatch ledger is the forbidden
+  // "sent but disarmed" window and surfaces as WAKE_STATUS_UNKNOWN; a verified
+  // post-disarm shape is exempt; armed claims, legacy ledgers and unreadable
+  // state are never exempt. Wake events raised earlier in this scan are
+  // retained in every branch.
+  const armClaim = readArmClaim(fast);
+  const exemption = watchStaleExemption({
+    structured: armClaim.structured,
+    armReason: armClaim.armReason,
+    dispatchActive: ACTIVE_DISPATCH_STATUSES.has(dispatch.status),
+    hasUnackedWake: unackedWakeSeen,
+  });
+  if (exemption === WATCH_STALE_EXEMPTION.CONFLICT_UNKNOWN) {
+    events.push(unknownEvent(join(dir, "a-fast-state.json"), ARM_STATE_CONFLICT_DETAIL));
+    return;
+  }
+  if (exemption === WATCH_STALE_EXEMPTION.EXEMPT || exemption === WATCH_STALE_EXEMPTION.KEEP_WAKE_EVENTS) return;
 
   events.push({
     type: "WATCH_STALE",

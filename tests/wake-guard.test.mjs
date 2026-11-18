@@ -8,7 +8,7 @@ import { spawnSync } from "node:child_process";
 import { mkdtemp, mkdir, writeFile, readFile, rm, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { detectWakeAnomalies, formatWakeContext, summarizeEvents, readMonitorRoots, parseLedger, injectionCooldownActive, stopCooldownActive, withInjection, withStopBlock, eventIdentity, selectWakeEvents } from "../plugins/chatgpt-dispatch-guard/hooks/wake-context.mjs";
+import { detectWakeAnomalies, formatWakeContext, summarizeEvents, readMonitorRoots, parseLedger, injectionCooldownActive, stopCooldownActive, withInjection, withStopBlock, eventIdentity, selectWakeEvents, watchStaleExemption, readArmClaim, WATCH_STALE_EXEMPTION, ARM_STATE_CONFLICT_DETAIL, FAST_STATE_SCHEMA_V4 } from "../plugins/chatgpt-dispatch-guard/hooks/wake-context.mjs";
 import { install, installConfig, verifyConfig } from "../monitor/install-zcode-guard.mjs";
 
 const hooksDir = join(import.meta.dirname, "../plugins/chatgpt-dispatch-guard/hooks");
@@ -967,4 +967,142 @@ test("installer --verify passes end to end against a real installed config (all 
   const listing = await readdir(dir);
   assert.ok(listing.some((f) => f === "config.json.pre-chatgpt-guard.bak"));
   await rm(dir, { recursive: true, force: true });
+});
+
+// ---- #27 Batch 3 (ruling §四.3): WATCH_STALE exemption table for the armed
+// state. Pure table rows plus the scan wiring: a DISARMED_IDLE claim against
+// an in-flight dispatch ledger is the forbidden "sent but disarmed" window
+// (UNKNOWN, never an exemption); armed claims, legacy ledgers and unreadable
+// state never exempt; wake events are retained in every branch. ----
+
+test("#27 B3 exemption table: frozen rows, pure function", () => {
+  const structured = { structured: true, armReason: "DISARMED_IDLE" };
+  // DISARMED_IDLE 且交叉验证通过 -> 豁免
+  assert.equal(watchStaleExemption({ ...structured, dispatchActive: false, hasUnackedWake: false }),
+    WATCH_STALE_EXEMPTION.EXEMPT);
+  // DISARMED_IDLE 但 dispatch-state 有在途 -> UNKNOWN 不豁免
+  assert.equal(watchStaleExemption({ ...structured, dispatchActive: true, hasUnackedWake: false }),
+    WATCH_STALE_EXEMPTION.CONFLICT_UNKNOWN);
+  // DISARMED_IDLE 但有未 ack wake -> 保留对应唤醒事件（stale 异常本身豁免）
+  assert.equal(watchStaleExemption({ ...structured, dispatchActive: false, hasUnackedWake: true }),
+    WATCH_STALE_EXEMPTION.KEEP_WAKE_EVENTS);
+  // Conflict and unacked wake together: the conflict verdict stands and the
+  // wake events are retained regardless (never suppressed by any branch).
+  assert.equal(watchStaleExemption({ ...structured, dispatchActive: true, hasUnackedWake: true }),
+    WATCH_STALE_EXEMPTION.CONFLICT_UNKNOWN);
+  // Armed claims are never exempt — while armed the watch must be running.
+  for (const armReason of ["DISPATCH_ACCEPTED", "PEER_GENERATING", "ARMED_UNKNOWN"]) {
+    assert.equal(watchStaleExemption({ structured: true, armReason, dispatchActive: true, hasUnackedWake: false }),
+      WATCH_STALE_EXEMPTION.NOT_EXEMPT, armReason);
+  }
+  // 读取失败 / legacy / foreign reason: no arm information, never exempt.
+  for (const claim of [
+    { structured: false, armReason: null },                 // missing / unreadable
+    { structured: false, armReason: null },                 // legacy v3 (no schema v4)
+    { structured: false, armReason: null },                 // foreign reason value
+  ]) {
+    assert.equal(watchStaleExemption({ ...claim, dispatchActive: true, hasUnackedWake: false }),
+      WATCH_STALE_EXEMPTION.NOT_EXEMPT);
+  }
+});
+
+test("#27 B3 readArmClaim: only a v4 ledger with a frozen four-state value carries an arm claim", () => {
+  assert.deepEqual(readArmClaim({ schema: FAST_STATE_SCHEMA_V4, armedReason: "DISARMED_IDLE" }),
+    { structured: true, armReason: "DISARMED_IDLE" });
+  assert.deepEqual(readArmClaim({ schema: FAST_STATE_SCHEMA_V4, armedReason: null }),
+    { structured: true, armReason: null });
+  // Legacy schemas, absent values and junk carry no arm information.
+  assert.deepEqual(readArmClaim({ schema: "ego-fast-state/v3", armedReason: "DISARMED_IDLE" }),
+    { structured: false, armReason: null });
+  assert.deepEqual(readArmClaim({ ts: 5 }), { structured: false, armReason: null });
+  assert.deepEqual(readArmClaim(null), { structured: false, armReason: null });
+  assert.deepEqual(readArmClaim("{junk"), { structured: false, armReason: null });
+  // A hand-edited foreign value is untrustworthy, never an exemption basis.
+  assert.deepEqual(readArmClaim({ schema: FAST_STATE_SCHEMA_V4, armedReason: "WEIRD" }),
+    { structured: false, armReason: null });
+});
+
+test("#27 B3 exemption wiring: an armed claim keeps WATCH_STALE, a DISARMED_IDLE claim over an in-flight dispatch becomes the forbidden-window UNKNOWN", async () => {
+  const now = 1_800_000_000_000;
+  const staleFast = (armedReason, schema = FAST_STATE_SCHEMA_V4) => ({
+    schema, ts: now - 8 * 60_000, ...(armedReason === null ? {} : { armedReason }),
+  });
+  // Armed claim (DISPATCH_ACCEPTED) + stale + ACCEPTED ledger -> WATCH_STALE stands.
+  {
+    const { root } = await makeRoot(now, {
+      "a-dispatch-state.json": dispatchRecord(now - 60 * 60_000),
+      "a-fast-state.json": staleFast("DISPATCH_ACCEPTED"),
+    });
+    const { healthy, events } = await detectWakeAnomalies([root], now);
+    assert.equal(healthy, false);
+    assert.equal(events[0].type, "WATCH_STALE");
+    await rm(root, { recursive: true, force: true });
+  }
+  // DISARMED_IDLE claim + in-flight (ACCEPTED) ledger = "已派出但显示撤防"
+  // forbidden window -> WAKE_STATUS_UNKNOWN, never an exemption.
+  {
+    const { root } = await makeRoot(now, {
+      "a-dispatch-state.json": dispatchRecord(now - 60 * 60_000),
+      "a-fast-state.json": staleFast("DISARMED_IDLE"),
+    });
+    const { healthy, events } = await detectWakeAnomalies([root], now);
+    assert.equal(healthy, false);
+    assert.equal(events.length, 1);
+    assert.equal(events[0].type, "WAKE_STATUS_UNKNOWN");
+    assert.equal(events[0].detail, ARM_STATE_CONFLICT_DETAIL);
+    await rm(root, { recursive: true, force: true });
+  }
+  // Legacy fast state (pre-arm ledger): legacy mode, WATCH_STALE unchanged.
+  {
+    const { root } = await makeRoot(now, {
+      "a-dispatch-state.json": dispatchRecord(now - 60 * 60_000),
+      "a-fast-state.json": staleFast(null, "ego-fast-state/v3"),
+    });
+    const { healthy, events } = await detectWakeAnomalies([root], now);
+    assert.equal(healthy, false);
+    assert.equal(events[0].type, "WATCH_STALE");
+    await rm(root, { recursive: true, force: true });
+  }
+  // ARMED_UNKNOWN claim: fail-closed armed, WATCH_STALE stands.
+  {
+    const { root } = await makeRoot(now, {
+      "a-dispatch-state.json": dispatchRecord(now - 60 * 60_000),
+      "a-fast-state.json": staleFast("ARMED_UNKNOWN"),
+    });
+    const { healthy, events } = await detectWakeAnomalies([root], now);
+    assert.equal(healthy, false);
+    assert.equal(events[0].type, "WATCH_STALE");
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("#27 B3 exemption wiring: a post-disarm shape never swallows a pending wake event", async () => {
+  const now = 1_800_000_000_000;
+  // Terminal dispatch (cross-validation passes) + DISARMED_IDLE claim + stale
+  // fast state: no stale anomaly is raised — and an un-acked watch exit is
+  // STILL retained (the exemption never suppresses wake events).
+  {
+    const { root } = await makeRoot(now, {
+      "a-dispatch-state.json": dispatchRecord(now - 3 * 60 * 60_000, { status: "COMPLETED" }),
+      "a-fast-state.json": { schema: FAST_STATE_SCHEMA_V4, ts: now - 3 * 60 * 60_000, armedReason: "DISARMED_IDLE" },
+      "a-watch-exit.json": watchExit(now - 181_000, { acknowledgedAt: now - 1, ackAction: "investigated" }),
+    });
+    const { healthy, events } = await detectWakeAnomalies([root], now);
+    assert.equal(healthy, true);
+    assert.deepEqual(events, []);
+    await rm(root, { recursive: true, force: true });
+  }
+  {
+    const { root } = await makeRoot(now, {
+      "a-dispatch-state.json": dispatchRecord(now - 3 * 60 * 60_000, { status: "COMPLETED" }),
+      "a-fast-state.json": { schema: FAST_STATE_SCHEMA_V4, ts: now - 3 * 60 * 60_000, armedReason: "DISARMED_IDLE" },
+      "a-watch-exit.json": watchExit(now - 181_000),
+    });
+    const { healthy, events } = await detectWakeAnomalies([root], now);
+    assert.equal(healthy, false);
+    assert.equal(events.length, 1);
+    assert.equal(events[0].type, "WAKE_PENDING");
+    assert.equal(events[0].wakeId, wakeUuid);
+    await rm(root, { recursive: true, force: true });
+  }
 });

@@ -2,14 +2,15 @@
 // Single entry point for ChatGPT web dispatch, monitoring and page release.
 // Use this command as a MANAGED foreground/background tool task: exit code 2
 // carries a wake signal to the hosting Agent (only if its job API supports it).
-import { readFile, writeFile, mkdir, copyFile, unlink, stat, rename, open, appendFile } from "node:fs/promises";
+import { readFile, writeFile, mkdir, copyFile, unlink, stat, rename, open, appendFile, readdir } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { dirname, join, resolve, isAbsolute } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { tick, acknowledge } from "./supervision-watchdog.mjs";
-import { readDispatchState, markCompleted, writeJsonAtomic, validateDispatchRecord } from "./dispatch-state.mjs";
+import { readDispatchState, markCompleted, writeJsonAtomic, validateDispatchRecord, evaluateDisarmEligibility, appendEvent } from "./dispatch-state.mjs";
+import { ARMED_REASONS, IN_FLIGHT_DISPATCH_STATUSES, armedTransitionPatch, classifyFastStateFile, normalizeFastState } from "./state-schema.mjs";
 import { verifiedReply, acknowledgeReply, verifiedConsumption, sha256 } from "./reply-delivery.mjs";
 import { withAgentRegistry } from "./agent-space.mjs";
 import { taskspaceOperatorAction } from "./taskspace-takeover.mjs";
@@ -469,6 +470,197 @@ async function collectCompleted(params, dir) {
   return 0;
 }
 
+// ---- #27 Batch 3 (ruling §四.1/.2): arm-on-wait — armed-state persistence ----
+//
+// The frozen four-state machine lives in state-schema.mjs (ARMED_REASONS /
+// armedTransitionPatch). This module owns the TRIGGERS:
+//   arm  — a new dispatch persists its armed state BEFORE delivery, so there
+//          is never a window where a message was sent while the state still
+//          reads disarmed (ruling §四.2 "新派单先布防再投递");
+//   disarm — the release path writes DISARMED_IDLE only after the full
+//          criteria of evaluateDisarmEligibility() hold, in the ruling's
+//          order: confirm terminal with nothing in flight -> write disarm ->
+//          stop the watch (returning from the watch loop).
+// The probe (ego-fast-probe.mjs) owns the DISPATCH_ACCEPTED ->
+// PEER_GENERATING upgrade via armedReasonOnProbeRound() and never disarms.
+
+const fastStateFileOf = (dir) => join(dir, "a-fast-state.json");
+
+// Read the fast state for an arm/disarm decision. Missing and legacy v3
+// ledgers are distinct outcomes; anything that fails the v4 contract is
+// "corrupt" and is handled fail-closed by the callers (ARMED_UNKNOWN /
+// blockers), never as a clean slate to write over silently.
+async function readFastStateForDecision(dir) {
+  let parsed;
+  try { parsed = JSON.parse(await readFile(fastStateFileOf(dir), "utf8")); }
+  catch (error) {
+    if (error?.code === "ENOENT") return { classification: "missing", value: null };
+    return { classification: "corrupt", value: null };
+  }
+  const classification = classifyFastStateFile(parsed);
+  if (classification === "current") return { classification, value: parsed };
+  if (classification === "legacy") {
+    return { classification, value: normalizeFastState(parsed, {}, Number.isFinite(parsed?.ts) ? parsed.ts : Date.now()) };
+  }
+  return { classification: "corrupt", value: null };
+}
+
+function currentArmedReasonOf(classification, value) {
+  if ((classification === "current" || classification === "legacy") &&
+      ARMED_REASONS.has(value?.armedReason)) return value.armedReason;
+  return null;
+}
+
+// Persist the arm state for a new dispatch. Idempotent per state machine: an
+// already-armed state simply re-anchors DISPATCH_ACCEPTED. A missing ledger
+// arms cleanly from null; a CORRUPT fast state must not be re-read as health —
+// it lands in ARMED_UNKNOWN (fail-closed armed, never auto-disarmed, ruling
+// §四.1). A legacy v3 ledger arms from null for the new dispatch (the ruling's
+// legacy clause forbids inferring DISARM, not recording an explicit new arm).
+export async function armForDispatch(dir, { conversationUuid = null, space = null, timestamp = Date.now() } = {}) {
+  const { classification, value } = await readFastStateForDecision(dir);
+  const current = currentArmedReasonOf(classification, value);
+  const target = classification === "corrupt" ? "ARMED_UNKNOWN" : "DISPATCH_ACCEPTED";
+  const decision = armedTransitionPatch(current, target, { conversation: conversationUuid, space, timestamp });
+  if (!decision.ok) throw new Error(`ARM_TRANSITION_REJECTED:${current}->${target}`);
+  const next = normalizeFastState(classification === "current" || classification === "legacy" ? value : {},
+    decision.patch, timestamp);
+  await writeJsonAtomic(fastStateFileOf(dir), next);
+  await appendEvent(dir, "ARMED_DISPATCH_ACCEPTED", {
+    conversation: conversationUuid, space: space ?? null,
+    previousReason: current, sourceClassification: classification,
+  });
+  return next;
+}
+
+// Write DISARMED_IDLE for a conversation whose release just completed. All
+// ruling §四.2 criteria are gathered here and passed to the pure
+// evaluateDisarmEligibility(); any blocker (or any unreadable evidence —
+// fail-closed) leaves the armed state untouched: staying armed is the safe
+// direction, and the wake-guard plus the next dispatch round own the fallout.
+// Idempotent: an already DISARMED_IDLE state with satisfied criteria reports
+// success without rewriting. A legacy ledger without arm fields is never
+// auto-disarmed (ruling §四.1). The caller sequence already confirmed the
+// terminal state with nothing in flight (verified release + consumption), so
+// this function re-proves the criteria on the durable ledgers before writing.
+export async function disarmAfterRelease(dir, { rootMonitorDir = null, timestamp = Date.now() } = {}) {
+  const root = rootMonitorDir ?? dirname(dirname(dir));
+  const blockers = [];
+  // Arm state (current fast state). Missing/corrupt = unconfirmable.
+  const { classification, value } = await readFastStateForDecision(dir);
+  const current = currentArmedReasonOf(classification, value);
+  if (classification === "missing") blockers.push("ARM_STATE_MISSING");
+  else if (classification === "corrupt") blockers.push("ARM_STATE_UNREADABLE");
+  else if (current === null) blockers.push("ARM_STATE_LEGACY_NO_DISARM_INFERENCE");
+  else if (current === "DISARMED_IDLE") return { disarmed: true, alreadyDisarmed: true, blockers: [] };
+
+  // Dispatch ledger: terminal + reply consumed.
+  let record = null;
+  try { record = await readDispatchState(dir); }
+  catch { blockers.push("DISPATCH_LEDGER_UNREADABLE"); }
+  if (!record && !blockers.includes("DISPATCH_LEDGER_UNREADABLE")) blockers.push("DISPATCH_LEDGER_ABSENT");
+  let replyConsumed = false;
+  if (record?.status === "COMPLETED") {
+    try { await verifiedConsumption(dir, record); replyConsumed = true; }
+    catch { replyConsumed = false; }
+  } else if (record?.status === "ABORTED") replyConsumed = true;
+
+  // Unprocessed wake marker (un-acked ego-watch-exit ledger) and unfinished
+  // supervision handoff. Unreadable evidence counts as outstanding.
+  let unackedWakes = 1;
+  try {
+    const marker = JSON.parse(await readFile(join(dir, "a-watch-exit.json"), "utf8"));
+    unackedWakes = marker?.acknowledgedAt !== null && marker?.acknowledgedAt !== undefined ? 0 : 1;
+  } catch (error) {
+    if (error?.code !== "ENOENT") blockers.push("WAKE_MARKER_UNREADABLE");
+    else unackedWakes = 0;
+  }
+  let supervisionPending = true;
+  try {
+    const status = JSON.parse(await readFile(join(dir, "a-supervision-status.json"), "utf8"));
+    supervisionPending = Boolean(status?.pending);
+  } catch (error) {
+    if (error?.code !== "ENOENT") blockers.push("SUPERVISION_STATUS_UNREADABLE");
+    else supervisionPending = false;
+  }
+
+  // No other in-flight dispatch anywhere in this monitor root. A sibling
+  // ledger that cannot be proven terminal (unreadable or structurally
+  // invalid, P1-4 conservative default) counts as in-flight.
+  let otherInFlight = 0;
+  try {
+    const siblings = await readdir(join(root, "conversations"), { withFileTypes: true });
+    for (const entry of siblings) {
+      if (!entry.isDirectory() || join(root, "conversations", entry.name) === dir) continue;
+      try {
+        const sibling = JSON.parse(await readFile(
+          join(root, "conversations", entry.name, "a-dispatch-state.json"), "utf8"));
+        if (!validateDispatchRecord(sibling) || IN_FLIGHT_DISPATCH_STATUSES.has(sibling.status)) otherInFlight++;
+      } catch (error) {
+        if (error?.code !== "ENOENT") otherInFlight++;
+      }
+    }
+  } catch (error) {
+    // A missing conversations directory proves no sibling dispatch exists;
+    // any other read failure is unconfirmable.
+    if (error?.code !== "ENOENT") blockers.push("SIBLING_LEDGERS_UNREADABLE");
+  }
+
+  // The five ruling criteria are evaluated only on clean evidence; any
+  // unreadable/unprovable step above already carries its own blocker.
+  let verdict = { eligible: false, blockers: [] };
+  if (!blockers.length && record) {
+    verdict = evaluateDisarmEligibility({
+      armedReason: current,
+      dispatchStatus: record.status,
+      replyConsumed, unackedWakes, supervisionPending, otherInFlight,
+    });
+  }
+  const merged = [...blockers, ...verdict.blockers];
+  if (merged.length) return { disarmed: false, blockers: merged };
+
+  const decision = armedTransitionPatch(current, "DISARMED_IDLE", {
+    conversation: record?.conversationUuid ?? null, space: record?.taskSpace ?? null, timestamp,
+  });
+  if (!decision.ok) return { disarmed: false, blockers: [`ARM_TRANSITION_REJECTED:${current}->DISARMED_IDLE`] };
+  await writeJsonAtomic(fastStateFileOf(dir), normalizeFastState(value, decision.patch, timestamp));
+  await appendEvent(dir, "DISARMED_IDLE", { conversation: record?.conversationUuid ?? null });
+  return { disarmed: true, alreadyDisarmed: false, blockers: [] };
+}
+
+// ---- #27 Batch 3 (ruling §四.4): two page-label lifecycles ----
+//
+// FIXED_SESSION labels are long-lived: the managed release of their OWN
+// conversation is the only action that may ever close them. DISPATCH_TEMP
+// labels are closed as soon as they are provably finished dispatch residue —
+// exclusively through the release cleanup's close mechanism
+// (release-agent-space.template.mjs -> sweepTaskPages, P1-A close-intent),
+// which the disarm sequence reuses; neither the probe nor the disarm step
+// ever closes a label directly (the probe holds no close call at all).
+// The boundary mirrors release-sweep.mjs's conservative default: anything
+// unproven stays open (fail-closed), terminal ledgers are closable, active
+// ledgers are not.
+export const PAGE_LABEL_LIFECYCLE = Object.freeze({
+  FIXED_SESSION: "fixed-session",
+  DISPATCH_TEMP: "dispatch-temp",
+});
+
+export function classifyPageLabelLifecycle({ conversationUuid = null, known = [], ledgerStatus = null } = {}) {
+  const knownList = Array.isArray(known) ? known : [];
+  const ownershipProven = typeof conversationUuid === "string" &&
+    knownList.some((k) => typeof k === "string" && k.toLowerCase() === conversationUuid.toLowerCase());
+  if (!ownershipProven) {
+    return { lifecycle: PAGE_LABEL_LIFECYCLE.FIXED_SESSION, closable: false, reason: "OWNERSHIP_UNPROVEN" };
+  }
+  if (ledgerStatus === "COMPLETED" || ledgerStatus === "ABORTED") {
+    return { lifecycle: PAGE_LABEL_LIFECYCLE.DISPATCH_TEMP, closable: true, reason: "TEMP_RESULT_PAGE_FINISHED_DISPATCH" };
+  }
+  if (typeof ledgerStatus === "string" && ledgerStatus !== "") {
+    return { lifecycle: PAGE_LABEL_LIFECYCLE.DISPATCH_TEMP, closable: false, reason: "ACTIVE_DISPATCH_LEDGER" };
+  }
+  return { lifecycle: PAGE_LABEL_LIFECYCLE.DISPATCH_TEMP, closable: false, reason: "LEDGER_UNPROVEN" };
+}
+
 // Exported for testing with a runScript injection (rebuildSpace precedent);
 // production callers use the default browser path.
 export async function releaseDelivered(params, dir, { runScript } = {}) {
@@ -497,6 +689,17 @@ export async function releaseDelivered(params, dir, { runScript } = {}) {
     return exitWatching(dir, "REPLY_DELIVERED_RELEASE_PENDING");
   }
   console.log("RESULT=DISPATCH_FINISHED_AND_RELEASED");
+  // #27 Batch 3 (ruling §四.2): the normal end sequence — the terminal state
+  // with nothing in flight was just confirmed (verified release + consumption
+  // above), so write the disarm BEFORE stopping the watch (returning 0 ends
+  // the watch loop). A deferred disarm keeps the state armed (safe direction)
+  // and is reported; the wake-guard plus the next dispatch round own it.
+  const disarm = await disarmAfterRelease(dir, {
+    rootMonitorDir: params.rootMonitorDir ?? dirname(dirname(dir)),
+  });
+  if (!disarm.disarmed) {
+    console.error("RESULT=DISARM_DEFERRED code=" + disarm.blockers.join(","));
+  }
   return 0;
 }
 
@@ -877,6 +1080,13 @@ export async function main(args = process.argv.slice(2)) {
     p.message = resolve(p.message);
     p.attachments = await loadAttachments(p.attachmentsFile);
   }
+  // #27 Batch 3 (ruling §四.2): a new dispatch persists its armed state BEFORE
+  // the delivery template runs — there must be no window where a message was
+  // sent while the fast state still read disarmed. Recovery of an owned draft
+  // (recover-draft) sends nothing and stays out of this path.
+  if (["send", "send-new"].includes(p.action)) {
+    await armForDispatch(dir, { conversationUuid: p.conversation, space: p.space });
+  }
   if (p.action === "probe") await writeFile(join(dir, "a-watch-uuid.txt"), p.conversation + "\n", "utf8");
   const observation = await runEgo(adaptTemplate(template, p), dir, p.action);
   // agent-kit#33: takeover guidance on send-family failures. The probe announces
@@ -908,6 +1118,16 @@ export async function main(args = process.argv.slice(2)) {
   if (p.action === "probe") return classifyProbeResult(observation).wake ? 2 : 0;
   const record = p.action === "send" ? await readDispatchState(dir) : null;
   const code = classifyManagerResult(p.action, observation, record, p);
+  // #27 Batch 3 (ruling §四.2): the direct release action follows the same
+  // end sequence as the watch path — terminal confirmed (verified completion +
+  // consumption + AGENT_SPACE_RELEASED), then write the disarm. No watch
+  // process is involved here, so a deferred disarm is reported and left armed.
+  if (p.action === "release" && code === 0) {
+    const disarm = await disarmAfterRelease(dir, { rootMonitorDir: p.rootMonitorDir ?? dirname(dirname(dir)) });
+    if (!disarm.disarmed) {
+      console.error("RESULT=DISARM_DEFERRED code=" + disarm.blockers.join(","));
+    }
+  }
   if (p.action === "send" && code !== 0) {
     console.error("RESULT=MANAGER_SEND_REQUIRES_RECONCILIATION status=" + (record?.status || "ABSENT"));
   }

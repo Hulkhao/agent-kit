@@ -159,3 +159,45 @@ test("manager wakes on TASKSPACE_LIST_FAILED instead of collapsing it into anoth
   assert.deepEqual(classifyProbeResult({ code: 0, result: "TASKSPACE_LIST_FAILED" }),
     { wake: true, streak: 0 });
 });
+
+// ---- #27 Batch 3 (ruling §四.1/.2): the probe owns the PEER_GENERATING
+// upgrade and the fail-closed ARMED_UNKNOWN catch-all; it never disarms. ----
+
+test("the probe resolves armedReason through the shared state machine on every healthy round", () => {
+  // The import exists...
+  assert.match(probeSource, /IN_FLIGHT_DISPATCH_STATUSES,\s*\n\s*armedReasonOnProbeRound,/);
+  // ...and the healthy-round writeState carries the resolution, not an invented value.
+  const write = probeSource.slice(
+    probeSource.indexOf("armedReason: armedReasonOnProbeRound(previous.armedReason"),
+    probeSource.indexOf("probeFailed: false,\n  backoffUntil: null,"));
+  assert.ok(write.length > 0 && write.length < 700, "healthy writeState armedReason slice");
+  assert.match(write, /generating: probe\.generating === true/);
+  assert.match(write, /dispatchInFlight: IN_FLIGHT_DISPATCH_STATUSES\.has\(dispatchResult\.record\?\.status \|\| ""\)/);
+  assert.doesNotMatch(write, /DISARMED_IDLE/);
+});
+
+test("a corrupt fast state lands in the ARMED_UNKNOWN catch-all, never a silent clean slate", () => {
+  const gate = probeSource.slice(
+    probeSource.indexOf("if (stateCorrupt) {"),
+    probeSource.indexOf('console.log("RESULT=STATE_CORRUPT")'));
+  assert.match(gate, /armedReason: "ARMED_UNKNOWN"/);
+  assert.match(gate, /probeFailed: true/);
+});
+
+test("the live probe mirrors the armedReason resolution and the corrupt-state catch-all", async () => {
+  const liveSource = await readFile(
+    fileURLToPath(new URL("../monitor/ego-fast-probe-live.mjs", import.meta.url)), "utf8");
+  assert.match(liveSource, /IN_FLIGHT_DISPATCH_STATUSES,\s*\n\s*armedReasonOnProbeRound,/);
+  const write = liveSource.slice(
+    liveSource.indexOf("armedReason: armedReasonOnProbeRound(previous.armedReason"),
+    liveSource.indexOf("probeFailed: false,\n  backoffUntil: null,"));
+  assert.ok(write.length > 0 && write.length < 700, "live healthy writeState armedReason slice");
+  assert.match(write, /dispatchInFlight: IN_FLIGHT_DISPATCH_STATUSES\.has\(dispatchResult\.record\?\.status \|\| ""\)/);
+  const corrupt = liveSource.slice(
+    liveSource.indexOf("if (stateCorrupt) {"),
+    liveSource.indexOf('console.log("RESULT=STATE_CORRUPT")'));
+  assert.match(corrupt, /armedReason: "ARMED_UNKNOWN"/);
+  // Neither probe variant ever writes a disarm claim itself.
+  assert.doesNotMatch(liveSource, /armedReason: "DISARMED_IDLE"/);
+  assert.doesNotMatch(probeSource, /armedReason: "DISARMED_IDLE"/);
+});

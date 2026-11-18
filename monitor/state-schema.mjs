@@ -116,6 +116,35 @@ export function armedReasonOnPeerGeneration(current, generating) {
   return current ?? null;
 }
 
+// #27 Batch 3 (ruling §四.2): a dispatch ledger status with delivery still
+// possible. Mirror of dispatch-state.mjs's private ACTIVE set, hosted here so
+// the probe's arm-state resolution and the manager's disarm criteria share one
+// definition (RELEASED is deliberately absent — the v2 validator never writes
+// it; P1-4 keeps the schema truth narrow).
+export const IN_FLIGHT_DISPATCH_STATUSES = new Set(["PREPARED", "SEND_STARTED", "ACCEPTED", "UNCERTAIN", "RETRY_AUTHORIZED"]);
+
+// #27 Batch 3 (ruling §四.1/.2): the probe-side armed-reason resolution for a
+// healthy round. Frozen rules:
+//   DISPATCH_ACCEPTED / ARMED_UNKNOWN -> PEER_GENERATING only on an OBSERVED
+//     generation (peer confirmation); otherwise the current state holds.
+//   PEER_GENERATING stays (a later non-generating round does not disarm —
+//     disarm is manager-owned).
+//   DISARMED_IDLE is never upgraded by a stray probe round (no unproven
+//     re-arm inference; the forbidden "disarmed but generating" window stays
+//     visible to the wake-guard instead of being rewritten away).
+//   null (legacy ledger without arm fields) stays null in legacy mode — no
+//     arm/disarm inference (ruling §四.1) — EXCEPT the fail-closed catch-all:
+//     an in-flight dispatch ledger with a missing arm field is exactly the
+//     "状态缺失" case, so it lands in ARMED_UNKNOWN (armed, never auto-disarmed).
+export function armedReasonOnProbeRound(current, { generating = false, dispatchInFlight = false } = {}) {
+  if (current === "DISPATCH_ACCEPTED" || current === "ARMED_UNKNOWN") {
+    return generating ? "PEER_GENERATING" : current;
+  }
+  if (current === "PEER_GENERATING") return current;
+  if (current === "DISARMED_IDLE") return current;
+  return dispatchInFlight ? "ARMED_UNKNOWN" : null;
+}
+
 // Disk-state classifier for readers that must tolerate a ledger written by
 // the previous schema: "current" (valid v4) / "legacy" (valid v3 without the
 // arm fields — legacy mode, no arm information) / "corrupt" (everything else,
