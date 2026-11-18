@@ -1,7 +1,10 @@
 // One schema and one normalizer for every probe outcome.
 import { createHash } from "node:crypto";
 
-export const FAST_STATE_SCHEMA = "ego-fast-state/v3";
+export const FAST_STATE_SCHEMA = "ego-fast-state/v4";
+// #27 Batch 3: the previous schema remains readable as legacy (arm fields
+// default to null there — legacy mode, no disarm inference, ruling §四.1).
+export const FAST_STATE_LEGACY_SCHEMA = "ego-fast-state/v3";
 
 export const FAST_STATE_DEFAULTS = Object.freeze({
   schema: FAST_STATE_SCHEMA,
@@ -40,7 +43,88 @@ export const FAST_STATE_DEFAULTS = Object.freeze({
   recoveryFailed: false,
   errorName: null,
   errorCode: null,
+  // #27 Batch 3 (ruling §四.1): frozen four-state arm machine. Frozen states:
+  // DISPATCH_ACCEPTED (armed-running) / PEER_GENERATING (running) /
+  // DISARMED_IDLE (disarmed-stopped) / ARMED_UNKNOWN (keep-running catch-all —
+  // missing/corrupt/conflicting/unconfirmable state lands here, never
+  // auto-disarmed). null = legacy ledger without the field: runs in legacy
+  // mode, no disarm may ever be inferred from it.
+  armedReason: null,
+  armedAt: null,
+  armedConversation: null,
+  armedSpace: null,
 });
+
+// The four frozen arm states (ruling §四.1). ARMED_UNKNOWN is fail-closed.
+export const ARMED_REASONS = new Set(["DISPATCH_ACCEPTED", "PEER_GENERATING", "DISARMED_IDLE", "ARMED_UNKNOWN"]);
+
+// Legal armed_reason transitions (null = "no field yet": legacy ledger or a
+// fresh file). Frozen matrix:
+//   null              -> DISPATCH_ACCEPTED | ARMED_UNKNOWN
+//     (legacy mode: a ledger without arm fields is never auto-armed to
+//      PEER_GENERATING and never auto-disarmed — ruling §四.1)
+//   DISPATCH_ACCEPTED -> DISPATCH_ACCEPTED | PEER_GENERATING | DISARMED_IDLE | ARMED_UNKNOWN
+//   PEER_GENERATING   -> PEER_GENERATING | DISPATCH_ACCEPTED | DISARMED_IDLE | ARMED_UNKNOWN
+//   DISARMED_IDLE     -> DISARMED_IDLE | DISPATCH_ACCEPTED | ARMED_UNKNOWN
+//     (re-arm on a new dispatch goes through DISPATCH_ACCEPTED; a "peer
+//      generating" claim straight out of idle would be unproven inference)
+//   ARMED_UNKNOWN     -> ARMED_UNKNOWN | DISPATCH_ACCEPTED | PEER_GENERATING | DISARMED_IDLE
+//     (recovery: only an explicit confirmation may move UNKNOWN anywhere)
+const ARMED_TRANSITIONS = new Map([
+  [null, new Set(["DISPATCH_ACCEPTED", "ARMED_UNKNOWN"])],
+  ["DISPATCH_ACCEPTED", new Set(["DISPATCH_ACCEPTED", "PEER_GENERATING", "DISARMED_IDLE", "ARMED_UNKNOWN"])],
+  ["PEER_GENERATING", new Set(["PEER_GENERATING", "DISPATCH_ACCEPTED", "DISARMED_IDLE", "ARMED_UNKNOWN"])],
+  ["DISARMED_IDLE", new Set(["DISARMED_IDLE", "DISPATCH_ACCEPTED", "ARMED_UNKNOWN"])],
+  ["ARMED_UNKNOWN", new Set(["ARMED_UNKNOWN", "DISPATCH_ACCEPTED", "PEER_GENERATING", "DISARMED_IDLE"])],
+]);
+
+export function canTransitionArmedReason(from, to) {
+  if (!ARMED_REASONS.has(to)) return false;
+  const current = ARMED_REASONS.has(from) ? from : null;
+  return ARMED_TRANSITIONS.get(current).has(to);
+}
+
+// Pure transition patch factory shared by the manager's setArmedState() and
+// the probe's generation upgrade. Returns { ok, patch } — ok=false for an
+// illegal transition (callers decide: the manager throws, the probe coerces
+// the state to ARMED_UNKNOWN instead of applying anything).
+export function armedTransitionPatch(current, next, { conversation = null, space = null, timestamp = null } = {}) {
+  if (!canTransitionArmedReason(current, next)) return { ok: false, patch: null };
+  return {
+    ok: true,
+    patch: {
+      armedReason: next,
+      armedAt: timestamp ?? Date.now(),
+      armedConversation: conversation,
+      armedSpace: space,
+    },
+  };
+}
+
+// #27 Batch 3: the peer-confirmed generation upgrade (ruling §四.2 "对端确认
+// 生成后升 PEER_GENERATING"). Only an observed generation upgrades; a legacy
+// null stays null (no inference) and DISARMED_IDLE is never upgraded by a
+// stray probe. ARMED_UNKNOWN may be recovered by a positive confirmation.
+export function armedReasonOnPeerGeneration(current, generating) {
+  if (generating !== true) return current ?? null;
+  if (current === "DISPATCH_ACCEPTED" || current === "ARMED_UNKNOWN") return "PEER_GENERATING";
+  return current ?? null;
+}
+
+// Disk-state classifier for readers that must tolerate a ledger written by
+// the previous schema: "current" (valid v4) / "legacy" (valid v3 without the
+// arm fields — legacy mode, no arm information) / "corrupt" (everything else,
+// fail-closed).
+export function classifyFastStateFile(value) {
+  if (validateFastState(value)) return "current";
+  if (value && typeof value === "object" && !Array.isArray(value) && value.schema === FAST_STATE_LEGACY_SCHEMA) {
+    try {
+      const migrated = normalizeFastState(value, {}, Number.isFinite(value.ts) ? value.ts : 0);
+      if (validateFastState(migrated)) return "legacy";
+    } catch { /* fall through to corrupt */ }
+  }
+  return "corrupt";
+}
 
 const ARRAY_FIELDS = new Set(["buttonLabels", "activityMarkers"]);
 const BOOL_FIELDS = new Set([
@@ -80,6 +164,15 @@ export function normalizeFastState(previous = {}, patch = {}, timestamp = Date.n
   for (const key of ["pageLabel", "generationKey", "lastMessageRole", "lastMessageKey", "dispatchId", "errorName", "errorCode"]) {
     if (merged[key] !== null && typeof merged[key] !== "string") merged[key] = null;
   }
+  // #27 Batch 3 arm fields: the reason is whitelist-coerced (anything outside
+  // the frozen four states — including foreign values from a hand-edited file
+  // — reads as legacy-null so no invented state is ever trusted), armedAt is a
+  // nullable non-negative number, anchors are nullable strings.
+  if (merged.armedReason !== null && !ARMED_REASONS.has(merged.armedReason)) merged.armedReason = null;
+  if (merged.armedAt !== null && (!Number.isFinite(merged.armedAt) || merged.armedAt < 0)) merged.armedAt = null;
+  for (const key of ["armedConversation", "armedSpace"]) {
+    if (merged[key] !== null && typeof merged[key] !== "string") merged[key] = null;
+  }
   if (merged.spaceId !== null && typeof merged.spaceId !== "string" &&
       !(typeof merged.spaceId === "number" && Number.isFinite(merged.spaceId))) merged.spaceId = null;
   if (merged.composerEmpty !== null && typeof merged.composerEmpty !== "boolean") merged.composerEmpty = null;
@@ -109,10 +202,14 @@ export function validateFastState(value) {
   if (value.backoffUntil !== null && (!Number.isFinite(value.backoffUntil) || value.backoffUntil < 0)) return false;
   if (value.lastProgressAt !== null && (!Number.isFinite(value.lastProgressAt) || value.lastProgressAt < 0)) return false;
   if (value.lastGotoAt !== null && (!Number.isFinite(value.lastGotoAt) || value.lastGotoAt < 0)) return false;
-  const nullableStrings = ["pageLabel", "generationKey", "lastMessageRole", "lastMessageKey", "dispatchId", "errorName", "errorCode"];
+  const nullableStrings = ["pageLabel", "generationKey", "lastMessageRole", "lastMessageKey", "dispatchId", "errorName", "errorCode",
+    "armedConversation", "armedSpace"];
   for (const key of nullableStrings) {
     if (value[key] !== null && typeof value[key] !== "string") return false;
   }
+  // #27 Batch 3 arm fields (frozen four-state machine, ruling §四.1).
+  if (value.armedReason !== null && !ARMED_REASONS.has(value.armedReason)) return false;
+  if (value.armedAt !== null && (!Number.isFinite(value.armedAt) || value.armedAt < 0)) return false;
   if (value.spaceId !== null && !(typeof value.spaceId === "string" ||
       (typeof value.spaceId === "number" && Number.isFinite(value.spaceId)))) return false;
   if (value.composerEmpty !== null && typeof value.composerEmpty !== "boolean") return false;

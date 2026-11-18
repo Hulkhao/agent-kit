@@ -2,7 +2,7 @@
 import { appendFile, readFile, rename, writeFile } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
-import { spacePhaseMs, stormBackoffDeadline, validateFastState } from "./state-schema.mjs";
+import { spacePhaseMs, stormBackoffDeadline, classifyFastStateFile } from "./state-schema.mjs";
 import { verifiedReply } from "./reply-delivery.mjs";
 
 const ACTIVE = new Set(["PREPARED", "SEND_STARTED", "ACCEPTED", "UNCERTAIN", "RETRY_AUTHORIZED"]);
@@ -22,7 +22,10 @@ async function readJson(path) {
 export async function dispatchStormGate(dir, timestamp = Date.now()) {
   const state = await readJson(`${dir}/a-fast-state.json`);
   if (state === null) return null;
-  if (!validateFastState(state)) throw new Error("FAST_STATE_INVALID");
+  // #27 Batch 3: a legacy v3 ledger (pre arm fields) still carries the storm
+  // fields this gate reads — legacy mode, not corruption. Anything else that
+  // fails the schema stays fail-closed.
+  if (classifyFastStateFile(state) === "corrupt") throw new Error("FAST_STATE_INVALID");
   if ((state.backoffUntil !== null && state.backoffUntil > timestamp) ||
       state.errorCode === "CHAT_SURFACE_STRUCTURALLY_UNAVAILABLE") {
     return "STORM_BACKOFF_PENDING";
