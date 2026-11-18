@@ -516,15 +516,27 @@ try {
     for (let poll = 0; poll < 8 && !menuInfo; poll++) {
       await page.waitForTimeout(800);
       menuInfo = await page.evaluate(() => {
-        const menus = [...document.querySelectorAll("[data-radix-popper-content-wrapper], [role='menu'], [role='dialog']")];
-        for (const m of menus) {
+        // 2026-11-19 field evidence (LEVEL_GATE_READBACK): hidden/stray radix
+        // wrappers (e.g. the sidebar sort popover with 分项目显示/合并显示
+        // radios) matched first and starved the real model menu — the gate
+        // then read an empty slider set and aborted a genuinely-High session.
+        // Match only VISIBLE wrappers and prefer the model menu's unique
+        // signature (an effort slider); pass criteria stay unchanged.
+        const isVisible = (el) => {
+          const s = getComputedStyle(el);
+          if (s.display === "none" || s.visibility === "hidden") return false;
+          return el.getClientRects().length > 0;
+        };
+        const candidates = [];
+        for (const m of document.querySelectorAll("[data-radix-popper-content-wrapper], [role='menu'], [role='dialog']")) {
+          if (!isVisible(m)) continue;
           const radios = [...m.querySelectorAll("[role='menuitemradio']")].map((el) => ({ label: (el.textContent || "").trim().slice(0, 30), checked: el.getAttribute("aria-checked") }));
-          if (radios.length) return {
-            radios,
-            sliders: [...m.querySelectorAll("[role='slider']")].map((el) => ({ now: el.getAttribute("aria-valuenow"), max: el.getAttribute("aria-valuemax") })),
-          };
+          if (!radios.length) continue;
+          const sliders = [...m.querySelectorAll("[role='slider']")].map((el) => ({ now: el.getAttribute("aria-valuenow"), max: el.getAttribute("aria-valuemax") }));
+          candidates.push({ radios, sliders, hasSlider: sliders.length > 0 });
         }
-        return null;
+        const picked = candidates.find((c) => c.hasSlider) || candidates[0] || null;
+        return picked ? { radios: picked.radios, sliders: picked.sliders } : null;
       });
     }
   }
