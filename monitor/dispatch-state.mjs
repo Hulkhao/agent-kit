@@ -1,8 +1,9 @@
 // Durable dispatch ledger. Never stores prompt/response text or virtualized turn counts.
 import { appendFile, open, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import { readFileSync } from "node:fs";
+import { basename, dirname } from "node:path";
 import { createHash, randomUUID } from "node:crypto";
-import { spacePhaseMs, stormBackoffDeadline, classifyFastStateFile, ARMED_REASONS } from "./state-schema.mjs";
+import { spacePhaseMs, stormBackoffDeadline, classifyFastStateFile, normalizeFastState, armedTransitionPatch, ARMED_REASONS } from "./state-schema.mjs";
 import { verifiedReply } from "./reply-delivery.mjs";
 
 const ACTIVE = new Set(["PREPARED", "SEND_STARTED", "ACCEPTED", "UNCERTAIN", "RETRY_AUTHORIZED"]);
@@ -46,22 +47,27 @@ export async function writeJsonAtomic(path, value) {
 }
 
 // ---- #27 Batch 3 P1-C round 5 (planner ruling reply 325e2917): the
-// per-conversation serialized commit lock ----
+// serialized commit lock; round 6 (reply 365689e8): holder ownership ----
 //
-// One exclusive-create lockfile per conversation directory serializes every
-// writer of dispatch-identity-relevant state, closing the TOCTOU window the
-// round-4 ruling identified between disarmAfterRelease's one-shot identity
-// check and its final DISARMED_IDLE write. Participants (all writers of
-// arm-relevant state):
+// One exclusive-create lockfile serializes every writer of dispatch-identity-
+// relevant state, closing the TOCTOU window the round-4 ruling identified
+// between disarmAfterRelease's one-shot identity check and its final
+// DISARMED_IDLE write. Round 6 (P1-C-3) moved the lock file to the MONITOR
+// ROOT scope (commitLockScopeOf), so two different conversations — and the
+// disarm commit's GLOBAL otherInFlight===0 criterion — share one coordination
+// domain instead of one lock per conversation directory. Participants (all
+// writers of arm-relevant state):
 //   armForDispatch      — the whole arm write section (dispatch-manager.mjs);
 //   prepareDispatch     — the PREPARED ledger establishment below (ruling
 //                         requirement 1: arm and PREPARED establishment share
 //                         ONE coordination mechanism);
 //   disarmAfterRelease  — the final commit section (fresh ledger identity +
-//                         fresh armed-instance check + DISARMED_IDLE write in
-//                         ONE critical section, ruling requirement 2);
+//                         fresh armed-instance check + global in-flight
+//                         re-scan + DISARMED_IDLE write in ONE critical
+//                         section, ruling requirements 2+3);
 //   retryPendingDisarm  — converges through disarmAfterRelease, so it gets the
-//                         same commit protection (ruling requirement 3).
+//                         same commit protection (ruling requirement 3);
+//   the archived-PREPARED recovery write in dispatch-manager main().
 // Why "read the ledger once more before writeJsonAtomic" is NOT enough: that
 // extra read and the write are still two unrelated file operations — a
 // concurrent arm can commit between them. Under the lock, the identity
@@ -75,16 +81,36 @@ export async function writeJsonAtomic(path, value) {
 // commit stays armed, prepareDispatch aborts before any delivery. Error codes:
 //   COMMIT_LOCK_TIMEOUT — the bounded wait expired while the current holder
 //     still looks alive (lock file present, not provably stale);
-//   COMMIT_LOCK_STALE   — a stale lock was detected but could not be removed.
+//   COMMIT_LOCK_STALE   — a stale lock was detected but could not be removed;
+//   COMMIT_LOCK_LOST    — the holder's ownership guard found the lock file
+//     gone or held by a DIFFERENT holderId: this holder was displaced
+//     mid-section and must not write (P1-C-1 ruling requirement 3).
 //
-// Stale-lock policy (holder crashed while holding the lock): bounded and
-// evidence-based. A contender waits COMMIT_LOCK_WAIT_MS; at expiry the lock is
-// stolen by ATOMIC RENAME (moving the lockfile to a unique sibling name —
-// exactly one contender can win the move, the losers observe ENOENT and
-// re-contend) — but only when the lock is provably abandoned: its recorded
-// acquiredAt (or, for a zero-byte file from a crash between create and write,
-// its mtime) is older than COMMIT_LOCK_STALE_MS. The stolen file is deleted
-// best-effort; a leftover after a mid-steal crash is inert junk, never a lock.
+// Holder ownership (round 6, P1-C-1): every claim carries a random holderId.
+//   acquire — exclusive create + claim write { schema, acquiredAt, holderId };
+//   steal   — a contender whose bounded wait expired may steal a lock ONLY
+//     when the claim is provably abandoned: its recorded acquiredAt (or, for a
+//     zero-byte file from a crash between create and write, its mtime) is
+//     older than COMMIT_LOCK_STALE_MS. The steal is an ATOMIC RENAME to a
+//     unique sibling name — exactly one contender can win the move — and the
+//     winner VERIFIES the moved file is still the stale claim it judged
+//     (same acquiredAt + holderId). A mismatch means the contender renamed a
+//     DIFFERENT, fresher claim between its judgment and its move: the fresher
+//     claim is restored verbatim by an atomic rename back (its holder's own
+//     guard stays authoritative) and the loser re-contends instead of taking
+//     the new lock (P1-C-1 requirement 2). Evidence boundary (named by the
+//     ruling): file age proves the claim is old, NOT that its holder process
+//     is dead — a live holder displaced by a stale-based steal therefore
+//     detects the loss through its ownership guard and aborts fail-closed
+//     before any write, never through blind trust in the lock.
+//   guard   — task(guard): every participant re-verifies ownership
+//     (read claim → holderId === mine, else COMMIT_LOCK_LOST) IMMEDIATELY
+//     BEFORE its final state write, so a holder displaced mid-section can
+//     never co-commit with the new holder (P1-C-1 requirement 3).
+//   release — ownership-protected: read claim → holderId === mine → atomic
+//     rename to a unique retiring name → unlink THAT file (P1-C-1 requirement
+//     4). A foreign or vanished claim is never unlinked blindly, so a
+//     displaced holder cannot delete the new holder's lock.
 // Critical sections here are short pure file operations, so the defaults leave
 // a wide margin: live contention waits up to 10s, an abandoned lock is
 // recoverable after ~30s at the latest.
@@ -95,37 +121,79 @@ export const COMMIT_LOCK_STALE_MS = 30_000;
 const COMMIT_LOCK_POLL_MS = 25;
 export const COMMIT_LOCK_SCHEMA = "ego-commit-lock/v1";
 
-// The two fail-closed lock error codes; callers match on this prefix to wrap
+// P1-C-3 (round 6): the lock SCOPE is the monitor root — both managed
+// conversation layouts (<root>/conversations/<uuid> and
+// <root>/pending-new/<requestId>) resolve to <root>, so every arm, prepare,
+// disarm and retry on ANY conversation of the monitor root — plus the disarm
+// commit's global otherInFlight re-scan — serializes on ONE lock. Non-managed
+// (flat) directories stay self-scoped.
+export function commitLockScopeOf(conversationDir) {
+  const parent = dirname(conversationDir);
+  const base = basename(parent);
+  if (base === "conversations" || base === "pending-new") return dirname(parent);
+  return conversationDir;
+}
+
+// The fail-closed lock error codes; callers match on this prefix to wrap
 // the primitive failure into their own site-specific code (ARM_…/DISARM_…).
 export function isCommitLockError(error) {
   return String(error?.message || "").startsWith("COMMIT_LOCK_");
 }
 
-// Age of the current holder's claim in ms, or null when unprovable (missing,
-// unreadable). Primary evidence: the acquiredAt written into the lock file;
-// fallback for a zero-byte/corrupt lock file (a crash between exclusive create
-// and content write): the file mtime. An unprovable age is never treated as
-// stale — fail-closed, the contender times out instead of stealing blindly.
-async function commitLockAgeMs(lockPath, now) {
-  let acquiredAt = null;
+// The current holder's claim, or null when the file is missing. readable=false
+// marks a zero-byte/corrupt lock file (a crash between exclusive create and
+// content write, or a structurally invalid claim): its age falls back to the
+// file mtime, and an unprovable age is never treated as stale — fail-closed,
+// the contender times out instead of stealing blindly.
+const parseCommitLockClaim = (raw) =>
+  (raw && typeof raw === "object" && !Array.isArray(raw) &&
+    raw.schema === COMMIT_LOCK_SCHEMA && Number.isFinite(raw.acquiredAt))
+    ? { acquiredAt: raw.acquiredAt, holderId: raw.holderId ?? null, readable: true }
+    : null;
+
+async function readCommitLockClaim(lockPath) {
   try {
-    const raw = JSON.parse(await readFile(lockPath, "utf8"));
-    if (raw?.schema === COMMIT_LOCK_SCHEMA && Number.isFinite(raw.acquiredAt)) acquiredAt = raw.acquiredAt;
-  } catch (error) {
-    if (error?.code !== "ENOENT") acquiredAt = null;
-  }
-  if (acquiredAt === null) {
-    try {
-      const info = await stat(lockPath);
-      acquiredAt = info.mtimeMs;
-    } catch { return null; }
-  }
-  return Number.isFinite(acquiredAt) ? now() - acquiredAt : null;
+    const claim = parseCommitLockClaim(JSON.parse(await readFile(lockPath, "utf8")));
+    if (claim) return claim;
+  } catch { /* fall through to the mtime fallback */ }
+  try {
+    const info = await stat(lockPath);
+    return { acquiredAt: info.mtimeMs, holderId: null, readable: false };
+  } catch { return null; }
+}
+
+// Ownership-protected release (P1-C-1 requirement 4): only a claim that still
+// reads as OURS is removed, and it is removed through an atomic rename to a
+// unique name followed by the unlink of THAT name — a concurrent steal can
+// never make this delete a lock this holder did not verify as its own.
+async function releaseOwnedCommitLock(lockPath, holderId) {
+  let claim = null;
+  try { claim = JSON.parse(await readFile(lockPath, "utf8")); }
+  catch { return; } // gone or unreadable: nothing of ours is there to remove
+  if (claim?.schema !== COMMIT_LOCK_SCHEMA || claim.holderId !== holderId) return;
+  const retiring = lockPath + ".retiring-" + randomUUID();
+  try {
+    await rename(lockPath, retiring);
+    await unlink(retiring).catch(() => {});
+  } catch { /* a contender renamed it away first: nothing of ours left to remove */ }
 }
 
 export async function withCommitLock(dir, task, { waitMs = COMMIT_LOCK_WAIT_MS, staleMs = COMMIT_LOCK_STALE_MS, now = Date.now } = {}) {
   const lockPath = `${dir}/${COMMIT_LOCK_FILE}`;
+  const holderId = randomUUID();
   const deadline = now() + waitMs;
+  // Ownership guard (P1-C-1 requirement 3): handed to the task, which calls it
+  // immediately before its final state write. A holder displaced mid-section
+  // (its claim renamed away, or the path now holding a foreign claim) throws
+  // COMMIT_LOCK_LOST here and writes nothing — fail-closed.
+  const guard = async () => {
+    let claim = null;
+    try { claim = JSON.parse(await readFile(lockPath, "utf8")); }
+    catch { throw new Error("COMMIT_LOCK_LOST"); }
+    if (claim?.schema !== COMMIT_LOCK_SCHEMA || claim.holderId !== holderId) {
+      throw new Error("COMMIT_LOCK_LOST");
+    }
+  };
   for (;;) {
     // Only the lock ACQUISITION is tried against contention here. The task
     // itself runs OUTSIDE this catch: a task failure (e.g. the ledger's own
@@ -137,36 +205,58 @@ export async function withCommitLock(dir, task, { waitMs = COMMIT_LOCK_WAIT_MS, 
     } catch (error) {
       if (error.code !== "EEXIST") throw error; // e.g. ENOENT: the dir itself is broken
       if (now() >= deadline) {
-        const age = await commitLockAgeMs(lockPath, now);
-        if (age === null) throw new Error("COMMIT_LOCK_TIMEOUT");
-        if (age > staleMs) {
-          // Atomic steal: exactly one contender wins the rename; the losers get
-          // ENOENT and immediately re-contend on the exclusive create.
-          const stolen = lockPath + ".stolen-" + randomUUID();
-          try {
-            await rename(lockPath, stolen);
-          } catch (stealError) {
-            if (stealError.code === "ENOENT") continue; // another contender stole it first
-            throw new Error("COMMIT_LOCK_STALE");
-          }
-          await unlink(stolen).catch(() => {});
-          continue;
+        const judged = await readCommitLockClaim(lockPath);
+        if (judged === null || !(now() - judged.acquiredAt > staleMs)) {
+          throw new Error("COMMIT_LOCK_TIMEOUT");
         }
-        throw new Error("COMMIT_LOCK_TIMEOUT");
+        // Atomic steal: exactly one contender wins the rename; the losers get
+        // ENOENT and immediately re-contend on the exclusive create.
+        const stolen = lockPath + ".stolen-" + randomUUID();
+        try {
+          await rename(lockPath, stolen);
+        } catch (stealError) {
+          if (stealError.code === "ENOENT") continue; // another contender stole it first
+          throw new Error("COMMIT_LOCK_STALE");
+        }
+        // Verify the moved file is STILL the stale claim this contender judged
+        // (P1-C-1 requirement 2: a contender must never take away a fresher
+        // claim that another contender created in the meantime).
+        let stolenClaim = null;
+        try {
+          stolenClaim = parseCommitLockClaim(JSON.parse(await readFile(stolen, "utf8")));
+        } catch { stolenClaim = null; }
+        const sameStaleClaim = judged.readable
+          ? stolenClaim !== null && stolenClaim.acquiredAt === judged.acquiredAt &&
+            stolenClaim.holderId === judged.holderId
+          : stolenClaim === null; // unreadable claim stays unreadable = same file
+        if (sameStaleClaim) {
+          await unlink(stolen).catch(() => {});
+          continue; // lockPath is free now; the next turn claims it exclusively
+        }
+        // The renamed claim was NOT the stale one — restore it verbatim by
+        // atomic rename (no absence window for a third contender to slip a
+        // foreign claim into) and re-contend without touching the new lock.
+        try {
+          await rename(stolen, lockPath);
+        } catch (restoreError) {
+          await unlink(stolen).catch(() => {});
+          if (restoreError.code !== "ENOENT") throw new Error("COMMIT_LOCK_STALE");
+        }
+        continue;
       }
       await new Promise((resolve) => setTimeout(resolve, COMMIT_LOCK_POLL_MS));
       continue;
     }
     try {
       await handle.writeFile(JSON.stringify({
-        schema: COMMIT_LOCK_SCHEMA, acquiredAt: now(),
+        schema: COMMIT_LOCK_SCHEMA, acquiredAt: now(), holderId,
       }), "utf8");
     } finally { await handle.close(); }
-    // Critical section. The release (unlink) runs even when the task throws,
-    // so an in-process failure never orphans the lock — only a process crash
-    // does, and that is what the stale policy recovers from.
-    try { return await task(); }
-    finally { await unlink(lockPath).catch(() => {}); }
+    // Critical section. The ownership-protected release runs even when the
+    // task throws, so an in-process failure never orphans the lock — only a
+    // process crash does, and that is what the stale policy recovers from.
+    try { return await task(guard); }
+    finally { await releaseOwnedCommitLock(lockPath, holderId); }
   }
 }
 
@@ -323,17 +413,63 @@ export async function prepareDispatch({ monitorDir, conversationUuid, taskSpace,
   if (surface.generating) throw new Error("PREVIOUS_GENERATION_STILL_ACTIVE");
   if (surface.lastMessageRole === "user") throw new Error("PREVIOUS_USER_TURN_UNRESOLVED");
   // #27 Batch 3 P1-C round 5 (ruling requirement 1): the PREPARED ledger
-  // establishment participates in the SAME per-conversation commit lock as the
-  // arm write section and the disarm commit. The browser surface reads above
-  // deliberately stay OUTSIDE the lock (never hold the commit lock across
-  // browser work); the ACTIVE re-check below is re-run INSIDE the lock so two
-  // concurrent sends on one conversation can no longer both pass it and race
-  // their PREPARED writes. Fail-closed: an unavailable lock aborts the prepare
-  // (the template then aborts before any fill or delivery).
-  return withCommitLock(monitorDir, async () => {
+  // establishment participates in the SAME commit lock as the arm write
+  // section and the disarm commit; round 6 (P1-C-3) promoted that lock to the
+  // MONITOR ROOT scope so cross-conversation disarm coordination shares one
+  // domain. The browser surface reads above deliberately stay OUTSIDE the
+  // lock (never hold the commit lock across browser work); the ACTIVE
+  // re-check below is re-run INSIDE the lock so two concurrent sends on one
+  // conversation can no longer both pass it and race their PREPARED writes.
+  // Fail-closed: an unavailable lock aborts the prepare (the template then
+  // aborts before any fill or delivery).
+  return withCommitLock(commitLockScopeOf(monitorDir), async (guard) => {
     const inLock = await readDispatchState(monitorDir);
     if (inLock && ACTIVE.has(inLock.status)) {
       throw new Error(`ACTIVE_DISPATCH_BLOCKS_SEND:${inLock.dispatchId}:${inLock.status}`);
+    }
+    // #27 Batch 3 P1-C round 6 (P1-C-2): armed-state consistency at PREPARED
+    // establishment. The ruling's arm→PREPARED gap: an old dispatch A whose
+    // ledger was still ACTIVE when the new dispatch B armed could complete,
+    // and its disarm commit — seeing no supersession stamp — could legally
+    // write DISARMED_IDLE over B's arm before B's prepareDispatch ran, leaving
+    // a PREPARED ledger behind a disarmed fast state. Under the lock the
+    // sequence is serialized, but the DISARMED_IDLE write itself stays legal
+    // whenever B's arm did not stamp the ACTIVE instance (default arm — the
+    // frozen send template aborts on any in-flight ledger, so an undeclared
+    // arm over an ACTIVE ledger never delivers and must never poison A's own
+    // disarm with a self-blocking stamp). The invariant that must hold at
+    // delivery time is therefore enforced HERE, where the PREPARED ledger is
+    // established: a fast state still reading DISARMED_IDLE is re-armed to
+    // DISPATCH_ACCEPTED (the frozen matrix's legal re-arm transition) in the
+    // SAME critical section before the ledger write — 布防先于投递 holds for
+    // every PREPARED ledger that reaches the fill stage. Missing fast state
+    // (arm never ran) is left alone; an unreadable one aborts the prepare
+    // fail-closed.
+    const fastStatePath = `${monitorDir}/a-fast-state.json`;
+    let fastRaw = null;
+    try { fastRaw = JSON.parse(await readFile(fastStatePath, "utf8")); }
+    catch (error) {
+      if (error?.code !== "ENOENT") throw error; // unreadable armed evidence: abort, never deliver unproven
+    }
+    if (fastRaw !== null) {
+      const classification = classifyFastStateFile(fastRaw);
+      if ((classification === "current" || classification === "legacy") &&
+          fastRaw.armedReason === "DISARMED_IDLE") {
+        const rearm = armedTransitionPatch("DISARMED_IDLE", "DISPATCH_ACCEPTED", {
+          conversation: conversationUuid, space: taskSpace, timestamp: Date.now(),
+        });
+        if (rearm.ok) {
+          // P1-C-1 (round 6): the re-arm write is ownership-guarded just like
+          // the ledger write below — every commit-section state write
+          // re-verifies the holder immediately before touching disk.
+          await guard();
+          await writeJsonAtomic(fastStatePath, normalizeFastState(fastRaw, rearm.patch, Date.now()));
+          await appendEvent(monitorDir, "ARMED_DISPATCH_ACCEPTED", {
+            source: "PREPARED_REARM", conversation: conversationUuid, space: taskSpace,
+            previousReason: "DISARMED_IDLE",
+          });
+        }
+      }
     }
 
     // R2.5 ledger contract: store the content fingerprint and byte length, never the payload text.
@@ -361,6 +497,10 @@ export async function prepareDispatch({ monitorDir, conversationUuid, taskSpace,
       attempt: 1,
       createdAt: Date.now(),
     };
+    // P1-C-1 (round 6): ownership re-verification immediately before the
+    // ledger write — a holder displaced mid-section aborts (COMMIT_LOCK_LOST)
+    // instead of co-committing with the new holder.
+    await guard();
     await writeJsonAtomic(fileOf(monitorDir), record);
     await appendEvent(monitorDir, "DISPATCH_PREPARED", {
       dispatchId: record.dispatchId,

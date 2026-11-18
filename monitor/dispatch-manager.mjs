@@ -9,7 +9,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { tick, acknowledge } from "./supervision-watchdog.mjs";
-import { readDispatchState, markCompleted, writeJsonAtomic, validateDispatchRecord, evaluateDisarmEligibility, appendEvent, withCommitLock, isCommitLockError } from "./dispatch-state.mjs";
+import { readDispatchState, markCompleted, writeJsonAtomic, validateDispatchRecord, evaluateDisarmEligibility, appendEvent, withCommitLock, commitLockScopeOf, isCommitLockError } from "./dispatch-state.mjs";
 import { ARMED_REASONS, IN_FLIGHT_DISPATCH_STATUSES, armedTransitionPatch, classifyFastStateFile, normalizeFastState } from "./state-schema.mjs";
 import { verifiedReply, acknowledgeReply, verifiedConsumption, sha256 } from "./reply-delivery.mjs";
 import { withAgentRegistry } from "./agent-space.mjs";
@@ -759,22 +759,37 @@ async function archiveCorruptFastState(dir, timestamp = Date.now()) {
 // clause forbids inferring DISARM, not recording an explicit new arm).
 //
 // P1-C round 5 (ruling requirements 1+4): the whole arm write section runs
-// under the per-conversation commit lock (withCommitLock, dispatch-state.mjs)
-// — the same coordination mechanism prepareDispatch's PREPARED ledger
-// establishment and disarmAfterRelease's final commit use. Fail-closed: an
-// unavailable lock aborts the arm BEFORE any state write, so main() never
-// reaches the delivery template (ARM_COMMIT_LOCK_FAILED, exit 2, nothing sent).
+// under the serialized commit lock (withCommitLock, dispatch-state.mjs) — the
+// same coordination mechanism prepareDispatch's PREPARED ledger establishment
+// and disarmAfterRelease's final commit use; round 6 (P1-C-3) promoted the
+// lock to the MONITOR ROOT scope (commitLockScopeOf), so arms on different
+// conversations of one monitor root serialize against the disarm commit's
+// global in-flight criterion. Fail-closed: an unavailable lock aborts the arm
+// BEFORE any state write, so main() never reaches the delivery template
+// (ARM_COMMIT_LOCK_FAILED, exit 2, nothing sent).
 // The arm also stamps armedSupersededDispatchId with the dispatchId of the
 // TERMINAL ledger observed at arm time (dispatch-manager's route-(a) instance
 // mark): the disarm commit of THAT instance reads the stamp fresh under the
 // lock and refuses when a newer dispatch armed over it in the identity-check →
-// write window. An ACTIVE ledger (e.g. a PREPARED resume) stamps nothing —
-// that dispatch's own later disarm must never be blocked by its own re-arm —
-// and an unreadable ledger stamps nothing (the disarm commit's own in-lock
-// ledger re-read stays fail-closed for that case).
-export async function armForDispatch(dir, { conversationUuid = null, space = null, timestamp = Date.now(), commitLock = null } = {}) {
+// write window. Round 6 (P1-C-2): the arm may ALSO stamp an ACTIVE (in-flight)
+// ledger instance — but only when the caller explicitly declares
+// `supersedesActiveInstance` (a new dispatch that WILL replace that instance
+// once it reaches terminal state). The default stays stamp-null for ACTIVE
+// ledgers, and deliberately so: an undeclared arm over an in-flight ledger is
+// exactly the frozen template's abort/resume flows (DISPATCH_IN_FLIGHT_* /
+// same-payload PREPARED resume / recover-draft) — stamping those would poison
+// the in-flight instance's own later disarm with a permanent
+// DISARM_ARMED_INSTANCE_SUPERSEDED blocker (the self-re-arm trap the ruling
+// names). A declared superseding arm over an ACTIVE ledger closes the ruling's
+// remaining interleave: A (ACTIVE) → B arms (declared) → A completes → A's
+// disarm commit reads the stamp under the lock and refuses, so B's PREPARED
+// establishment can never land behind A's DISARMED_IDLE. The consistency
+// repair in prepareDispatch (dispatch-state.mjs) covers the undeclared path.
+// An unreadable ledger stamps nothing (the disarm commit's own in-lock ledger
+// re-read stays fail-closed for that case).
+export async function armForDispatch(dir, { conversationUuid = null, space = null, timestamp = Date.now(), commitLock = null, supersedesActiveInstance = false } = {}) {
   try {
-    return await withCommitLock(dir, async () => {
+    return await withCommitLock(commitLockScopeOf(dir), async (guard) => {
       // P1-C round 3: a new dispatch never inherits the previous round's release
       // success — any leftover companion credential is cleared BEFORE the new arm
       // state is written. A failed clear aborts the whole arm fail-closed (arming
@@ -784,14 +799,18 @@ export async function armForDispatch(dir, { conversationUuid = null, space = nul
       catch (error) {
         if (error.code !== "ENOENT") throw new Error("ARM_DISARM_CREDENTIAL_CLEAR_FAILED");
       }
-      // The supersession stamp (round 5): which terminal dispatch instance, if
-      // any, did this arm supersede? Read INSIDE the lock, same critical
-      // section as the fast-state write below.
+      // The supersession stamp (round 5 terminal, round 6 declared-ACTIVE):
+      // which dispatch instance, if any, did this arm supersede? Read INSIDE
+      // the lock, same critical section as the fast-state write below.
       let superseded = null;
       try {
         const ledger = await readDispatchState(dir);
-        if (ledger && (ledger.status === "COMPLETED" || ledger.status === "ABORTED")) {
-          superseded = ledger.dispatchId;
+        if (ledger) {
+          if (ledger.status === "COMPLETED" || ledger.status === "ABORTED") {
+            superseded = ledger.dispatchId;
+          } else if (supersedesActiveInstance && IN_FLIGHT_DISPATCH_STATUSES.has(ledger.status)) {
+            superseded = ledger.dispatchId;
+          }
         }
       } catch { /* unreadable ledger stamps nothing — fail-closed stays with the disarm commit */ }
       const { classification, value } = await readFastStateForDecision(dir);
@@ -823,6 +842,11 @@ export async function armForDispatch(dir, { conversationUuid = null, space = nul
           // structural failure — the storm gate included — keeps refusing.
           ? { ...armPatch, probeFailed: true, recoveryFailed: true, errorCode: "STATE_CORRUPT" }
           : armPatch, timestamp);
+      // P1-C-1 (round 6): ownership re-verification immediately before the
+      // fast-state write — a holder displaced mid-section aborts
+      // (COMMIT_LOCK_LOST → ARM_COMMIT_LOCK_FAILED, nothing armed, nothing
+      // delivered) instead of co-committing with the new holder.
+      await guard();
       await writeJsonAtomic(fastStateFileOf(dir), next);
       await appendEvent(dir, "ARMED_DISPATCH_ACCEPTED", {
         conversation: conversationUuid, space: space ?? null,
@@ -1027,6 +1051,40 @@ async function hasDeferredReleaseCredential(dir) {
   return credential.dispatchId;
 }
 
+// P1-C round 6 (P1-C-3): the GLOBAL in-flight scan shared by the advisory
+// pass and the serialized commit of disarmAfterRelease. Counts every sibling
+// dispatch ledger under <root>/conversations and <root>/pending-new (own
+// directory excluded) that cannot be proven terminal — unreadable or
+// structurally invalid ledgers count as in-flight (P1-4 conservative
+// default), and a lingering pending-new directory counts as in-flight
+// wholesale. `unreadable` flags a base directory that could not be listed
+// (a missing directory proves no sibling exists; any other read failure is
+// unconfirmable).
+async function countInFlightSiblings(root, ownDir) {
+  let count = 0;
+  let unreadable = false;
+  const scanBase = async (base, { missingCountsInFlight }) => {
+    let entries;
+    try { entries = await readdir(base, { withFileTypes: true }); }
+    catch (error) {
+      if (error?.code !== "ENOENT") unreadable = true;
+      return;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory() || join(base, entry.name) === ownDir) continue;
+      try {
+        const sibling = JSON.parse(await readFile(join(base, entry.name, "a-dispatch-state.json"), "utf8"));
+        if (!validateDispatchRecord(sibling) || IN_FLIGHT_DISPATCH_STATUSES.has(sibling.status)) count++;
+      } catch (error) {
+        if (error?.code !== "ENOENT" || missingCountsInFlight) count++;
+      }
+    }
+  };
+  await scanBase(join(root, "conversations"), { missingCountsInFlight: false });
+  await scanBase(join(root, "pending-new"), { missingCountsInFlight: true });
+  return { count, unreadable };
+}
+
 // Write DISARMED_IDLE for a conversation whose release just completed. All
 // ruling §四.2 criteria are gathered here and passed to the pure
 // evaluateDisarmEligibility(); any blocker (or any unreadable evidence —
@@ -1052,7 +1110,8 @@ async function hasDeferredReleaseCredential(dir) {
 //   acquire lock → re-read ledger → identity re-verification (expectedDispatchId)
 //   → re-read fast state → armed-instance re-verification
 //     (armedSupersededDispatchId, stamped by every coordinated arm) →
-//   transition check → write DISARMED_IDLE → release lock.
+//   global sibling in-flight re-scan (round 6, P1-C-3) → transition check →
+//   ownership guard (round 6, P1-C-1) → write DISARMED_IDLE → release lock.
 // A concurrent dispatch B that armed (and/or replaced the ledger) either did so
 // BEFORE the lock was taken — then the in-lock re-reads see B's stamp or B's
 // ledger and refuse — or must WAIT for the lock, and then re-arms over the
@@ -1129,29 +1188,20 @@ export async function disarmAfterRelease(dir, { rootMonitorDir = null, timestamp
   // scan also covers pending-new/ — a durable new-session request still
   // sitting there is an in-flight dispatch (a completed binding is renamed
   // into conversations/ by bindNewConversation, so a lingering directory
-  // means the allocation never finished).
-  let otherInFlight = 0;
-  const scanSiblingLedgers = async (base, { missingCountsInFlight }) => {
-    let entries;
-    try { entries = await readdir(base, { withFileTypes: true }); }
-    catch (error) {
-      // A missing directory proves no sibling dispatch exists; any other
-      // read failure is unconfirmable.
-      if (error?.code !== "ENOENT") blockers.push("SIBLING_LEDGERS_UNREADABLE");
-      return;
-    }
-    for (const entry of entries) {
-      if (!entry.isDirectory() || join(base, entry.name) === dir) continue;
-      try {
-        const sibling = JSON.parse(await readFile(join(base, entry.name, "a-dispatch-state.json"), "utf8"));
-        if (!validateDispatchRecord(sibling) || IN_FLIGHT_DISPATCH_STATUSES.has(sibling.status)) otherInFlight++;
-      } catch (error) {
-        if (error?.code !== "ENOENT" || missingCountsInFlight) otherInFlight++;
-      }
-    }
-  };
-  await scanSiblingLedgers(join(root, "conversations"), { missingCountsInFlight: false });
-  await scanSiblingLedgers(join(root, "pending-new"), { missingCountsInFlight: true });
+  // means the allocation never finished). Round 6 (P1-C-3): this advisory
+  // scan runs BEFORE the commit lock is taken, so the SAME scan is re-run
+  // INSIDE the serialized commit below (shared countInFlightSiblings helper)
+  // — the global otherInFlight===0 criterion is re-confirmed in the same
+  // critical section as the DISARMED_IDLE write, under the MONITOR-ROOT
+  // commit lock every sibling arm/prepare also serializes on. A sibling
+  // dispatch that armed+prepared inside the scan→commit window is therefore
+  // either already visible to the re-scan (blocker, no disarm) or still
+  // waiting for the same lock (it re-arms legally over the written
+  // DISARMED_IDLE) — an expired scan can never complete a disarm over a
+  // sibling's in-flight dispatch.
+  const siblingScan = await countInFlightSiblings(root, dir);
+  if (siblingScan.unreadable) blockers.push("SIBLING_LEDGERS_UNREADABLE");
+  const otherInFlight = siblingScan.count;
 
   // The ruling criteria are evaluated only on clean evidence; any
   // unreadable/unprovable step above already carries its own blocker.
@@ -1181,9 +1231,12 @@ export async function disarmAfterRelease(dir, { rootMonitorDir = null, timestamp
   if (beforeCommit) await beforeCommit();
 
   // ---- Serialized commit (ruling requirements 2+4): identity confirmation and
-  // the DISARMED_IDLE write are atomic under the per-conversation commit lock.
+  // the DISARMED_IDLE write are atomic under the MONITOR-ROOT commit lock
+  // (round 6, P1-C-3) — the same lock every sibling conversation's arm and
+  // PREPARED establishment serialize on, so the global otherInFlight===0
+  // criterion is coordinated with them, not scanned past them.
   try {
-    return await withCommitLock(dir, async () => {
+    return await withCommitLock(commitLockScopeOf(dir), async (guard) => {
       // Fresh ledger identity — the authoritative check of THIS critical
       // section (the advisory record above may be stale by now).
       let fresh = null;
@@ -1227,12 +1280,30 @@ export async function disarmAfterRelease(dir, { rootMonitorDir = null, timestamp
       if (stamp !== null && stamp === expectedDispatchId) {
         return { disarmed: false, alreadyDisarmed: false, blockers: ["DISARM_ARMED_INSTANCE_SUPERSEDED"] };
       }
+      // P1-C-3 (round 6): the GLOBAL in-flight criterion re-confirmed in the
+      // same critical section as the write below. A sibling conversation's
+      // dispatch that armed + prepared inside the advisory-scan→commit window
+      // is visible here (its PREPARED ledger counts as in-flight) and keeps
+      // this state armed; a sibling still waiting for this very lock cannot
+      // have committed yet and re-arms legally afterwards.
+      const inLockSiblings = await countInFlightSiblings(root, dir);
+      if (inLockSiblings.unreadable) {
+        return { disarmed: false, alreadyDisarmed: false, blockers: ["SIBLING_LEDGERS_UNREADABLE"] };
+      }
+      if (inLockSiblings.count > 0) {
+        return { disarmed: false, alreadyDisarmed: false, blockers: ["OTHER_INFLIGHT_DISPATCH"] };
+      }
       const decision = armedTransitionPatch(freshCurrent, "DISARMED_IDLE", {
         conversation: fresh.conversationUuid ?? null, space: fresh.taskSpace ?? null, timestamp,
       });
       if (!decision.ok) {
         return { disarmed: false, alreadyDisarmed: false, blockers: [`ARM_TRANSITION_REJECTED:${freshCurrent}->DISARMED_IDLE`] };
       }
+      // P1-C-1 (round 6): ownership re-verification immediately before the
+      // DISARMED_IDLE write — a holder displaced mid-section aborts
+      // (COMMIT_LOCK_LOST → the state stays armed) instead of co-committing
+      // with the new holder.
+      await guard();
       await writeJsonAtomic(fastStateFileOf(dir), normalizeFastState(armNow.value, decision.patch, timestamp));
       await appendEvent(dir, "DISARMED_IDLE", { conversation: fresh.conversationUuid ?? null });
       return { disarmed: true, alreadyDisarmed: false, blockers: [] };
@@ -1745,10 +1816,13 @@ export async function main(args = process.argv.slice(2)) {
     }
     // Exclusive creation prevents replacing another dispatch's ledger.
     // P1-C round 5 (ruling requirement 1): this is a PREPARED ledger
-    // establishment, so it joins the same per-conversation commit lock as the
-    // arm section and the disarm commit (fail-closed: an unavailable lock
-    // aborts the recovery before any ledger write).
-    await withCommitLock(dir, async () => {
+    // establishment, so it joins the same commit lock as the arm section and
+    // the disarm commit; round 6 (P1-C-3): the lock scope is the monitor root,
+    // shared with every sibling conversation's writers (fail-closed: an
+    // unavailable lock aborts the recovery before any ledger write).
+    await withCommitLock(commitLockScopeOf(dir), async (guard) => {
+      // P1-C-1 (round 6): ownership re-verification before the ledger write.
+      await guard();
       const handle = await open(join(dir, "a-dispatch-state.json"), "wx", 0o600);
       try { await handle.writeFile(JSON.stringify(archived)); }
       finally { await handle.close(); }
