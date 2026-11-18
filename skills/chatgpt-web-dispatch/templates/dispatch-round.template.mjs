@@ -602,20 +602,97 @@ for (let focusAttempt = 1; focusAttempt <= 3 && !sent; focusAttempt++) {
   sent = true;
 }
 if (!sent) abort("SEND_NOT_EXECUTED");
+const sentAt = Date.now(); // Gate 9b persistence checks anchor on the actual send time
+
+// ---- Gate 9b: send persistence verification (issue #38 vanish mode + issue #37
+// false done-candidate). Gate 9's client evidence (empty composer + generating
+// spinner) cannot distinguish a stored send from a vanished one: both vanish
+// dispatches passed every gate yet the optimistic user turn later ROLLED BACK to
+// the baseline assistant tail, and a fresh CALIBRATE goto proved the server never
+// stored the message. Only a tail key ADVANCED past the dispatch baseline proves
+// persistence. Two bounded re-reads (~20s and ~80s after the send) decide:
+//   VERIFIED   — a check reads lastMessageKey != baselineTailKey (the dispatched
+//                user turn or an even-newer assistant reply) → markAccepted.
+//   UNVERIFIED — both checks still read the baseline assistant tail, or a
+//                surface read failed even after one retry → fail-closed to
+//                UNCERTAIN, never a silent ACCEPT.
+const PERSISTENCE_CHECK_DELAYS_MS = [20000, 80000];
+const verifySendPersistence = async (fromAt) => {
+  let vanished = false;
+  for (const delayMs of PERSISTENCE_CHECK_DELAYS_MS) {
+    const wait = fromAt + delayMs - Date.now();
+    if (wait > 0) await page.waitForTimeout(wait);
+    let sample = null;
+    let lastReadError = null;
+    // Fail-safe read: one bounded retry, then the whole verdict is UNVERIFIED —
+    // a read failure must never be mistaken for persistence evidence.
+    for (let attempt = 0; attempt < 2 && !sample; attempt++) {
+      try { sample = await readComposerSurface(page); }
+      catch (error) {
+        lastReadError = error;
+        if (attempt === 0) await page.waitForTimeout(3000);
+      }
+    }
+    if (!sample) {
+      await markComposerFreeze(MON, { space: SPACE, error: lastReadError }).catch(() => {});
+      await appendEvent(MON, "SEND_PERSISTENCE_UNVERIFIED", {
+        dispatchId: dispatch.dispatchId, baselineTailKey: dispatch.baselineTailKey,
+        reason: "SURFACE_READ_FAILED", checkDelayMs: delayMs,
+      }).catch(() => {});
+      return { verdict: "UNVERIFIED", reason: "SURFACE_READ_FAILED" };
+    }
+    if (sample.lastMessageKey && sample.lastMessageKey !== dispatch.baselineTailKey) {
+      await appendEvent(MON, "SEND_PERSISTENCE_VERIFIED", {
+        dispatchId: dispatch.dispatchId, baselineTailKey: dispatch.baselineTailKey,
+        lastMessageKey: sample.lastMessageKey, lastMessageRole: sample.lastMessageRole,
+        checkDelayMs: delayMs,
+      });
+      return { verdict: "VERIFIED" };
+    }
+    vanished = sample.lastMessageKey === dispatch.baselineTailKey && sample.lastMessageRole === "assistant";
+  }
+  await appendEvent(MON, "SEND_PERSISTENCE_UNVERIFIED", {
+    dispatchId: dispatch.dispatchId, baselineTailKey: dispatch.baselineTailKey,
+    reason: vanished ? "BASELINE_TAIL_UNCHANGED" : "TAIL_IDENTITY_UNPROVEN", vanished,
+  });
+  return { verdict: "UNVERIFIED", reason: vanished ? "BASELINE_TAIL_UNCHANGED" : "TAIL_IDENTITY_UNPROVEN" };
+};
 
 // ---- Gate 9: acceptance evidence (at-most-once preserved; UNCERTAIN never auto-resends) ----
 let accepted = null, acceptErr = null;
+let persistenceUnverified = false;
 for (let i = 0; i < 24 && !accepted; i++) {
   await page.waitForTimeout(1500);
   try {
     const s = await composerOp(() => readComposerSurface(page));
-    if (s.composerEmpty && (s.generating || (s.lastMessageRole === "assistant" && s.lastMessageKey && s.lastMessageKey !== dispatch.baselineTailKey))) {
+    const tailAlreadyAdvanced = s.lastMessageRole === "assistant" && s.lastMessageKey &&
+      s.lastMessageKey !== dispatch.baselineTailKey;
+    if (s.composerEmpty && (s.generating || tailAlreadyAdvanced)) {
+      // Gate 9b: persistence is proven BEFORE markAccepted. A real assistant
+      // reply already past the baseline IS persistence evidence by itself;
+      // otherwise the two bounded re-reads decide.
+      if (tailAlreadyAdvanced) {
+        await appendEvent(MON, "SEND_PERSISTENCE_VERIFIED", {
+          dispatchId: dispatch.dispatchId, baselineTailKey: dispatch.baselineTailKey,
+          lastMessageKey: s.lastMessageKey, lastMessageRole: s.lastMessageRole,
+          evidence: "GATE9_TAIL_ADVANCED",
+        });
+      } else {
+        const verdict = await verifySendPersistence(sentAt);
+        if (verdict.verdict !== "VERIFIED") {
+          persistenceUnverified = true;
+          break; // vanish suspected or unprovable: NEVER markAccepted
+        }
+      }
       try { accepted = await markAccepted(MON, dispatch.dispatchId, page); }
       catch (error) { acceptErr = String(error).slice(0, 120); }
     }
   } catch {}
 }
-if (!accepted) await markUncertain(MON, dispatch.dispatchId, "SEND_ACK_MISSING").catch(() => {});
+if (!accepted) {
+  if (persistenceUnverified) await markUncertain(MON, dispatch.dispatchId, "SEND_PERSISTENCE_UNVERIFIED").catch(() => {});
+  else await markUncertain(MON, dispatch.dispatchId, "SEND_ACK_MISSING").catch(() => {});
+}
 if (accepted && NEW_CHAT) {
   let actualUuid = null;
   for (let i = 0; i < 12 && !actualUuid; i++) {

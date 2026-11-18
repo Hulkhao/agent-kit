@@ -7,10 +7,10 @@ import { fileURLToPath } from "node:url";
 import { mkdtemp, mkdir, rm, writeFile, readFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { normalizeFastState } from "../monitor/state-schema.mjs";
+import { normalizeFastState, validateFastState, classifyFastStateFile } from "../monitor/state-schema.mjs";
 import { tick, acknowledge } from "../monitor/supervision-watchdog.mjs";
-import { shouldReviewStartupIdle } from "../monitor/supervision-policy.mjs";
-import { parseArgs, adaptTemplate, bindNewConversation, classifyManagerResult, loadAttachments, requireArmedDispatch, main, readEgoOutcome, ensureMonitor, authorizeSpaceRebuild, rebuildSpace, claimSpace, taskspaceOwnershipLost, announceTaskspaceOwnershipLoss, exitWatching, acknowledgeWake, releaseDelivered, managedAcknowledge, ackOwnershipEvidence, ACK_RESOLVED_OWNERSHIP_REQUIRED, ACK_AUDIT_FILE } from "../monitor/dispatch-manager.mjs";
+import { shouldReviewStartupIdle, classifySupervision, deliverySuspected } from "../monitor/supervision-policy.mjs";
+import { parseArgs, adaptTemplate, bindNewConversation, classifyManagerResult, loadAttachments, requireArmedDispatch, main, readEgoOutcome, ensureMonitor, authorizeSpaceRebuild, rebuildSpace, claimSpace, taskspaceOwnershipLost, announceTaskspaceOwnershipLoss, exitWatching, acknowledgeWake, releaseDelivered, managedAcknowledge, ackOwnershipEvidence, ACK_RESOLVED_OWNERSHIP_REQUIRED, ACK_AUDIT_FILE, SUPERVISION_WAKE_REASON_MAP } from "../monitor/dispatch-manager.mjs";
 import { withAgentRegistry, isValidNewTaskSpaceName, assertTaskSpaceNamingAllowed } from "../monitor/agent-space.mjs";
 import { taskspaceOperatorAction } from "../monitor/taskspace-takeover.mjs";
 import { checkDispatchTool } from "../plugins/chatgpt-dispatch-guard/hooks/policy.mjs";
@@ -867,7 +867,9 @@ test("#25: every watch exit-2 path persists the ego-watch-exit ledger and announ
   assert.match(watch, /exitWatching\(dir, supervisionReason, \{/);
   assert.match(watch, /a-supervision-status\.json/);
   assert.match(watch, /wakeId: pending && typeof pending\.id === "string" \? pending\.id : undefined/);
-  assert.match(watch, /pending\.reason : "MONITOR_WAKE_UNACKNOWLEDGED"/);
+  // #38 F3: structured supervision classes map to their exitWatching reasons;
+  // unmapped reasons keep the historical passthrough and the shared fallback.
+  assert.match(watch, /SUPERVISION_WAKE_REASON_MAP\[pending\.reason\] \|\| pending\.reason\) : "MONITOR_WAKE_UNACKNOWLEDGED"/);
   assert.match(watch, /announce: false/);
   // Path 5: any catchable watch-branch failure — init, reconciliation, release
   // or the poll loop — leaves the ledger behind and exits 2 (WG-03): the whole
@@ -1550,6 +1552,166 @@ test("#33: DONE_CANDIDATE live-window evidence lands in the dispatch record only
     await rm(dir, { recursive: true, force: true });
     await rm(scratch, { recursive: true, force: true });
   }
+});
+
+// ---- #38 F2: done-candidate gate tightening (vanish-mode misclassification) ----
+
+test("#38: fast-state schema carries deliveryFailedCandidate; legacy v3 stays tolerant", () => {
+  const t = 1_800_000_000_000;
+  // The v4 schema whitelists the new boolean and coerces foreign types away.
+  const flagged = normalizeFastState({}, { deliveryFailedCandidate: true }, t);
+  assert.equal(flagged.deliveryFailedCandidate, true);
+  assert.equal(validateFastState(flagged), true);
+  assert.equal(classifyFastStateFile(flagged), "current");
+  // The field resets through the normal patch path (tail advanced again).
+  assert.equal(normalizeFastState(flagged, { deliveryFailedCandidate: false }, t + 1).deliveryFailedCandidate, false);
+  assert.equal(normalizeFastState({}, { deliveryFailedCandidate: "yes" }, t).deliveryFailedCandidate, false);
+  // A legacy v3 ledger (no arm fields, no deliveryFailedCandidate) still
+  // migrates through classifyFastStateFile unchanged — legacy mode, no corruption.
+  const legacy = { schema: "ego-fast-state/v3", ts: t, generating: false, doneCandidate: false };
+  assert.equal(classifyFastStateFile(legacy), "legacy");
+  const migrated = normalizeFastState(legacy, {}, t);
+  assert.equal(migrated.deliveryFailedCandidate, false);
+  assert.equal(validateFastState(migrated), true);
+  // Anything outside the known schemas stays fail-closed corrupt.
+  assert.equal(classifyFastStateFile({ schema: "ego-fast-state/v9" }), "corrupt");
+});
+
+test("#38: markDoneCandidate refuses evidence whose tail equals the dispatch baseline", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ego-done-baseline-"));
+  try {
+    const record = { schema: "ego-dispatch-state/v2", dispatchId: uuid, conversationUuid: uuid,
+      taskSpace: "GDC-执行A", pageLabel: "p1", status: "ACCEPTED", baselineTailKey: "baseline-tail",
+      baselineTailRole: "assistant", baselineComposerLength: 0, attempt: 1, createdAt: Date.now(),
+      payload_sha256: sha256("任务") };
+    await writeFile(join(dir, "a-dispatch-state.json"), JSON.stringify(record));
+    // The vanish-mode shape: the "stable" candidate tail IS the baseline.
+    // Refused fail-closed — no doneLive evidence is frozen, the ledger status
+    // is untouched, and the refusal is audited.
+    assert.equal(await markDoneCandidate(dir, uuid, { bodyLen: 9245, lastMessageKey: "baseline-tail" }), null);
+    const refused = await readDispatchState(dir);
+    assert.equal(refused.status, "ACCEPTED");
+    assert.equal(refused.doneLiveBodyLen, undefined);
+    assert.equal(refused.doneLiveLastMessageKey, undefined);
+    const events = await readFile(join(dir, "a-fast-events.ndjson"), "utf8");
+    assert.match(events, /DONE_CANDIDATE_REJECTED_BASELINE_TAIL/);
+    // A tail genuinely past the baseline still freezes its evidence normally.
+    const next = await markDoneCandidate(dir, uuid, { bodyLen: 13349, lastMessageKey: "reply-tail" });
+    assert.equal(next.doneLiveBodyLen, 13349);
+    assert.equal(next.doneLiveLastMessageKey, "reply-tail");
+    assert.equal(next.status, "ACCEPTED");
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test("#38: both probes refuse a done candidate whose stable tail equals the dispatch baseline", async () => {
+  for (const name of ["ego-fast-probe.mjs", "ego-fast-probe-live.mjs"]) {
+    const source = await readFile(new URL(`../monitor/${name}`, import.meta.url), "utf8");
+    // The ledger baseline feeds both the per-round flag and the confirm window.
+    assert.match(source, /const tailKeyEqualsBaseline = \["SEND_STARTED", "ACCEPTED"\]\.includes\(dispatchResult\.record\?\.status\) &&/, name);
+    assert.match(source, /deliveryFailedCandidate: completedDispatch \? false : tailKeyEqualsBaseline/, name);
+    // The refusal branch sits BEFORE the done-candidate branch in the confirm window.
+    const window = source.slice(source.indexOf("const stable ="), source.indexOf("TRANSITION_GENERATING_TO_IDLE_CONFIRMED"));
+    assert.match(window, /if \(stable && ledgerBaselineTailKey && second\.lastMessageKey === ledgerBaselineTailKey\) \{/, name);
+    assert.match(window, /doneCandidate: false,\s*\n\s*deliveryFailedCandidate: true/, name);
+    assert.match(window, /DONE_CANDIDATE_REFUSED_BASELINE_TAIL/, name);
+    const refusedAt = window.indexOf("DONE_CANDIDATE_REFUSED_BASELINE_TAIL");
+    const doneAt = window.indexOf('appendEvent(MON, "DONE_CANDIDATE"');
+    assert.ok(refusedAt > 0 && doneAt > refusedAt, `${name}: refusal must precede the done-candidate write`);
+  }
+});
+
+// ---- #38 F3: DELIVERY_SUSPECTED structured supervision wake ----
+
+test("#38: DELIVERY_SUSPECTED fires for both vanish signatures after the supervision window", () => {
+  const t = 1_800_000_000_000;
+  const minutes = 10;
+  const stateAt = (patch, ts) => normalizeFastState({}, {
+    generationKey: "disp-1", uiSchema: "CHATGPT_CHAT_KNOWN", dispatchStatus: "ACCEPTED",
+    lastProgressAt: t, lastMessageRole: "assistant", lastMessageKey: "baseline-tail", ...patch,
+  }, ts);
+  // (a) tail rolled back onto / never left the dispatch baseline
+  const rolledBack = stateAt({}, t + 11 * 60_000);
+  assert.equal(classifySupervision(rolledBack, { now: t + 11 * 60_000, minutes, baselineTailKey: "baseline-tail" }),
+    "DELIVERY_SUSPECTED");
+  // Precedence: the identical evidence is NOT the generic NO_SUBSTANTIVE_PROGRESS.
+  assert.notEqual(classifySupervision(rolledBack, { now: t + 11 * 60_000, minutes, baselineTailKey: "baseline-tail" }),
+    "NO_SUBSTANTIVE_PROGRESS");
+  // The signature must be sustained: inside the window nothing fires yet.
+  assert.equal(classifySupervision(stateAt({}, t + 5 * 60_000), { now: t + 5 * 60_000, minutes, baselineTailKey: "baseline-tail" }),
+    null);
+  // (b) an optimistic user turn sitting unanswered at the tail
+  const userTurn = stateAt({ lastMessageRole: "user", lastMessageKey: "fallback-turn-5:0:user" }, t + 11 * 60_000);
+  assert.equal(classifySupervision(userTurn, { now: t + 11 * 60_000, minutes, baselineTailKey: "baseline-tail" }),
+    "DELIVERY_SUSPECTED");
+});
+
+test("#38: DELIVERY_SUSPECTED never fires when the tail advanced, a reply is unhandled, or evidence is unprovable", () => {
+  const t = 1_800_000_000_000;
+  const minutes = 10;
+  const stateAt = (patch, ts) => normalizeFastState({}, {
+    generationKey: "disp-1", uiSchema: "CHATGPT_CHAT_KNOWN", dispatchStatus: "ACCEPTED",
+    lastProgressAt: t, lastMessageRole: "assistant", lastMessageKey: "baseline-tail", ...patch,
+  }, ts);
+  // A real assistant tail beyond the baseline is proof of delivery — the class
+  // must not fire (responseTailAdvanced equivalent) and ordinary rules apply.
+  const advanced = stateAt({ lastMessageKey: "reply-tail" }, t + 11 * 60_000);
+  assert.equal(deliverySuspected(advanced, "baseline-tail"), false);
+  assert.equal(classifySupervision(advanced, { now: t + 11 * 60_000, minutes, baselineTailKey: "baseline-tail" }),
+    "NO_SUBSTANTIVE_PROGRESS");
+  // doneCandidate keeps its REPLY_UNHANDLED precedence.
+  const done = stateAt({ doneCandidate: true }, t + 11 * 60_000);
+  assert.equal(classifySupervision(done, { now: t + 11 * 60_000, minutes, baselineTailKey: "baseline-tail" }),
+    "REPLY_UNHANDLED");
+  // A still-generating surface is not a vanish signature.
+  assert.equal(deliverySuspected(stateAt({ generating: true }, t + 11 * 60_000), "baseline-tail"), false);
+  // Non-ACCEPTED dispatches are out of scope.
+  assert.equal(deliverySuspected(normalizeFastState({}, {
+    dispatchStatus: "SEND_STARTED", lastMessageKey: "baseline-tail",
+  }, t), "baseline-tail"), false);
+  assert.equal(deliverySuspected(normalizeFastState({}, {
+    dispatchStatus: "UNCERTAIN", lastMessageKey: "baseline-tail",
+  }, t), "baseline-tail"), false);
+  // Without a usable baseline the class can never fire (fail-safe).
+  assert.equal(deliverySuspected(stateAt({}, t + 11 * 60_000), null), false);
+  assert.equal(deliverySuspected(stateAt({}, t + 11 * 60_000)), false);
+  assert.equal(deliverySuspected(stateAt({}, t + 11 * 60_000), 42), false);
+});
+
+test("#38: the watchdog feeds the ledger baseline in and DELIVERY_SUSPECTED surfaces as a pending alarm", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ego-delivery-suspect-"));
+  const t = 1_800_000_000_000;
+  try {
+    await writeFile(join(dir, "supervision.config.json"), JSON.stringify({ supervisionMinutes: 10, maxAbnormalRounds: 3 }));
+    const record = { schema: "ego-dispatch-state/v2", dispatchId: uuid, conversationUuid: uuid,
+      taskSpace: "GDC-执行A", pageLabel: "p1", status: "ACCEPTED", baselineTailKey: "baseline-tail",
+      baselineTailRole: "assistant", baselineComposerLength: 0, attempt: 1, createdAt: t,
+      payload_sha256: null, payload_bytes: null, composer_baseline: null };
+    await writeFile(join(dir, "a-dispatch-state.json"), JSON.stringify(record));
+    // Tail back on the ledger baseline, no progress for one supervision window.
+    const state = normalizeFastState({}, {
+      generationKey: uuid, uiSchema: "CHATGPT_CHAT_KNOWN", dispatchStatus: "ACCEPTED",
+      lastProgressAt: t, lastMessageRole: "assistant", lastMessageKey: "baseline-tail",
+    }, t + 10 * 60_000);
+    await writeFile(join(dir, "a-fast-state.json"), JSON.stringify(state));
+    assert.equal(await tick(t + 10 * 60_000, dir), true);
+    const status = JSON.parse(await readFile(join(dir, "a-supervision-status.json"), "utf8"));
+    assert.equal(status.pending.reason, "DELIVERY_SUSPECTED");
+    // Manager mapping: the class exits as DELIVERY_SUSPECTED_WAKE_SUPERVISOR;
+    // unmapped classes keep the passthrough contract.
+    assert.equal(SUPERVISION_WAKE_REASON_MAP.DELIVERY_SUSPECTED, "DELIVERY_SUSPECTED_WAKE_SUPERVISOR");
+    assert.equal(SUPERVISION_WAKE_REASON_MAP.REPLY_UNHANDLED, undefined);
+    assert.equal(SUPERVISION_WAKE_REASON_MAP.NO_SUBSTANTIVE_PROGRESS, undefined);
+    // A corrupt ledger yields no baseline: the class stays silent and the
+    // ordinary progress rules stay in charge (fail-safe).
+    await writeFile(join(dir, "a-supervision-status.json"), JSON.stringify({
+      schema: "ego-supervision/v1", generationKey: null, progressAt: 0, abnormalRounds: 0, lastReviewAt: 0, pending: null,
+    }));
+    await writeFile(join(dir, "a-dispatch-state.json"), "{corrupted");
+    await writeFile(join(dir, "a-fast-state.json"), JSON.stringify(normalizeFastState(state, {}, t + 20 * 60_000)));
+    assert.equal(await tick(t + 20 * 60_000, dir), true);
+    const next = JSON.parse(await readFile(join(dir, "a-supervision-status.json"), "utf8"));
+    assert.equal(next.pending.reason, "NO_SUBSTANTIVE_PROGRESS");
+  } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
 test("#33: API finality evidence exposes end_turn/status without relaxing extraction", () => {

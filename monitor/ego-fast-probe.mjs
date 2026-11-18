@@ -124,13 +124,27 @@ try {
   process.exit(0);
 }
 
+// F4 (agent-kit#38 probe diagnostic split): a listTaskSpaces() THROW is a registry
+// READ failure, not a missing space. It gets its own code TASKSPACE_LIST_FAILED
+// with the rebuild-space hint — a registry loss must never flow into the naming
+// gate below, which can only see "space absent" and would misreport a lost
+// registry as a naming decision. Only a successful list that lacks the space
+// proceeds to the naming-gate branch.
+let existingSpaces = null;
+try { existingSpaces = await listTaskSpaces(); }
+catch (error) {
+  await writeState({ probeFailed: true, recoveryFailed: true, errorCode: "TASKSPACE_LIST_FAILED", ...safeError(error) });
+  await appendEvent(MON, "TASKSPACE_LIST_FAILED", safeError(error)).catch(() => {});
+  console.log('RECOVERY_HINT=SPACE_REGISTRY_LOST command="dispatch-manager.mjs rebuild-space --monitor-dir <monitor-dir> --agent-id <agent-id> --space <space>"');
+  console.log("RESULT=TASKSPACE_LIST_FAILED");
+  process.exit(0);
+}
 try {
   // #27 re-review P1-1: the naming gate precedes ANY registry write. A
   // read-only listTaskSpaces() decides whether SPACE already exists (legacy
   // reuse stays legal); a MISSING space must pass the frozen naming convention
   // BEFORE claimAgentSpace(), so a violating new name can never enter the
   // registry — and from there borrow rebuild-space's LEDGER_PROOF creation.
-  const existingSpaces = await listTaskSpaces();
   const spaceExists = existingSpaces.some((space) => space.taskId === SPACE || space.name === SPACE);
   assertTaskSpaceNamingAllowed(SPACE, AGENT_ID, spaceExists);
   await claimAgentSpace({ agentId: AGENT_ID, spaceName: SPACE });
@@ -184,7 +198,17 @@ const readPinnedProfileId = async () => {
   } catch { return null; }
 };
 try {
-  const spaces = await listTaskSpaces();
+  // F4: same diagnostic split as the naming gate above — a bootstrap list
+  // failure is TASKSPACE_LIST_FAILED, never a generic recovery failure.
+  let spaces;
+  try { spaces = await listTaskSpaces(); }
+  catch (listError) {
+    await writeState({ spaceId, probeFailed: true, recoveryFailed: true, errorCode: "TASKSPACE_LIST_FAILED", ...safeError(listError) });
+    await appendEvent(MON, "TASKSPACE_LIST_FAILED", { spaceId, ...safeError(listError) }).catch(() => {});
+    console.log('RECOVERY_HINT=SPACE_REGISTRY_LOST command="dispatch-manager.mjs rebuild-space --monitor-dir <monitor-dir> --agent-id <agent-id> --space <space>"');
+    console.log("RESULT=TASKSPACE_LIST_FAILED");
+    process.exit(0);
+  }
   // The SPACE name is the stable identity; a stored spaceId only wins if its taskId still matches.
   const targetSpace = spaces.find((space) => space.taskId === SPACE || space.name === SPACE) ||
     (spaceId ? spaces.find((space) => space.id === spaceId && (!space.taskId || space.taskId === SPACE)) : null);
@@ -645,6 +669,12 @@ if (dispatchResult.result === "UNCERTAIN") {
 }
 
 const dispatchId = dispatchResult.record?.dispatchId || null;
+// agent-kit#38/#37: the dispatch-time tail is the durable delivery baseline.
+// A live tail still sitting on it means the message never persisted server-side
+// (vanish mode) — such a round must never be promoted to a done candidate.
+const ledgerBaselineTailKey = dispatchResult.record?.baselineTailKey || null;
+const tailKeyEqualsBaseline = ["SEND_STARTED", "ACCEPTED"].includes(dispatchResult.record?.status) &&
+  Boolean(probe.lastMessageKey) && probe.lastMessageKey === ledgerBaselineTailKey;
 const sameGeneration = previous.generationKey === (dispatchId || "conversation");
 const completedDispatch = dispatchResult.record?.status === "COMPLETED";
 const everGenerating = completedDispatch ? false :
@@ -665,6 +695,7 @@ const state = await writeState({
   lastProgressAt: substantiveProgress || !sameGeneration ? now() : (previous.lastProgressAt ?? previous.ts ?? now()),
   startIdle: recovered && !probe.generating,
   doneCandidate: completedDispatch ? false : (sameGeneration ? previous.doneCandidate : false),
+  deliveryFailedCandidate: completedDispatch ? false : tailKeyEqualsBaseline,
   probeFailed: false,
   backoffUntil: null,
   unavailableStrikes: 0,
@@ -732,7 +763,33 @@ if (!probe.generating && (everGenerating || responseTailAdvanced)) {
     (!responseTailAdvanced || second.lastMessageKey !== dispatchResult.record?.baselineTailKey) &&
     first.lastMessageTextLength === second.lastMessageTextLength &&
     first.bodyLen === second.bodyLen && first.busyCount === 0 && second.busyCount === 0;
-  if (!stable) {
+  if (stable && ledgerBaselineTailKey && second.lastMessageKey === ledgerBaselineTailKey) {
+    // agent-kit#38/#37: a "stable" tail identical to the dispatch baseline is the
+    // vanish-mode signature — nothing ever landed (or the optimistic user turn
+    // rolled back). The old window confirmed DONE_CANDIDATE here 4x because
+    // everGenerating bypassed the tail-advance guard. NEVER set doneCandidate on
+    // a baseline tail; mark the delivery-failure candidate instead and let the
+    // supervision layer raise DELIVERY_SUSPECTED after its window.
+    await writeState({
+      generating: false,
+      len: second.bodyLen,
+      composerEmpty: true,
+      lastMessageRole: second.lastMessageRole,
+      lastMessageKey: second.lastMessageKey,
+      lastMessageTextLength: second.lastMessageTextLength,
+      stopLabelCount: second.stopLabelCount,
+      buttonLabels: second.buttonLabels,
+      activityMarkers: second.activityMarkers,
+      busyCount: second.busyCount,
+      doneCandidate: false,
+      deliveryFailedCandidate: true,
+    });
+    await appendEvent(MON, "DONE_CANDIDATE_REFUSED_BASELINE_TAIL", {
+      dispatchId, lastMessageKey: second.lastMessageKey, baselineTailKey: ledgerBaselineTailKey,
+      bodyLen: second.bodyLen,
+    });
+    console.log("RESULT=GENERATING");
+  } else if (!stable) {
     await writeState({
       generating: second.generating,
       len: second.bodyLen,

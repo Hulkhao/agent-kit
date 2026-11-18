@@ -502,6 +502,128 @@ test("#30: verifyDraftOwnership fidelity — sensitive whitespace loss rejected,
       reason: "SEND_STARTED_LOCKED_ACCEPTANCE_RECONCILIATION_REQUIRED" });
 });
 
+// ---- Gate 9b: send persistence verification (issue #38 vanish mode) ----
+
+// Execute the template's ACTUAL verifySendPersistence helper (not a copy) against
+// injected surface reads, collecting the audit events it emits. The slice spans
+// the Gate 9b block between the send loop and the Gate 9 acceptance loop.
+async function persistenceHarness(reads) {
+  const src = await template();
+  const start = src.indexOf("const PERSISTENCE_CHECK_DELAYS_MS");
+  const end = src.indexOf("// ---- Gate 9:");
+  assert.ok(start > 0 && end > start, "Gate 9b helper must sit between the send loop and Gate 9");
+  const events = [];
+  const waits = [];
+  let call = 0;
+  const page = { waitForTimeout: async (ms) => { waits.push(ms); } };
+  const readComposerSurface = async () => {
+    const step = reads[Math.min(call, reads.length - 1)];
+    call += 1;
+    return step();
+  };
+  const api = runInNewContext(src.slice(start, end) + "\n({ verifySendPersistence, PERSISTENCE_CHECK_DELAYS_MS })", {
+    page, readComposerSurface,
+    appendEvent: async (mon, event, fields) => events.push({ event, fields }),
+    markComposerFreeze: async () => ({}),
+    MON: "mon-38", SPACE: "space-38",
+    dispatch: { dispatchId: "dispatch-38", baselineTailKey: "baseline-key" },
+  });
+  return { ...api, events, waits, readCount: () => call };
+}
+
+test("Gate 9b: tail advance past the baseline at a persistence check verifies and audits", async () => {
+  const h = await persistenceHarness([() => ({ lastMessageKey: "reply-key", lastMessageRole: "assistant" })]);
+  const verdict = await h.verifySendPersistence(Date.now() - 90_000);
+  assert.equal(verdict.verdict, "VERIFIED");
+  assert.deepEqual(h.events.map((e) => e.event), ["SEND_PERSISTENCE_VERIFIED"]);
+  assert.equal(h.events[0].fields.dispatchId, "dispatch-38");
+  assert.equal(h.events[0].fields.baselineTailKey, "baseline-key");
+  assert.equal(h.readCount(), 1);
+});
+
+test("Gate 9b: vanish rollback — baseline assistant tail at BOTH checks is UNVERIFIED, never accepted", async () => {
+  const baseline = () => ({ lastMessageKey: "baseline-key", lastMessageRole: "assistant" });
+  const h = await persistenceHarness([baseline, baseline]);
+  const verdict = await h.verifySendPersistence(Date.now() - 90_000);
+  assert.equal(verdict.verdict, "UNVERIFIED");
+  assert.equal(verdict.reason, "BASELINE_TAIL_UNCHANGED");
+  assert.deepEqual(h.events.map((e) => e.event), ["SEND_PERSISTENCE_UNVERIFIED"]);
+  assert.equal(h.events[0].fields.vanished, true);
+  assert.equal(h.readCount(), 2, "both bounded checks must run before the verdict");
+});
+
+test("Gate 9b: reply lands between the checks — VERIFIED at the second check", async () => {
+  const h = await persistenceHarness([
+    () => ({ lastMessageKey: "baseline-key", lastMessageRole: "assistant" }),
+    () => ({ lastMessageKey: "reply-key", lastMessageRole: "assistant" }),
+  ]);
+  const verdict = await h.verifySendPersistence(Date.now() - 90_000);
+  assert.equal(verdict.verdict, "VERIFIED");
+  assert.deepEqual(h.events.map((e) => e.event), ["SEND_PERSISTENCE_VERIFIED"]);
+  assert.equal(h.events[0].fields.checkDelayMs, 80000);
+});
+
+test("Gate 9b: surface read failures fail closed to UNVERIFIED (one retry, never a silent accept)", async () => {
+  const boom = () => { throw new Error("PageEvaluationTimeout"); };
+  const h = await persistenceHarness([boom, boom]);
+  const verdict = await h.verifySendPersistence(Date.now() - 90_000);
+  assert.equal(verdict.verdict, "UNVERIFIED");
+  assert.equal(verdict.reason, "SURFACE_READ_FAILED");
+  assert.deepEqual(h.events.map((e) => e.event), ["SEND_PERSISTENCE_UNVERIFIED"]);
+  assert.equal(h.readCount(), 2, "exactly one retry inside the failing check, then stop");
+});
+
+test("Gate 9b: a transient read failure retries once and the checks resume normally", async () => {
+  const h = await persistenceHarness([
+    () => { throw new Error("boom"); },
+    () => ({ lastMessageKey: "baseline-key", lastMessageRole: "assistant" }),
+    () => ({ lastMessageKey: "baseline-key", lastMessageRole: "assistant" }),
+  ]);
+  const verdict = await h.verifySendPersistence(Date.now() - 90_000);
+  assert.equal(verdict.verdict, "UNVERIFIED");
+  assert.equal(verdict.reason, "BASELINE_TAIL_UNCHANGED");
+  assert.equal(h.readCount(), 3, "retry consumed inside check 1, check 2 still ran");
+});
+
+test("Gate 9b: the two checks anchor ~20s and ~80s after the send time", async () => {
+  const baseline = () => ({ lastMessageKey: "baseline-key", lastMessageRole: "assistant" });
+  assert.deepEqual([...(await persistenceHarness([baseline, baseline])).PERSISTENCE_CHECK_DELAYS_MS], [20000, 80000]);
+  // Fresh send: the first check waits ~20s.
+  const fresh = await persistenceHarness([baseline, baseline]);
+  await fresh.verifySendPersistence(Date.now());
+  assert.ok(fresh.waits[0] >= 15_000 && fresh.waits[0] <= 25_000, `first check ~20s after send, got ${fresh.waits[0]}ms`);
+  // 20s in: the first check is already due and the second waits ~60s more
+  // (i.e. it fires ~80s after the send).
+  const mid = await persistenceHarness([baseline, baseline]);
+  await mid.verifySendPersistence(Date.now() - 20_000);
+  assert.equal(mid.waits.length, 1, "only the second check still waits");
+  assert.ok(mid.waits[0] >= 55_000 && mid.waits[0] <= 65_000, `second check ~80s after send, got ${mid.waits[0]}ms`);
+  // 90s in: both checks are already due, no waiting at all.
+  const late = await persistenceHarness([baseline, baseline]);
+  await late.verifySendPersistence(Date.now() - 90_000);
+  assert.deepEqual(late.waits, []);
+});
+
+test("Gate 9b: persistence is verified BEFORE markAccepted and fails closed to UNCERTAIN", async () => {
+  const src = await template();
+  const gate9 = src.slice(src.indexOf("// ---- Gate 9b:"), src.indexOf("if (accepted && NEW_CHAT)"));
+  // The helper is defined before the acceptance loop consumes it.
+  assert.ok(src.indexOf("const verifySendPersistence") < src.indexOf("for (let i = 0; i < 24 && !accepted; i++)"));
+  // An UNVERIFIED verdict leaves the loop before markAccepted can ever run.
+  assert.match(gate9, /if \(verdict\.verdict !== "VERIFIED"\) \{\s*\n\s*persistenceUnverified = true;\s*\n\s*break; /);
+  assert.ok(gate9.indexOf("verifySendPersistence(sentAt)") < gate9.indexOf("accepted = await markAccepted(MON"),
+    "the persistence verdict must gate markAccepted");
+  // Both audit events exist, and the fail-closed UNCERTAIN reason is wired.
+  assert.match(gate9, /SEND_PERSISTENCE_VERIFIED/);
+  assert.match(gate9, /SEND_PERSISTENCE_UNVERIFIED/);
+  assert.match(gate9, /markUncertain\(MON, dispatch\.dispatchId, "SEND_PERSISTENCE_UNVERIFIED"\)/);
+  // The helper itself never marks acceptance (fail-closed by construction).
+  const helper = src.slice(src.indexOf("const verifySendPersistence"), src.indexOf("// ---- Gate 9:"));
+  assert.doesNotMatch(helper, /markAccepted/);
+  // A real assistant tail already past the baseline is persistence evidence by itself.
+  assert.match(gate9, /evidence: "GATE9_TAIL_ADVANCED"/);
+});
+
 test("#30: recover-draft ledger semantics — only a proved PREPARED aborts to ABORTED, everything else is rejected", async () => {
   const { abortPreparedDispatch, writeJsonAtomic } = await import("../monitor/dispatch-state.mjs");
   const { mkdtemp, readFile, rm } = await import("node:fs/promises");

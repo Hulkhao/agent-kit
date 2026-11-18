@@ -298,6 +298,16 @@ export async function markUncertain(monitorDir, dispatchId, reasonCode = "SEND_A
 export async function markDoneCandidate(dir, dispatchId, { bodyLen, lastMessageKey } = {}) {
   const record = await readDispatchState(dir);
   if (!record || record.dispatchId !== dispatchId) return null;
+  // agent-kit#38/#37 defense in depth: a candidate tail identical to the
+  // dispatch baseline proves nothing ever landed (or the optimistic turn
+  // rolled back) — the exact vanish-mode shape that produced four false
+  // DONE_CANDIDATE rounds. Refuse the evidence instead of freezing it.
+  if (typeof lastMessageKey === "string" && lastMessageKey === record.baselineTailKey) {
+    await appendEvent(dir, "DONE_CANDIDATE_REJECTED_BASELINE_TAIL", {
+      dispatchId, lastMessageKey, baselineTailKey: record.baselineTailKey,
+    }).catch(() => {});
+    return null;
+  }
   const next = {
     ...record,
     doneLiveBodyLen: Number.isFinite(bodyLen) && bodyLen >= 0 ? bodyLen : null,

@@ -219,6 +219,14 @@ export function classifyProbeResult({ code, result }, benignStreak = 0) {
 // process is gone; it never carries task or reply content.
 const WATCH_EXIT_SCHEMA = "ego-watch-exit/v1";
 
+// #38 F3: structured supervision classes that need a more specific exitWatching
+// wake reason map here. Unmapped reasons (REPLY_UNHANDLED, NO_SUBSTANTIVE_PROGRESS,
+// MONITOR_STATE_ABNORMAL, ...) keep the historical passthrough behavior: the
+// pending.reason string becomes the exitWatching reason verbatim.
+export const SUPERVISION_WAKE_REASON_MAP = Object.freeze({
+  DELIVERY_SUSPECTED: "DELIVERY_SUSPECTED_WAKE_SUPERVISOR",
+});
+
 // Unified watch exit, in contract order: generate wakeId -> atomically write
 // <conversationDir>/a-watch-exit.json -> announce the wake reason -> exit 2.
 // A failed marker write must never upgrade the wake into a success: the exit
@@ -847,7 +855,7 @@ export async function main(args = process.argv.slice(2)) {
           try { pending = JSON.parse(await readFile(join(dir, "a-supervision-status.json"), "utf8")).pending ?? null; }
           catch { pending = null; }
           const supervisionReason = pending && typeof pending.reason === "string" && pending.reason
-            ? pending.reason : "MONITOR_WAKE_UNACKNOWLEDGED";
+            ? (SUPERVISION_WAKE_REASON_MAP[pending.reason] || pending.reason) : "MONITOR_WAKE_UNACKNOWLEDGED";
           return await exitWatching(dir, supervisionReason, {
             wakeId: pending && typeof pending.id === "string" ? pending.id : undefined,
             announce: false,

@@ -5,6 +5,7 @@ import { readFile, writeFile, rename } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { parseSupervisionConfig, classifySupervision, nextSupervisionRound } from "./supervision-policy.mjs";
+import { readDispatchState } from "./dispatch-state.mjs";
 
 const defaultDir = dirname(fileURLToPath(import.meta.url));
 const SCHEMA = "ego-supervision/v1";
@@ -67,7 +68,16 @@ export async function tick(now = Date.now(), dir = defaultDir) {
   }
   const prior = status;
   if (state) status = nextSupervisionRound(status, state);
-  const reason = state ? classifySupervision(state, { now, lastReviewAt: status.lastReviewAt, minutes: config.supervisionMinutes }) : "STATE_MISSING";
+  // agent-kit#38 F3: DELIVERY_SUSPECTED needs the dispatch-time baseline tail to
+  // tell a rolled-back / never-landed send from genuine progress. An absent,
+  // unreadable or corrupt ledger yields null — the class then never fires and
+  // the ordinary supervision rules stay in charge (fail-safe).
+  let baselineTailKey = null;
+  try {
+    const record = await readDispatchState(dir);
+    if (typeof record?.baselineTailKey === "string" && record.baselineTailKey) baselineTailKey = record.baselineTailKey;
+  } catch { baselineTailKey = null; }
+  const reason = state ? classifySupervision(state, { now, lastReviewAt: status.lastReviewAt, minutes: config.supervisionMinutes, baselineTailKey }) : "STATE_MISSING";
   if (!reason) {
     if (status.generationKey !== prior.generationKey || status.progressAt !== prior.progressAt || status.abnormalRounds !== prior.abnormalRounds) await store(status, dir);
     return false;

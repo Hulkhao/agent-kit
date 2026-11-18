@@ -104,3 +104,58 @@ test("manager wakes on PROBE_INVALID_ORIGIN (classifyProbeResult default branch)
   assert.equal(classifyProbeResult({ code: 0, result: "PROBE_UNAVAILABLE_RETRY" }).wake, false);
   assert.equal(classifyProbeResult({ code: 0, result: "PROBE_BACKOFF" }).wake, false);
 });
+
+// ---- #38 F4: probe diagnostic split — a lost space registry is a LIST failure,
+// never a naming decision ----
+
+test("a listTaskSpaces() throw exits TASKSPACE_LIST_FAILED before the naming gate", () => {
+  // The existence check is wrapped in its own try: a throw writes the dedicated
+  // error code, prints the rebuild-space hint and exits — it can never reach the
+  // naming decision below.
+  const gate = probeSource.slice(
+    probeSource.indexOf("let existingSpaces = null;"),
+    probeSource.indexOf("await claimAgentSpace({ agentId: AGENT_ID, spaceName: SPACE });"));
+  assert.match(gate, /try \{ existingSpaces = await listTaskSpaces\(\); \}\s*\n\s*catch \(error\) \{\s*\n\s*await writeState\(\{ probeFailed: true, recoveryFailed: true, errorCode: "TASKSPACE_LIST_FAILED"/);
+  assert.match(gate, /console\.log\("RESULT=TASKSPACE_LIST_FAILED"\)/);
+  assert.match(gate, /RECOVERY_HINT=SPACE_REGISTRY_LOST/);
+  // The naming decision consumes only a SUCCESSFUL list result.
+  const decision = probeSource.slice(
+    probeSource.indexOf("const spaceExists = existingSpaces.some"),
+    probeSource.indexOf("await claimAgentSpace({ agentId: AGENT_ID, spaceName: SPACE });"));
+  assert.doesNotMatch(decision, /await listTaskSpaces\(\)/);
+  assert.doesNotMatch(decision, /TASKSPACE_LIST_FAILED/);
+  // The dedicated code is reported before any naming-violation handling exists
+  // in the file — a registry loss can never masquerade as TASKSPACE_NAMING_VIOLATION_STOP.
+  assert.ok(probeSource.indexOf("RESULT=TASKSPACE_LIST_FAILED") < probeSource.indexOf("TASKSPACE_NAMING_VIOLATION_STOP"));
+});
+
+test("the probe bootstrap re-wraps its own list call with the same TASKSPACE_LIST_FAILED code", () => {
+  const bootstrap = probeSource.slice(
+    probeSource.indexOf("let spaces;"),
+    probeSource.indexOf("if (!targetSpace)"));
+  assert.ok(bootstrap.length > 0 && bootstrap.length < 2000, "bootstrap list wrap slice");
+  assert.match(bootstrap, /try \{ spaces = await listTaskSpaces\(\); \}\s*\n\s*catch \(listError\) \{/);
+  assert.match(bootstrap, /errorCode: "TASKSPACE_LIST_FAILED"/);
+  assert.match(bootstrap, /console\.log\("RESULT=TASKSPACE_LIST_FAILED"\)/);
+  assert.match(bootstrap, /RECOVERY_HINT=SPACE_REGISTRY_LOST/);
+});
+
+test("the live probe mirrors the TASKSPACE_LIST_FAILED split for its bootstrap list call", async () => {
+  const liveSource = await readFile(
+    fileURLToPath(new URL("../monitor/ego-fast-probe-live.mjs", import.meta.url)), "utf8");
+  const bootstrap = liveSource.slice(
+    liveSource.indexOf("let spaces;"),
+    liveSource.indexOf("if (!targetSpace)"));
+  assert.ok(bootstrap.length > 0 && bootstrap.length < 2000, "live bootstrap list wrap slice");
+  assert.match(bootstrap, /try \{ spaces = await listTaskSpaces\(\); \}\s*\n\s*catch \(listError\) \{/);
+  assert.match(bootstrap, /errorCode: "TASKSPACE_LIST_FAILED"/);
+  assert.match(bootstrap, /console\.log\("RESULT=TASKSPACE_LIST_FAILED"\)/);
+  assert.match(bootstrap, /RECOVERY_HINT=SPACE_REGISTRY_LOST/);
+  // A successful list that lacks the space keeps the existing recovery shape.
+  assert.match(liveSource, /TASKSPACE_BOOTSTRAP_NO_PIN/);
+});
+
+test("manager wakes on TASKSPACE_LIST_FAILED instead of collapsing it into another code", () => {
+  assert.deepEqual(classifyProbeResult({ code: 0, result: "TASKSPACE_LIST_FAILED" }),
+    { wake: true, streak: 0 });
+});

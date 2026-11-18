@@ -21,6 +21,11 @@ export const FAST_STATE_DEFAULTS = Object.freeze({
   lastGotoAt: null,
   startIdle: false,
   doneCandidate: false,
+  // agent-kit#38/#37: the probe observed a stable assistant tail that never
+  // advanced past the dispatch baseline — the vanish-mode done-candidate
+  // misclassification. This flag marks that signature so the supervision layer
+  // can raise DELIVERY_SUSPECTED instead of a false REPLY_UNHANDLED.
+  deliveryFailedCandidate: false,
   gapRejected: 0,
   probeFailed: false,
   backoffUntil: null,
@@ -129,7 +134,7 @@ export function classifyFastStateFile(value) {
 const ARRAY_FIELDS = new Set(["buttonLabels", "activityMarkers"]);
 const BOOL_FIELDS = new Set([
   "generating", "everGenerating", "bodyChanged", "startIdle", "doneCandidate",
-  "probeFailed", "unavailablePersistent", "recoveryFailed",
+  "deliveryFailedCandidate", "probeFailed", "unavailablePersistent", "recoveryFailed",
 ]);
 const NUMBER_FIELDS = new Set([
   "ts", "pageCount", "len", "gapRejected", "unavailableStrikes", "composerCount",
