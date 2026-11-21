@@ -17,6 +17,7 @@ const CONV = "REPLACE_WITH_CONVERSATION_UUID"; // page located by URL containing
 const ATTACHMENTS = "REPLACE_WITH_ATTACHMENTS_JSON"; // managed JSON array of absolute file paths
 const NEW_CHAT = "REPLACE_WITH_NEW_CHAT_FLAG"; // true only for a durable send-new request
 const RECOVER_ONLY = "REPLACE_WITH_RECOVER_ONLY"; // clear only a verified PREPARED draft
+const ATTACH_CHANNEL_EVIDENCE = ""; // #28 §3.2 precheck, only needed when attachments are sent: "USER_STATED:<peer repo permission the user stated in-session>" or "MEASURED_FAIL:<recorded GitHub-read failure>"
 
 if ([MON, SPACE, CONV, AGENT_ID].some((v) => v.startsWith("REPLACE_")) || MSG_FILE.startsWith("REPLACE_")) {
   console.log("RESULT=ADAPTATION_REQUIRED");
@@ -378,6 +379,21 @@ if (await getFillCount(MON, SPACE) >= 3) { // Gate 3 (FRESHEN)
   await ensureOwnEmptyComposer(); // resurrection check, never skipped
 }
 
+// ---- #28 §3.2 attachment-channel precheck — fail-closed BEFORE any PREPARED ledger write ----
+// GitHub-first is the default material channel (handbook §3.2). Downgrading to the
+// attachment channel requires an explicitly recorded basis in ATTACH_CHANNEL_EVIDENCE:
+// USER_STATED:<peer repo permission the user stated in-session> or MEASURED_FAIL:<the
+// actual GitHub-read failure, never an assumption>. A missing or malformed basis stops
+// the dispatch before PREPARED, so the corrected next round starts without ledger state,
+// and the basis is echoed to the output stream as the downgrade's written record.
+if (ATTACHMENTS.length > 0) {
+  if (!ATTACH_CHANNEL_EVIDENCE) abort("ATTACHMENT_CHANNEL_PRECHECK_MISSING");
+  if (!/^(USER_STATED|MEASURED_FAIL):/.test(ATTACH_CHANNEL_EVIDENCE) || ATTACH_CHANNEL_EVIDENCE.length > 220) {
+    abort("ATTACHMENT_CHANNEL_PRECHECK_INVALID");
+  }
+  console.log("ATTACH_CHANNEL_BASIS=" + ATTACH_CHANNEL_EVIDENCE.slice(0, 220));
+}
+
 // ---- Gate 4: PREPARED persisted BEFORE the first insertText (r44 P0-B3 — frozen chain order:
 // PREPARED → 填充 → 回读 → …). An interrupted fill then resumes from the persisted dispatch identity,
 // not from runtime file contents.
@@ -454,7 +470,83 @@ if (attachmentBefore) {
     mounted = verifyAttachmentEvidence(attachmentBefore, await composerOp(attachmentSurface), attachmentNames);
     if (!mounted) await page.waitForTimeout(800);
   }
-  if (!mounted) abort("ATTACHMENT_NOT_VERIFIED");
+  if (!mounted) {
+    // #39-① evidence: the live composer form/action bar has drifted from the
+    // attachmentSurface assumptions (form.text, send-button selector, filename chips).
+    // Dump the actual region before the fail-closed stop — read-only; the abort below
+    // is unchanged. Field facts wanted: whether forms/editors exist, which send
+    // control is present and whether it is disabled, how many file inputs carry the
+    // mounted files, and whether any element text hits the attachment filenames.
+    try {
+      const evidence = await page.evaluate((names) => {
+        const visible = (el) => {
+          try {
+            const s = getComputedStyle(el);
+            if (s.display === "none" || s.visibility === "hidden") return false;
+          } catch {}
+          if (el.getClientRects().length > 0) return true;
+          const rect = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+          return Boolean(rect && rect.width > 0 && rect.height > 0);
+        };
+        const attr = (el, name) => String(el.getAttribute(name) || "").slice(0, 40);
+        const buttonBrief = (el) => ({
+          tag: el.tagName,
+          ariaLabel: attr(el, "aria-label"),
+          title: attr(el, "title"),
+          text: String(el.textContent || "").trim().slice(0, 16),
+          disabled: el.disabled === true || el.getAttribute("aria-disabled") === "true",
+        });
+        const fileBrief = (inp) => ({
+          ariaLabel: attr(inp, "aria-label"),
+          accept: String(inp.getAttribute("accept") || "").slice(0, 60),
+          files: inp.files ? inp.files.length : null,
+        });
+        const forms = [...document.querySelectorAll("form")].slice(0, 4).map((form) => {
+          const send = form.querySelector("button[aria-label='发送'], button[data-testid='send-button']");
+          const text = String(form.innerText || "");
+          return {
+            visible: visible(form),
+            text: text.slice(0, 100),
+            images: form.querySelectorAll("img").length,
+            sendButton: send ? {
+              ariaLabel: attr(send, "aria-label"),
+              disabled: send.disabled === true || send.getAttribute("aria-disabled") === "true",
+            } : null,
+            fileInputs: [...form.querySelectorAll("input[type='file']")].map(fileBrief),
+            buttons: [...form.querySelectorAll("button")].filter(visible).slice(0, 12).map(buttonBrief),
+            filenameHits: names.filter((name) => text.includes(name)).length,
+          };
+        });
+        // Composer action-bar fallback: buttons around activeElement (form + 3 ancestors)
+        // even when the composer area is not inside a form.
+        const scopes = new Set();
+        let node = document.activeElement;
+        for (let depth = 0; node && depth < 4; depth++) {
+          scopes.add(node);
+          if (node.form) scopes.add(node.form);
+          node = node.parentElement;
+        }
+        const nearbyButtons = [];
+        const seenButtons = new Set();
+        for (const scope of scopes) {
+          for (const b of scope.querySelectorAll("button")) {
+            if (visible(b) && !seenButtons.has(b)) { seenButtons.add(b); nearbyButtons.push(buttonBrief(b)); }
+          }
+        }
+        return {
+          forms,
+          composerNearbyButtons: nearbyButtons.slice(0, 12),
+          allFileInputs: [...document.querySelectorAll("input[type='file']")].map(fileBrief).slice(0, 8),
+          filenameTextEls: names.map((name) =>
+            [...document.querySelectorAll("*")].filter((el) => el.children.length === 0 &&
+              String(el.textContent || "").includes(name)).length),
+          names: names.map((name) => String(name).slice(0, 40)),
+        };
+      }, attachmentNames);
+      console.log("ATTACH_DUMP=" + JSON.stringify(evidence).slice(0, 900));
+    } catch {}
+    abort("ATTACHMENT_NOT_VERIFIED");
+  }
 }
 
 // ---- Gate 7: chat mode is mandatory before thinking-level precheck.
@@ -482,6 +574,76 @@ if (!chatMode) {
       .filter((el) => el.getClientRects().length > 0)
       .map((el) => (el.textContent || "").trim().slice(0, 20) + "=" + el.getAttribute("aria-pressed")));
     console.log("MODE_LABELS=" + JSON.stringify(dump).slice(0, 300));
+  } catch {}
+  // #39-② (+#21) evidence: on the live UI the old toggle/aria-pressed carriers are gone
+  // and the mode state has moved elsewhere. Dump every plausible carrier before the
+  // fail-closed stop — read-only; the abort below is unchanged. Field facts: visible
+  // aria-pressed buttons carry empty textContent, and the composer aria-label itself is
+  // the mode carrier (chat = 询问 ChatGPT, codex = 随心输入), which matches no mode
+  // keyword — so editors and popup controls are dumped explicitly.
+  try {
+    const evidence = await page.evaluate(() => {
+      const visible = (el) => {
+        try {
+          const s = getComputedStyle(el);
+          if (s.display === "none" || s.visibility === "hidden") return false;
+        } catch {}
+        if (el.getClientRects().length > 0) return true;
+        const rect = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+        return Boolean(rect && rect.width > 0 && rect.height > 0);
+      };
+      const attr = (el, name) => String(el.getAttribute(name) || "").slice(0, 40);
+      const modeBrief = (el) => ({
+        tag: el.tagName,
+        ariaLabel: attr(el, "aria-label"),
+        title: attr(el, "title"),
+        pressed: el.getAttribute("aria-pressed"),
+        expanded: el.getAttribute("aria-expanded"),
+        text: String(el.textContent || "").trim().slice(0, 16),
+      });
+      // Composer identity carriers (any visible editable surface).
+      const editors = [...document.querySelectorAll('[contenteditable="true"], [role="textbox"]')]
+        .filter(visible).slice(0, 6)
+        .map((el) => ({
+          tag: el.tagName,
+          ariaLabel: attr(el, "aria-label"),
+          placeholder: String(el.getAttribute("data-placeholder") || el.getAttribute("placeholder") || "").slice(0, 20),
+        }));
+      // Keyword carrier: any element whose aria-label/title hints at a mode surface.
+      const modeRe = /模式|mode|聊天|chat|codex|工作|Switch/i;
+      const modeAttrEls = [...document.querySelectorAll("*")]
+        .filter((el) => modeRe.test(String(el.getAttribute("aria-label") || "") + "\u0000" + String(el.getAttribute("title") || "")) && visible(el))
+        .slice(0, 12).map(modeBrief);
+      // Popup/combobox surfaces that can host a mode menu.
+      const popupControls = [...document.querySelectorAll("[aria-haspopup], [role='combobox']")]
+        .filter(visible).slice(0, 8)
+        .map((el) => ({ tag: el.tagName, ariaLabel: attr(el, "aria-label"), expanded: el.getAttribute("aria-expanded") }));
+      // Buttons around the composer: activeElement plus its form and three ancestor levels.
+      const scopes = new Set();
+      let node = document.activeElement;
+      for (let depth = 0; node && depth < 4; depth++) {
+        scopes.add(node);
+        if (node.form) scopes.add(node.form);
+        node = node.parentElement;
+      }
+      const nearbyButtons = [];
+      const seenButtons = new Set();
+      for (const scope of scopes) {
+        for (const b of scope.querySelectorAll("button")) {
+          if (visible(b) && !seenButtons.has(b)) { seenButtons.add(b); nearbyButtons.push(modeBrief(b)); }
+        }
+      }
+      const active = document.activeElement;
+      return {
+        activeElement: active ? { tag: active.tagName, ariaLabel: attr(active, "aria-label"), title: attr(active, "title") } : null,
+        editors,
+        visibleAriaPressedButtons: [...document.querySelectorAll("button[aria-pressed]")].filter(visible).length,
+        modeAttrEls,
+        popupControls,
+        composerNearbyButtons: nearbyButtons.slice(0, 16),
+      };
+    });
+    console.log("MODE_DUMP=" + JSON.stringify(evidence).slice(0, 900));
   } catch {}
   abort("CHAT_MODE_UNVERIFIED_STOP");
 }

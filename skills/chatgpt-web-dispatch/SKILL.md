@@ -48,14 +48,14 @@ metadata:
 
 ## 项目材料交接（两人工作流，细则见手册 §3.2）
 
-**文件走 GitHub，网页走短消息。** 项目源码、任务书、证据与补丁优先使用对应项目仓库；临时材料放独立 `handoff/<日期>-<任务>` 分支。网页派单正文给出 **仓库 + 分支 + 完整 Commit SHA + 文件路径 + 本轮要求**，收件方按 SHA 读取并确认版本。无法读取时报告真实错误，再选已授权的文档连接器或既有附件通道；不要把大材料退化成反复网页粘贴。**敏感资料不得入 Git 历史**，清理分支也无法保证历史彻底消失。
+**文件走 GitHub，网页走短消息。** 项目源码、任务书、证据与补丁优先使用对应项目仓库；临时材料放独立 `handoff/<日期>-<任务>` 分支。网页派单正文给出 **仓库 + 分支 + 完整 Commit SHA + 文件路径 + 本轮要求**，收件方按 SHA 读取并确认版本。无法读取时报告真实错误，再选已授权的文档连接器或既有附件通道；不要把大材料退化成反复网页粘贴。**敏感资料不得入 Git 历史**，清理分支也无法保证历史彻底消失。附件通道降级必须有据：模板适配器 `ATTACH_CHANNEL_EVIDENCE` 只接受 `USER_STATED:<用户明示的对端权限>` 或 `MEASURED_FAIL:<实测读取失败记录>` 前缀，附件派单缺失/非法即 `ATTACHMENT_CHANNEL_PRECHECK_MISSING/INVALID` 在 PREPARED 前 fail-closed 停止，依据以 `ATTACH_CHANNEL_BASIS=` 留痕（手册 §3.2）。
 
 此规则仅改变材料承载位置；现有派单九闸门、Composer 校验与监控流程照常执行。
 
 ## 相关事实源
 
 - 监控脚本唯一存放点：**本仓库 `monitor/` 目录（PO 令 2026-11-08 并入 agent-kit；原独立 ego-tools 本地仓库停用为历史归档）**；要改脚本只改仓库内这一份，禁止本地另立孤本副本。**开工前 `git pull` 同步官方最新**（任务边界更新，skill 与脚本天然同版交付）。状态机文件：`dispatch-state.mjs`（派单账本 + 结构化 Composer/尾部读取）、`state-schema.mjs`（v3 Schema + 绝对 deadline）、`page-recovery.mjs`（多 Page URL-UUID 消歧）、`ego-profile-check.mjs`（本机账号钉扎校验）。
-- **派单规范模板**：`templates/dispatch-round.template.mjs`（R2.5 九闸门冻结事务链 + R2.6-F 自适应填充，见手册 §3.1）。统一管理器内部使用此模板生成每轮脚本，业务 Agent 不手改模板适配器。遇到 `ADAPTATION_REQUIRED` 说明环境与模板假设不符，STOP 上报，不要徒手重写链路。
+- **派单规范模板**：`templates/dispatch-round.template.mjs`（R2.5 九闸门冻结事务链 + R2.6-F 自适应填充，见手册 §3.1）。统一管理器内部使用此模板生成每轮脚本，业务 Agent 不手改模板适配器。遇到 `ADAPTATION_REQUIRED` 说明环境与模板假设不符，STOP 上报，不要徒手重写链路。失败路径取证行（只增不改判据）：模式不可证 STOP 前输出 `MODE_LABELS=`/`MODE_DUMP=`（#39-②），附件挂载未证实 STOP 前输出 `ATTACH_DUMP=`（#39-①）。
 - 跨机器交付的 SHA256 必须注明哈希对象与字节基准（Git blob / 下载文件 / 部署磁盘，注明 LF/CRLF），见手册 §11.10。
 - 通用浏览器操作（非 ChatGPT 派单流）见 `ego-browser` skill。
 - 弃用声明：chrome-use / chatgpt-use 已全面弃用，仅存量旧脚本可读，禁止新建依赖。

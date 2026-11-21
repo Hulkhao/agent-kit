@@ -624,6 +624,107 @@ test("Gate 9b: persistence is verified BEFORE markAccepted and fails closed to U
   assert.match(gate9, /evidence: "GATE9_TAIL_ADVANCED"/);
 });
 
+// ---- #39-②/#39-①/#28 phase 1: failure-path evidence dumps + attachment-channel precheck ----
+// Phase 1 contract: the evidence lines are ADDITIVE ONLY. The frozen pass criteria,
+// gate order and abort codes must remain byte-for-byte in effect; the Gate 7 matcher
+// itself is fixed in phase 2 after the supervisor replays these dumps on the live UI.
+
+test("#39-② Gate 7: MODE_DUMP is additive read-only evidence inside !chatMode; MODE_LABELS and the abort are unchanged", async () => {
+  const src = await template();
+  const branchStart = src.indexOf("if (!chatMode) {");
+  const abortAt = src.indexOf('abort("CHAT_MODE_UNVERIFIED_STOP")', branchStart);
+  assert.ok(branchStart > 0 && abortAt > branchStart, "!chatMode failure branch must keep its abort");
+  const branch = src.slice(branchStart, abortAt + 'abort("CHAT_MODE_UNVERIFIED_STOP")'.length);
+  // Old evidence line retained, new dump added in front of the unchanged abort.
+  assert.ok(branch.indexOf("MODE_LABELS=") >= 0 && branch.indexOf("MODE_LABELS=") < branch.indexOf("MODE_DUMP="));
+  assert.ok(branch.indexOf("MODE_DUMP=") >= 0 && branch.indexOf("MODE_DUMP=") < abortAt - branchStart,
+    "MODE_DUMP must be emitted before the unchanged fail-closed abort");
+  assert.doesNotMatch(branch, /page\.(click|focus|keyboard|setInputFiles|goto)\b/, "evidence dumps must be read-only");
+  // Fixed truncation bounds: 300 for the legacy line, 900 for the comprehensive dump.
+  assert.match(branch, /JSON\.stringify\(dump\)\.slice\(0, 300\)/);
+  assert.match(branch, /JSON\.stringify\(evidence\)\.slice\(0, 900\)/);
+  // Capture fields: keyword carriers (any tag), composer identity carriers, popup
+  // controls, activeElement identity and the visible aria-pressed button count.
+  assert.match(branch, /模式\|mode\|聊天\|chat\|codex\|工作\|Switch/i);
+  assert.match(branch, /\[contenteditable="true"\], \[role="textbox"\]/);
+  assert.match(branch, /data-placeholder/);
+  assert.match(branch, /\[aria-haspopup\], \[role='combobox'\]/);
+  assert.match(branch, /activeElement: active \? \{ tag: active\.tagName, ariaLabel: attr\(active, "aria-label"\), title: attr\(active, "title"\) \} : null/);
+  assert.match(branch, /visibleAriaPressedButtons:/);
+  assert.match(branch, /composerNearbyButtons/);
+  // Gate 7 matcher itself is untouched in phase 1: primary toggle check, chat-family
+  // acceptance and the aria-pressed fallback all stay exactly as frozen.
+  assert.match(src, /切换模式\|Switch mode\|current mode/i);
+  assert.match(src, /\^\(ChatGPT\|聊天\|Chat\)\$\/i\.test\(current\.trim\(\)\)/);
+  assert.match(src, /fallback: aria-pressed pair \(older UIs\)/);
+  assert.match(src, /chat\.every\(\(m\) => m\.pressed === "true"\)/);
+});
+
+test("#39-① Gate 6: ATTACH_DUMP is additive read-only evidence in the ATTACHMENT_NOT_VERIFIED branch; mount polling and abort are unchanged", async () => {
+  const src = await template();
+  const attachAt = src.indexOf("if (attachmentBefore) {");
+  const gate7At = src.indexOf("// ---- Gate 7:");
+  assert.ok(attachAt > 0 && gate7At > attachAt, "attachment evidence block must sit before Gate 7");
+  const block = src.slice(attachAt, gate7At);
+  // The frozen verify loop: same predicate, 4 x 800ms polling, same abort code.
+  assert.match(block, /verifyAttachmentEvidence\(attachmentBefore, await composerOp\(attachmentSurface\), attachmentNames\)/);
+  assert.match(block, /attempt < 4/);
+  assert.match(block, /waitForTimeout\(800\)/);
+  const abortAt = block.indexOf('abort("ATTACHMENT_NOT_VERIFIED")');
+  const dumpAt = block.indexOf("ATTACH_DUMP=");
+  assert.ok(abortAt > 0 && dumpAt > 0 && dumpAt < abortAt, "ATTACH_DUMP must be emitted before the unchanged abort");
+  assert.doesNotMatch(block.slice(block.indexOf("if (!mounted) {")), /page\.(click|focus|keyboard|setInputFiles|goto)\b/,
+    "evidence dump must be read-only");
+  // Capture fields: file inputs (files.length + accept), filename text hits, send
+  // control disabled state with its aria-label, and the composer action-bar fallback.
+  assert.match(block, /files: inp\.files \? inp\.files\.length : null/);
+  assert.match(block, /accept: String\(inp\.getAttribute\("accept"\)/);
+  assert.match(block, /filenameTextEls/);
+  assert.match(block, /sendButton/);
+  assert.match(block, /getAttribute\("aria-disabled"\) === "true"/);
+  assert.match(block, /composerNearbyButtons/);
+  assert.match(block, /JSON\.stringify\(evidence\)\.slice\(0, 900\)/);
+});
+
+test("#28 §3.2: attachment-channel precheck is fail-closed before PREPARED; basis prefixes enforced; resume interlock untouched", async () => {
+  const src = await template();
+  // The adapter default is an empty string — never a REPLACE_WITH_ token, otherwise
+  // the manager's adaptTemplate would throw ADAPTER_UNRESOLVED for every dispatch.
+  assert.match(src, /const ATTACH_CHANNEL_EVIDENCE = ""; \/\/ #28 §3\.2 precheck/);
+  assert.doesNotMatch(src, /ATTACH_CHANNEL_EVIDENCE = "REPLACE_/);
+  const precheckAt = src.indexOf("#28 §3.2 attachment-channel precheck");
+  const preparedAt = src.indexOf("// ---- Gate 4: PREPARED persisted");
+  const mountAt = src.indexOf("page.setInputFiles");
+  assert.ok(precheckAt > 0 && preparedAt > precheckAt, "precheck must precede the Gate 4 PREPARED banner");
+  assert.ok(mountAt > precheckAt, "precheck must precede the attachment mount");
+  const precheck = src.slice(precheckAt, preparedAt);
+  // Fires only for attachment dispatches; a missing or malformed basis stops before
+  // any ledger write, and the basis is echoed as the downgrade's written record.
+  assert.match(precheck, /if \(ATTACHMENTS\.length > 0\) \{/);
+  assert.match(precheck, /abort\("ATTACHMENT_CHANNEL_PRECHECK_MISSING"\)/);
+  assert.match(precheck, /abort\("ATTACHMENT_CHANNEL_PRECHECK_INVALID"\)/);
+  assert.match(precheck, /\^\(USER_STATED\|MEASURED_FAIL\):/);
+  assert.match(precheck, /ATTACH_CHANNEL_BASIS=/);
+  // The frozen resume interlock inside the fill branch is byte-for-byte unchanged and
+  // still precedes the fill attempt.
+  const resumeAt = src.indexOf('if (resume) abort("ATTACHMENT_RESUME_REQUIRES_RECONCILIATION")');
+  const fillAt = src.indexOf("recordFillAttempt(MON, SPACE)");
+  assert.ok(resumeAt > 0 && fillAt > resumeAt);
+});
+
+test("#28/#39 phase 1: dump lines never leak tokens or payload text into the output stream", async () => {
+  const src = await template();
+  const modeBranch = src.slice(src.indexOf("if (!chatMode) {"), src.indexOf('abort("CHAT_MODE_UNVERIFIED_STOP")'));
+  const attachBranch = src.slice(src.indexOf("if (!mounted) {"), src.indexOf('abort("ATTACHMENT_NOT_VERIFIED")'));
+  for (const branch of [modeBranch, attachBranch]) {
+    assert.doesNotMatch(branch, /accessToken|token|cookie/i);
+    assert.doesNotMatch(branch, /payload/);
+  }
+  // The precheck echo is bounded and carries the adapter's own basis string only.
+  const precheck = src.slice(src.indexOf("#28 §3.2 attachment-channel precheck"), src.indexOf("// ---- Gate 4: PREPARED persisted"));
+  assert.match(precheck, /ATTACH_CHANNEL_EVIDENCE\.slice\(0, 220\)/);
+});
+
 test("#30: recover-draft ledger semantics — only a proved PREPARED aborts to ABORTED, everything else is rejected", async () => {
   const { abortPreparedDispatch, writeJsonAtomic } = await import("../monitor/dispatch-state.mjs");
   const { mkdtemp, readFile, rm } = await import("node:fs/promises");
