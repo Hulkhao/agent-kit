@@ -55,7 +55,7 @@ metadata:
 ## 相关事实源
 
 - 监控脚本唯一存放点：**本仓库 `monitor/` 目录（PO 令 2026-11-08 并入 agent-kit；原独立 ego-tools 本地仓库停用为历史归档）**；要改脚本只改仓库内这一份，禁止本地另立孤本副本。**开工前 `git pull` 同步官方最新**（任务边界更新，skill 与脚本天然同版交付）。状态机文件：`dispatch-state.mjs`（派单账本 + 结构化 Composer/尾部读取）、`state-schema.mjs`（v3 Schema + 绝对 deadline）、`page-recovery.mjs`（多 Page URL-UUID 消歧）、`ego-profile-check.mjs`（本机账号钉扎校验）。
-- **派单规范模板**：`templates/dispatch-round.template.mjs`（R2.5 九闸门冻结事务链 + R2.6-F 自适应填充，见手册 §3.1）。统一管理器内部使用此模板生成每轮脚本，业务 Agent 不手改模板适配器。遇到 `ADAPTATION_REQUIRED` 说明环境与模板假设不符，STOP 上报，不要徒手重写链路。失败路径取证行（只增不改判据）：模式不可证 STOP 前输出 `MODE_LABELS=`/`MODE_DUMP=`（#39-②），附件挂载未证实 STOP 前输出 `ATTACH_DUMP=`（#39-①）。
+- **派单规范模板**：`templates/dispatch-round.template.mjs`（R2.5 九闸门冻结事务链 + R2.6-F 自适应填充，见手册 §3.1）。统一管理器内部使用此模板生成每轮脚本，业务 Agent 不手改模板适配器。遇到 `ADAPTATION_REQUIRED` 说明环境与模板假设不符，STOP 上报，不要徒手重写链路。Gate 7 主检查=可见 composer aria-label（#21：chat=询问 ChatGPT/codex=随心输入；codex 拒绝留痕 `MODE_REJECT=`，未知一律降级旧判据再 STOP）。失败路径取证行（只增不改判据）：模式不可证 STOP 前输出 `MODE_LABELS=`/`MODE_DUMP=`（#39-②），附件挂载未证实 STOP 前输出 `ATTACH_DUMP=`（#39-①）。
 - 跨机器交付的 SHA256 必须注明哈希对象与字节基准（Git blob / 下载文件 / 部署磁盘，注明 LF/CRLF），见手册 §11.10。
 - 通用浏览器操作（非 ChatGPT 派单流）见 `ego-browser` skill。
 - 弃用声明：chrome-use / chatgpt-use 已全面弃用，仅存量旧脚本可读，禁止新建依赖。

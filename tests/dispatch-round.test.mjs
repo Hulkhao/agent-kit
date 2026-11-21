@@ -626,8 +626,11 @@ test("Gate 9b: persistence is verified BEFORE markAccepted and fails closed to U
 
 // ---- #39-②/#39-①/#28 phase 1: failure-path evidence dumps + attachment-channel precheck ----
 // Phase 1 contract: the evidence lines are ADDITIVE ONLY. The frozen pass criteria,
-// gate order and abort codes must remain byte-for-byte in effect; the Gate 7 matcher
-// itself is fixed in phase 2 after the supervisor replays these dumps on the live UI.
+// gate order and abort codes must remain byte-for-byte in effect. Phase 2 (#39-②
+// live MODE_DUMP evidence) later replaced the Gate 7 matcher's PRIMARY carrier with
+// the visible composer aria-label — the tests below enforce the frozen invariants
+// that survived that rewrite: legacy carriers verbatim, strict accept families,
+// fail-closed unknown handling and the unchanged failure-branch aborts.
 
 test("#39-② Gate 7: MODE_DUMP is additive read-only evidence inside !chatMode; MODE_LABELS and the abort are unchanged", async () => {
   const src = await template();
@@ -652,12 +655,163 @@ test("#39-② Gate 7: MODE_DUMP is additive read-only evidence inside !chatMode;
   assert.match(branch, /activeElement: active \? \{ tag: active\.tagName, ariaLabel: attr\(active, "aria-label"\), title: attr\(active, "title"\) \} : null/);
   assert.match(branch, /visibleAriaPressedButtons:/);
   assert.match(branch, /composerNearbyButtons/);
-  // Gate 7 matcher itself is untouched in phase 1: primary toggle check, chat-family
-  // acceptance and the aria-pressed fallback all stay exactly as frozen.
-  assert.match(src, /切换模式\|Switch mode\|current mode/i);
-  assert.match(src, /\^\(ChatGPT\|聊天\|Chat\)\$\/i\.test\(current\.trim\(\)\)/);
-  assert.match(src, /fallback: aria-pressed pair \(older UIs\)/);
-  assert.match(src, /chat\.every\(\(m\) => m\.pressed === "true"\)/);
+});
+
+test("#39-② phase 2 matcher: frozen invariants — editor-label primary carrier, verbatim legacy fallback, fail-closed accept list", async () => {
+  const src = await template();
+  const matcherAt = src.indexOf("const chatModeEvidence = await composerOp(() => page.evaluate(");
+  const gateEnd = src.indexOf("const chatMode = chatModeEvidence.chat;");
+  assert.ok(matcherAt > 0 && gateEnd > matcherAt, "the matcher must feed chatModeEvidence into chatMode");
+  const matcher = src.slice(matcherAt, gateEnd);
+  // Primary carrier is the visible composer label, decisive only inside the frozen
+  // families; the accept list is NOT widened to codex family or unknown labels.
+  assert.match(matcher, /\^\(询问 ChatGPT\|Ask ChatGPT\|聊天\|Chat\)\$\/i/);
+  assert.match(matcher, /\^\(随心输入\|工作\|Work\|Codex\)\$\/i/);
+  assert.match(matcher, /if \(chatEditors\.length > 0 && codexEditors\.length === 0\) return \{ chat: true, reason: "editor-label"/,
+    "accept requires chat evidence AND zero codex markers");
+  assert.match(matcher, /if \(codexEditors\.length > 0\) return \{ chat: false, reason: "codex-editor"/,
+    "codex evidence is an explicit reject, never a pass");
+  assert.ok(matcher.indexOf("reason: \"editor-label\"") < matcher.indexOf("Legacy carriers"),
+    "the editor carrier must be consulted before the legacy carriers");
+  // Legacy carriers survive verbatim behind the primary check (old toggle UIs keep working).
+  assert.match(matcher, /切换模式\|Switch mode\|current mode/i);
+  assert.match(matcher, /\^\(ChatGPT\|聊天\|Chat\)\$\/i\.test\(current\.trim\(\)\)/);
+  assert.match(matcher, /fallback: aria-pressed pair \(older UIs\)/);
+  assert.match(matcher, /chat\.every\(\(m\) => m\.pressed === "true"\)/);
+  // The codex rejection is logged before the dumps and the unchanged abort.
+  const branchStart = src.indexOf("if (!chatMode) {");
+  const abortAt = src.indexOf('abort("CHAT_MODE_UNVERIFIED_STOP")', branchStart);
+  const branch = src.slice(branchStart, abortAt + 'abort("CHAT_MODE_UNVERIFIED_STOP")'.length);
+  const rejectAt = branch.indexOf("MODE_REJECT=CODEX_EDITOR:");
+  assert.ok(rejectAt >= 0 && rejectAt < branch.indexOf("MODE_LABELS="),
+    "the codex verdict line precedes the evidence dumps");
+  assert.match(branch, /reason === "codex-editor"/);
+  assert.match(branch, /String\(chatModeEvidence\.label \|\| ""\)\.slice\(0, 40\)/);
+});
+
+// Execute the template's ACTUAL Gate 7 matcher against a minimal fake document.
+// The slice spans the composerOp call so the real page.evaluate callback runs.
+async function chatModeHarness({ editors = [], buttons = [], pressedButtons = [] } = {}) {
+  const src = await template();
+  const start = src.indexOf("const chatModeEvidence = await composerOp(() => page.evaluate(");
+  const end = src.indexOf("const chatMode = chatModeEvidence.chat;");
+  assert.ok(start > 0 && end > start, "expected the Gate 7 matcher in the template");
+  const document = {
+    querySelectorAll(selector) {
+      if (selector.includes("contenteditable")) return editors;
+      if (selector === "button") return buttons;
+      if (selector === "button[aria-pressed]") return pressedButtons;
+      return [];
+    },
+  };
+  const api = await runInNewContext(
+    "(async () => {\n" + src.slice(start, end) + "\nreturn { chatModeEvidence };\n})()", {
+      document,
+      composerOp: (fn) => fn(),
+      page: { evaluate: (fn) => fn() },
+    });
+  return api.chatModeEvidence;
+}
+
+function editorEl(label, visible = true) {
+  return { getAttribute: (key) => (key === "aria-label" ? label : null), getClientRects: () => (visible ? [{}] : []) };
+}
+function buttonEl(label) {
+  return { getAttribute: (key) => (key === "aria-label" ? label : null), getClientRects: () => [{}] };
+}
+function pressedButtonEl(label, pressed) {
+  return {
+    textContent: label,
+    getAttribute: (key) => (key === "aria-pressed" ? pressed : null),
+    getClientRects: () => [{}],
+  };
+}
+
+test("#39-② phase 2 behavior: visible chat-family composer label proves chat mode (zh + en, primary carrier wins)", async () => {
+  const zh = await chatModeHarness({ editors: [editorEl("询问 ChatGPT")] });
+  assert.equal(zh.chat, true);
+  assert.equal(zh.reason, "editor-label");
+  const en = await chatModeHarness({ editors: [editorEl("Ask ChatGPT")] });
+  assert.equal(en.chat, true);
+  // Primary carrier precedence: a chat editor decides even when a stale legacy
+  // toggle would have rejected (editor evidence is checked first).
+  const precedence = await chatModeHarness({
+    editors: [editorEl("询问 ChatGPT")],
+    buttons: [buttonEl("切换模式，当前模式：Codex")],
+  });
+  assert.equal(precedence.chat, true);
+  // Trailing whitespace is trimmed before matching; exactness is judged on the trimmed label.
+  const trimmed = await chatModeHarness({ editors: [editorEl("询问 ChatGPT ")] });
+  assert.equal(trimmed.chat, true);
+  // Extra text on the label makes it UNKNOWN → falls to the legacy carriers → no proof.
+  const widened = await chatModeHarness({ editors: [editorEl("询问 ChatGPT 什么")] });
+  assert.equal(widened.chat, false, "extra label text must never widen the accept list");
+  assert.equal(widened.reason, "legacy-aria-pressed");
+});
+
+test("#39-② phase 2 behavior: codex-family composer label is an explicit reject", async () => {
+  const codex = await chatModeHarness({ editors: [editorEl("随心输入")] });
+  assert.equal(codex.chat, false);
+  assert.equal(codex.reason, "codex-editor");
+  assert.equal(codex.label, "随心输入");
+  // #21 fact with a possible suffix variant still rejects through the substring guard.
+  const variant = await chatModeHarness({ editors: [editorEl("随心输入，回车发送")] });
+  assert.equal(variant.chat, false);
+  assert.equal(variant.reason, "codex-editor");
+  // Work-family words from the frozen reject list.
+  for (const label of ["Work", "Codex", "工作"]) {
+    const rejected = await chatModeHarness({ editors: [editorEl(label)] });
+    assert.equal(rejected.chat, false, `${label} must reject`);
+    assert.equal(rejected.reason, "codex-editor");
+  }
+  // Ambiguity fails closed: a chat label alongside a codex label never passes.
+  const mixed = await chatModeHarness({ editors: [editorEl("询问 ChatGPT"), editorEl("随心输入")] });
+  assert.equal(mixed.chat, false);
+  const mixedOrder = await chatModeHarness({ editors: [editorEl("随心输入"), editorEl("询问 ChatGPT")] });
+  assert.equal(mixedOrder.chat, false);
+});
+
+test("#39-② phase 2 behavior: unknown labels, no editors and hidden editors fall through to the legacy carriers; unprovable still STOPs", async () => {
+  const emptyPressed = Array.from({ length: 14 }, () => pressedButtonEl("", "false"));
+  // The captured #39-② shape WITHOUT editors: 14 empty aria-pressed buttons cannot
+  // prove chat → legacy verdict false → CHAT_MODE_UNVERIFIED_STOP territory.
+  const noEditor = await chatModeHarness({ pressedButtons: emptyPressed });
+  assert.equal(noEditor.chat, false);
+  assert.equal(noEditor.reason, "legacy-aria-pressed");
+  // Unknown editor labels never widen the accept list: they fall through.
+  const unknown = await chatModeHarness({ editors: [editorEl("Edit code")] });
+  assert.equal(unknown.chat, false);
+  assert.equal(unknown.reason, "legacy-aria-pressed");
+  // Visibility is mandatory: a hidden chat editor must not prove anything.
+  const hidden = await chatModeHarness({ editors: [editorEl("询问 ChatGPT", false)], pressedButtons: emptyPressed });
+  assert.equal(hidden.chat, false);
+  assert.equal(hidden.reason, "legacy-aria-pressed");
+  // Empty aria-label editors are ignored, same fallthrough.
+  const unlabeled = await chatModeHarness({ editors: [editorEl("")], pressedButtons: emptyPressed });
+  assert.equal(unlabeled.chat, false);
+});
+
+test("#39-② phase 2 behavior: legacy toggle UI still resolves through the old carriers", async () => {
+  const chatToggle = await chatModeHarness({ buttons: [buttonEl("切换模式，当前模式：ChatGPT")] });
+  assert.equal(chatToggle.chat, true);
+  assert.equal(chatToggle.reason, "legacy-toggle");
+  const codexToggle = await chatModeHarness({ buttons: [buttonEl("切换模式，当前模式：Codex")] });
+  assert.equal(codexToggle.chat, false);
+  assert.equal(codexToggle.reason, "legacy-toggle");
+  // Old aria-pressed pair UI: chat pressed + no work buttons → pass.
+  const pressed = await chatModeHarness({
+    pressedButtons: [pressedButtonEl("Chat", "true"), pressedButtonEl("Chat", "true")],
+  });
+  assert.equal(pressed.chat, true);
+  assert.equal(pressed.reason, "legacy-aria-pressed");
+  // Old aria-pressed pair UI: work pressed → reject.
+  const workPressed = await chatModeHarness({
+    pressedButtons: [pressedButtonEl("Chat", "true"), pressedButtonEl("Work", "true")],
+  });
+  assert.equal(workPressed.chat, false);
+  // Nothing at all: fail closed.
+  const nothing = await chatModeHarness({});
+  assert.equal(nothing.chat, false);
 });
 
 test("#39-① Gate 6: ATTACH_DUMP is additive read-only evidence in the ATTACHMENT_NOT_VERIFIED branch; mount polling and abort are unchanged", async () => {

@@ -550,14 +550,31 @@ if (attachmentBefore) {
 }
 
 // ---- Gate 7: chat mode is mandatory before thinking-level precheck.
-const chatMode = await composerOp(() => page.evaluate(() => {
-  // r48.2: the mode state lives in the toggle's aria-label ("切换模式，当前模式：ChatGPT");
-  // aria-pressed mode buttons no longer exist on the current UI. Chat-family labels
-  // accepted: ChatGPT / 聊天 / Chat. Work-family: Codex / 工作 / Work.
+// Primary carrier (2026-11-21 field evidence, #39-② MODE_DUMP + #21): the composer's own
+// aria-label carries the mode — chat = 询问 ChatGPT / Ask ChatGPT (bilingual, the same
+// exact set as the COMPOSER_ACTIVATION check, plus the mode words 聊天/Chat), codex =
+// 随心输入. Editor labels outside these frozen families are UNKNOWN and fall through to
+// the legacy carriers below; chat mode staying unprovable there is a STOP. Codex/work
+// evidence is an explicit REJECT — the accept list is never widened to unknown labels.
+const chatModeEvidence = await composerOp(() => page.evaluate(() => {
+  const CHAT_EDITOR_RE = /^(询问 ChatGPT|Ask ChatGPT|聊天|Chat)$/i;
+  const CODEX_EDITOR_RE = /^(随心输入|工作|Work|Codex)$/i;
+  const labels = [...document.querySelectorAll('[contenteditable="true"], [role="textbox"]')]
+    .filter((el) => el.getClientRects().length > 0)
+    .map((el) => (el.getAttribute("aria-label") || "").trim())
+    .filter(Boolean);
+  const chatEditors = labels.filter((label) => CHAT_EDITOR_RE.test(label));
+  const codexEditors = labels.filter((label) => CODEX_EDITOR_RE.test(label) || label.includes("随心输入"));
+  // Accept ONLY on chat-family evidence with ZERO codex markers among visible editors.
+  if (chatEditors.length > 0 && codexEditors.length === 0) return { chat: true, reason: "editor-label", label: chatEditors[0] };
+  if (codexEditors.length > 0) return { chat: false, reason: "codex-editor", label: codexEditors[0] };
+  // Legacy carriers (r48.2 field recipe): the mode state lives in the toggle's
+  // aria-label ("切换模式，当前模式：ChatGPT"); Chat-family labels accepted:
+  // ChatGPT / 聊天 / Chat. Work-family: Codex / 工作 / Work.
   const toggle = [...document.querySelectorAll('button')]
     .find((el) => /切换模式|Switch mode|current mode/i.test(el.getAttribute('aria-label') || ''));
   const current = toggle ? (toggle.getAttribute('aria-label').match(/(?:当前模式：|current mode:?\s*)([A-Za-z一-龥]+)/) || [])[1] || '' : '';
-  if (current) return /^(ChatGPT|聊天|Chat)$/i.test(current.trim());
+  if (current) return { chat: /^(ChatGPT|聊天|Chat)$/i.test(current.trim()), reason: "legacy-toggle", label: current.trim() };
   // fallback: aria-pressed pair (older UIs)
   const modes = [...document.querySelectorAll('button[aria-pressed]')]
     .filter((el) => el.getClientRects().length > 0)
@@ -565,10 +582,18 @@ const chatMode = await composerOp(() => page.evaluate(() => {
     .filter(({ label }) => /^(聊天|Chat|ChatGPT|工作|Work|Codex)$/i.test(label));
   const chat = modes.filter(({ label }) => /^(聊天|Chat|ChatGPT)$/i.test(label));
   const work = modes.filter(({ label }) => /^(工作|Work|Codex)$/i.test(label));
-  return chat.length >= 1 && chat.every((m) => m.pressed === "true") &&
-    (work.length === 0 || work.every((m) => m.pressed === "false"));
+  return {
+    chat: chat.length >= 1 && chat.every((m) => m.pressed === "true") &&
+      (work.length === 0 || work.every((m) => m.pressed === "false")),
+    reason: "legacy-aria-pressed", label: "",
+  };
 }));
+const chatMode = chatModeEvidence.chat;
 if (!chatMode) {
+  if (chatModeEvidence.reason === "codex-editor") {
+    // One-line codex verdict for the output stream; the full evidence dump still follows.
+    console.log("MODE_REJECT=CODEX_EDITOR:" + String(chatModeEvidence.label || "").slice(0, 40));
+  }
   try {
     const dump = await page.evaluate(() => [...document.querySelectorAll('button[aria-pressed]')]
       .filter((el) => el.getClientRects().length > 0)
