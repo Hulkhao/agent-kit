@@ -155,9 +155,11 @@ export async function writeJsonAtomic(path, value) {
 // file behind; the next contender times out with a COMMIT_LOCK_WAIT_TIMEOUT
 // whose message carries the lock path, the parsed or unparseable content
 // diagnostics, the ESRCH verdict where provable, and the remediation hint
-// ("safe to manually delete <path> then retry" for a provably dead or
-// identity-less holder; "holder process alive; wait or investigate"
-// otherwise). A human deletes the one named file. Nothing is ever stolen,
+// ("safe to manually delete <path> then retry" for a provably dead holder;
+// for unparseable content the hint NEVER claims safety — unparseable bytes
+// may be a live holder's mid-write claim, so the hint requires stopping the
+// monitor and confirming no live holder before manual cleanup; "holder
+// process alive; wait or investigate" otherwise). A human deletes the one named file. Nothing is ever stolen,
 // swept, or auto-recovered — §三.3's bar (mutual exclusion under arbitrary
 // async delays) is bought by giving up automatic recovery, not by weakening
 // exclusion.
@@ -298,7 +300,7 @@ export async function withCommitLock(dir, task, options = {}) {
       ? `holderId=${diag.holderId} holderPid=${diag.holderPid} acquiredAt=${diag.acquiredAt} holderProcess=${diag.holderDead ? "DEAD(ESRCH)" : "alive"}`
       : `content unparseable (${diag.readErrorCode ? `read error ${diag.readErrorCode}` : `${diag.rawLength ?? 0} bytes, no usable identity`} — crash-during-write remnant or foreign/tampered bytes)`;
     const remediation = !diag.readable
-      ? `safe to manually delete ${lockPath} then retry`
+      ? `unparseable content does NOT prove the holder is dead (possible mid-write claim): stop the monitor first, confirm no live holder, then manually delete ${lockPath} and retry`
       : diag.holderDead
         ? `holder process is provably dead (ESRCH): safe to manually delete ${lockPath} then retry`
         : "holder process alive; wait or investigate";
