@@ -44,7 +44,7 @@ metadata:
 4. 双循环监控统一运行一个受管 `dispatch-manager.mjs watch` 任务，内含 30 秒快轮询（以每轮起始时刻计时）和默认 10 分钟监管判定；不得用 `sleep 300 && probe` 代替长驻 `watch`；修改各会话监控目录 `conversations/<UUID>/supervision.config.json` 的 `supervisionMinutes`，可动态设为 15/20/30 等分钟。**启动时确认受管任务退出能实际通知并唤醒本地 Agent**；收到唤醒、完成诊断后通过管理器 `ack` 确认 `wakeId`，未确认不得宣称已接棒。连续 3 轮无进展要求联系 PO（即时聊天/邮件接入暂缓）；消息数接近 2000 提前迁移。
 5. 发送前确认「发送」按钮可用，再执行一次 focus+Enter；进入 `SEND_STARTED` 后无论 Enter 的返回结果如何，都先按账本与 DOM 双验对账，无法证明未发送即标 `UNCERTAIN` 并 STOP，禁止补点 click 或盲目重发。按钮 `disabled=true` 时先按页面恢复契约处理。填充用 600 grapheme 目标 / 1200 UTF-8 byte 硬上限；每块 CDP `Input.insertText` 后回读累计前缀，只有确认内容未变化才重试当前块一次，错位立即 STOP；fill/原生 paste/单次长文本不作为可靠通道；Composer 空态是 innerText=`"\n"`（长度 1），勿用 `length===0` 判空；向外发送前查敏感信息。
 6. 任务状态分离：浏览器存活、轮次生成、工具调用、最终完成是不同状态；超时或 stream reconnect 不等于任务失败。
-7. 崩溃恢复采用有上限的重启与安全诊断；失败后立即保留状态证据，禁止记录 Cookie、Token、提示词正文和工具参数。
+7. **Ego Lite 宿主保护（硬禁令）**：共享 Ego Lite 桌面宿主 `ego.exe` 及其进程树属于用户级运行环境，任何 Agent **不得终止、杀掉或重启**；禁止 `Get-Process ego | Stop-Process`、`taskkill /IM ego.exe`、按进程名匹配后批量终止或其他等效操作。`ego-browser nodejs` runner/watch 退出不代表宿主故障；按手册 §6 / §11.5 恢复受管 runner、自己的 Page 或自有 TaskSpace。有限恢复预算仅适用于明确归属的受管 runner 和页面/空间级恢复，不包含宿主。宿主级异常唯一动作：停止操作、保留脱敏现场并报告 PO；禁止记录 Cookie、Token、提示词正文和工具参数。
 
 ## 项目材料交接（两人工作流，细则见手册 §3.2）
 
