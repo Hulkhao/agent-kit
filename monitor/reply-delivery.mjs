@@ -51,6 +51,34 @@ export function extractDomReply(units, payloadHash, expectedTailKey, { displayHa
   return text.trim() ? { text, source: "DOM_BOUNDARY_VISIBLE" } : null;
 }
 
+// #40 PO_MANUAL collection: the payload fingerprint is unknowable (the PO pasted
+// the message themselves), so the reply boundary is the attach-time baseline tail
+// recorded in the ledger instead of a payload-hash anchor. Everything after the
+// baseline anchor must be the reply:
+//   baseline = user turn (the PO's just-sent message): only assistant units may follow;
+//   baseline = assistant turn (attach happened before the send): exactly ONE user
+//     unit (the PO's message) may open the window, then assistant-only — a second
+//     user unit makes the boundary ambiguous and fails closed.
+// The last assistant unit must carry the expected tail key (same contract as
+// extractDomReply). A baseline the page no longer shows fails closed (null).
+export function extractDomReplyByBaseline(units, expectedTailKey, baselineTailKey) {
+  if (!Array.isArray(units) || !isUuid(expectedTailKey) ||
+      typeof baselineTailKey !== "string" || !baselineTailKey) return null;
+  const anchor = units.findLastIndex((unit) => unit.messageKey === baselineTailKey);
+  if (anchor < 0) return null;
+  const after = units.slice(anchor + 1);
+  if (units[anchor].role === "user") {
+    if (after.some((unit) => unit.role === "user")) return null;
+  } else {
+    if (after[0]?.role !== "user") return null;
+    if (after.slice(1).some((unit) => unit.role === "user")) return null;
+  }
+  const responses = after.filter((unit) => unit.role === "assistant" && typeof unit.text === "string" && unit.text.trim());
+  if (!responses.length || responses.at(-1).messageKey !== expectedTailKey) return null;
+  const text = responses.map((unit) => unit.text).join("\n\n");
+  return text.trim() ? { text, source: "DOM_BOUNDARY_VISIBLE" } : null;
+}
+
 export function extractApiReply(conversation, payloadHash, { displayHash } = {}) {
   if (!/^[\da-f]{64}$/i.test(payloadHash || "")) return null;
   const nodes = activeBranchNodes(conversation);

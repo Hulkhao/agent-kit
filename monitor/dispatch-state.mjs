@@ -905,6 +905,34 @@ export async function resetFillCount(dir, space) {
 }
 
 // ---- R2.5-H composer render freeze: the ledger records the event; the probe consumes it ----
+//
+// #36 consumption lifecycle (deadlock family #36/#39-③): the freeze record's
+// consumption is POST-OBSERVATION. The probe (and only the probe) consumes a
+// freeze, but only AFTER it actually looked at the composer surface:
+//   surface observed healthy  → consume into a HEALTHY state (errorCode null);
+//   surface confirmed broken  → consume into the shared storm backoff (the
+//                               pre-#36 behavior);
+//   surface never observable  → the freeze stays unconsumed and EXPIRES (below)
+//                               instead of locking the conversation forever.
+// The old boot-time consumption wrote the storm backoff before anyone had
+// looked at the page — an unconditional poisoning that, on a terminal ledger
+// (COMPLETED/ABORTED, probe refused by the arm gate), made consumption itself
+// the brick: the written CHAT_SURFACE_STRUCTURALLY_UNAVAILABLE errorCode could
+// only be cleared by a healthy probe round that was no longer admittable.
+
+// Unconsumed-freeze expiry (#36): an unconsumed COMPOSER_RENDER_FREEZE stops
+// blocking the send Gate 0 after COMPOSER_FREEZE_STALE_MS and is stamped
+// expired=true when it is finally consumed. Value rationale: a fresh freeze
+// carries its own stormBackoffDeadline ≈ detectedAt + max(8min, 9min + phase)
+// ≤ ~9.25 min — the natural recovery window the storm channel already owns.
+// 30 min is ≈3× that worst case, so every healthy probe cycle inside one storm
+// window consumes the freeze long before expiry; expiry therefore fires only
+// when the consumption channel itself became unreachable (the #36/#39-③
+// deadlock family: probe refused by the arm gate over a terminal ledger), and
+// it is comfortably shorter than an operator loop, so no session stays locked
+// past one supervision cycle. A freeze row without a finite detectedAt never
+// goes stale (fail-closed: it keeps blocking Gate 0 exactly as before).
+export const COMPOSER_FREEZE_STALE_MS = 30 * 60 * 1000;
 
 export async function markComposerFreeze(dir, { space, error } = {}) {
   if (typeof space !== "string" || !space) throw new TypeError("SPACE_REQUIRED");
@@ -919,9 +947,10 @@ export async function markComposerFreeze(dir, { space, error } = {}) {
   return { freezeId, detectedAt, stormBackoffDeadline: stormBackoff, phaseMs };
 }
 
-export async function findUnconsumedComposerFreeze(dir) {
-  // r44 P0-A1: missing events file = provably no freezes (ENOENT → ""); any other read error
-  // must THROW so the caller STOPs — a read failure must never masquerade as "no freeze".
+// Shared scan (r44 P0-A1 contract preserved): missing events file = provably no
+// freezes (ENOENT → ""); any other read error must THROW so the caller STOPs —
+// a read failure must never masquerade as "no freeze".
+async function unconsumedComposerFreezeRows(dir) {
   let raw;
   try {
     raw = await readFile(`${dir}/a-fast-events.ndjson`, "utf8");
@@ -942,8 +971,54 @@ export async function findUnconsumedComposerFreeze(dir) {
     }
   }
   for (const freezeId of consumed) freezes.delete(freezeId);
-  const remaining = [...freezes.values()];
-  return remaining.length ? remaining[remaining.length - 1] : null;
+  return [...freezes.values()];
+}
+
+const freezeIsStale = (freeze, now) => Number.isFinite(freeze?.detectedAt) &&
+  now - freeze.detectedAt >= COMPOSER_FREEZE_STALE_MS;
+
+// The Gate 0 blocking query (send template contract): the newest unconsumed
+// freeze that is still FRESH. Each unconsumed freeze expires individually —
+// expired ones no longer block (issue #36), so a "consumption unreachable"
+// shape can never lock the conversation permanently.
+export async function findUnconsumedComposerFreeze(dir, now = Date.now()) {
+  const fresh = (await unconsumedComposerFreezeRows(dir))
+    .filter((row) => !freezeIsStale(row, now));
+  return fresh.length ? fresh[fresh.length - 1] : null;
+}
+
+// The consumption-time query: the newest unconsumed freeze REGARDLESS of age,
+// flagged stale so the consumer can stamp EXPIRED on the consumption event
+// (#36: 消费时标 EXPIRED — expiry is an audit fact, not an erasure).
+export async function findComposerFreezeToConsume(dir, now = Date.now()) {
+  const rows = await unconsumedComposerFreezeRows(dir);
+  if (!rows.length) return null;
+  const newest = rows[rows.length - 1];
+  return { ...newest, stale: freezeIsStale(newest, now) };
+}
+
+// The single consumption writer, shared by the probe's healthy and storm-backoff
+// paths (and by the requireArmedDispatch evidence gate through its finder). The
+// verdict is the POST-OBSERVATION evidence class: "SURFACE_HEALTHY" (composer
+// surface observed healthy → healthy state, no storm backoff) or "STORM_BACKOFF"
+// (surface confirmed broken → the shared storm channel, pre-#36 semantics).
+// Strict by contract: an events-file read failure throws (r44 P0-A1) so a
+// caller can never mistake a read failure for "nothing to consume".
+export async function consumeComposerFreeze(dir, { verdict, space = null, stormBackoffDeadline = null, now = Date.now() } = {}) {
+  if (typeof verdict !== "string" || !/^[A-Z_]{3,40}$/.test(verdict)) {
+    throw new TypeError("FREEZE_CONSUMPTION_VERDICT_REQUIRED");
+  }
+  const freeze = await findComposerFreezeToConsume(dir, now);
+  if (!freeze) return null;
+  await appendEvent(dir, "COMPOSER_FREEZE_CONSUMED", {
+    freezeId: freeze.freezeId, detectedAt: freeze.detectedAt,
+    consumedVia: verdict, expired: freeze.stale === true,
+    stormBackoffDeadline: Number.isFinite(stormBackoffDeadline)
+      ? stormBackoffDeadline : (freeze.stormBackoffDeadline ?? null),
+    phaseMs: freeze.phaseMs ?? null,
+    agent_id: space, space,
+  });
+  return freeze;
 }
 
 function safeEventError(error) {

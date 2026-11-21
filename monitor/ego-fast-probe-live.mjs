@@ -19,7 +19,7 @@ console.log(`PROBE_BOOT version=${PROBE_VERSION} space=${SPACE} mon=${MON}`);
 
 const {
   appendEvent,
-  findUnconsumedComposerFreeze,
+  consumeComposerFreeze,
   hasResponseTailAdvanced,
   lastConsumedFreezeDeadline,
   reconcileDispatch,
@@ -122,25 +122,11 @@ try {
   process.exit(0);
 }
 
-// R2.5-H: consume unprocessed composer-freeze events through the shared storm channel.
-// The ledger (dispatch-state) only records the event; this probe is the single writer that
-// turns it into a persisted storm backoff via the existing writeState() path.
-const pendingFreeze = await findUnconsumedComposerFreeze(MON).catch(() => null);
-if (pendingFreeze && !isBackoffActive(previous, now())) {
-  const rearm = stormRearmState({
-    previous,
-    detectedAt: now(),
-    phaseMs: spacePhaseMs(SPACE),
-    baseError: { errorName: pendingFreeze.errorName || "Error", nativeErrorCode: pendingFreeze.nativeErrorCode || "UNKNOWN" },
-  });
-  await writeState({ ...rearm });
-  await appendEvent(MON, "COMPOSER_FREEZE_CONSUMED", {
-    freezeId: pendingFreeze.freezeId, detectedAt: pendingFreeze.detectedAt,
-    stormBackoffDeadline: rearm.backoffUntil, phaseMs: pendingFreeze.phaseMs,
-    agent_id: SPACE, space: SPACE,
-  });
-  previous = { ...previous, ...rearm };
-}
+// #36: the boot-time freeze consumption was REMOVED (same contract as
+// ego-fast-probe.mjs). Consumption is POST-OBSERVATION: healthy surface →
+// consumeComposerFreeze(SURFACE_HEALTHY) + healthy state; confirmed broken →
+// consumeComposerFreeze(STORM_BACKOFF); never observable → the freeze expires
+// and Gate 0 self-opens. No unconditional boot-time poisoning.
 
 // backoffUntil is an absolute deadline. A backoff poll updates only ts; it never moves the deadline.
 if (isBackoffActive(previous, now())) {
@@ -333,6 +319,11 @@ if (stormPlan) {
       hostOk: retryProbe.hostOk, bodyLen: retryProbe.bodyLen,
       composerCount: retryProbe.composerCount,
     });
+    // #36: surface observed (post-navigation) and confirmed broken — consume the
+    // freeze into the shared storm channel with the REAL rearm deadline.
+    await consumeComposerFreeze(MON, {
+      verdict: "STORM_BACKOFF", space: SPACE, stormBackoffDeadline: rearm.backoffUntil,
+    }).catch(() => {});
     console.log(rearm.unavailablePersistent ? "RESULT=CONVERSATION_UNAVAILABLE_PERSISTENT" : "RESULT=PROBE_UNAVAILABLE_RETRY");
     process.exit(0);
   }
@@ -488,9 +479,21 @@ if (!isChatSurfaceReady(probe)) {
     hostOk: probe.hostOk, bodyLen: probe.bodyLen,
     composerCount: probe.composerCount, mainCount: probe.mainCount,
   });
+  // #36: surface observed and confirmed broken — the freeze consumes into the
+  // shared storm channel (the pre-#36 semantics), stamped with the real deadline.
+  await consumeComposerFreeze(MON, {
+    verdict: "STORM_BACKOFF", space: SPACE, stormBackoffDeadline: backoffUntil,
+  }).catch(() => {});
   console.log(persistent ? "RESULT=CONVERSATION_UNAVAILABLE_PERSISTENT" : "RESULT=PROBE_UNAVAILABLE_RETRY");
   process.exit(0);
 }
+
+// #36: the composer surface is now OBSERVED healthy (structural gate passed) —
+// consume any unconsumed freeze into a HEALTHY outcome (no storm backoff, no
+// errorCode poisoning); the healthy writeState below carries errorCode null so
+// the send Gate 0 and the storm gate reopen. Best-effort: a failed consumption
+// leaves the freeze unconsumed (Gate 0 stays shut) for the next healthy round.
+await consumeComposerFreeze(MON, { verdict: "SURFACE_HEALTHY", space: SPACE }).catch(() => {});
 
 let dispatchResult;
 try {

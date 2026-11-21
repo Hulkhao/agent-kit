@@ -9,10 +9,10 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { tick, acknowledge } from "./supervision-watchdog.mjs";
-import { readDispatchState, markCompleted, writeJsonAtomic, validateDispatchRecord, evaluateDisarmEligibility, appendEvent, withCommitLock, commitLockScopeOf, isCommitLockError } from "./dispatch-state.mjs";
+import { readDispatchState, markCompleted, writeJsonAtomic, validateDispatchRecord, evaluateDisarmEligibility, appendEvent, withCommitLock, commitLockScopeOf, isCommitLockError, findComposerFreezeToConsume } from "./dispatch-state.mjs";
 import { ARMED_REASONS, IN_FLIGHT_DISPATCH_STATUSES, armedTransitionPatch, classifyFastStateFile, normalizeFastState } from "./state-schema.mjs";
 import { verifiedReply, acknowledgeReply, verifiedConsumption, sha256 } from "./reply-delivery.mjs";
-import { withAgentRegistry } from "./agent-space.mjs";
+import { withAgentRegistry, claimAgentSpace } from "./agent-space.mjs";
 import { taskspaceOperatorAction } from "./taskspace-takeover.mjs";
 
 const sourceDir = dirname(fileURLToPath(import.meta.url));
@@ -35,9 +35,12 @@ const templates = {
   collect: join(sourceDir, "collect-reply.template.mjs"),
   "rebuild-space": join(sourceDir, "rebuild-space.template.mjs"),
   claim: join(sourceDir, "claim-space.template.mjs"),
+  // #40: page verification for the PO-manual attach (URL + tail-message evidence
+  // BEFORE any ledger is written — fail-closed binding).
+  "manual-attach": join(sourceDir, "po-manual-attach.template.mjs"),
 };
 const modules = ["agent-space.mjs", "release-sweep.mjs", "dispatch-state.mjs", "reply-delivery.mjs", "page-recovery.mjs", "state-schema.mjs", "taskspace-takeover.mjs", "supervision-policy.mjs"];
-const allowed = new Set(["send", "send-new", "recover-draft", "probe", "watch", "collect", "consume", "release", "ack", "abort", "rebuild-space", "claim"]);
+const allowed = new Set(["send", "send-new", "recover-draft", "probe", "watch", "collect", "consume", "release", "ack", "abort", "rebuild-space", "claim", "discard-pending", "manual-attach"]);
 const uuid = /^[a-f\d]{8}-[a-f\d]{4}-[1-8][a-f\d]{3}-[89ab][a-f\d]{3}-[a-f\d]{12}$/i;
 
 export function parseArgs(args) {
@@ -69,6 +72,19 @@ export function parseArgs(args) {
     }
     return params;
   }
+  // #39 item 3: the stuck pending request is addressed by its client requestId
+  // ALONE. A --conversation value would imply a bound conversation, which this
+  // action must never touch (fail-closed — the binding path owns those). This
+  // special case MUST sit before the generic identity check below, which
+  // forbids a bare requestId on every non-send-new action.
+  if (action === "discard-pending") {
+    if (!uuid.test(params.requestId || "")) throw new Error("MANAGER_IDENTITY_INVALID");
+    if (["conversation", "message", "attachmentsFile", "wakeId", "ackAction", "replySha256", "archivedRecord", "dispatchId", "reason"]
+        .some((key) => params[key])) throw new Error("MANAGER_IDENTITY_INVALID");
+    if (!params.agentId || !/^[a-z0-9][a-z0-9_.-]{1,63}$/i.test(params.agentId) ||
+        !params.space || params.space.length > 120) throw new Error("MANAGER_IDENTITY_INVALID");
+    return params;
+  }
   if (!params.agentId || !/^[a-z0-9][a-z0-9_.-]{1,63}$/i.test(params.agentId) ||
     !params.space || params.space.length > 120 || !uuid.test(params.conversation) ||
     (params.newChat && (params.conversation !== params.requestId || !uuid.test(params.requestId))) ||
@@ -81,6 +97,11 @@ export function parseArgs(args) {
     if (!uuid.test(params.dispatchId || "")) throw new Error("ABORT_DISPATCH_ID_REQUIRED");
     if (typeof params.reason !== "string" || !/^[A-Z0-9_]{3,48}$/.test(params.reason)) throw new Error("ABORT_REASON_CODE_INVALID");
     return params;
+  }
+  // #40: manual-attach binds an existing conversation — message payloads and
+  // watch-ack arguments have no meaning on a bind action; refused, not ignored.
+  if (action === "manual-attach" && ["message", "wakeId", "ackAction", "requestId"].some((key) => params[key])) {
+    throw new Error("MANAGER_IDENTITY_INVALID");
   }
   if ((params.reason || params.dispatchId) && action !== "abort") throw new Error("ABORT_ARGS_ABORT_ONLY");
   if (action === "consume" && !/^[\da-f]{64}$/i.test(params.replySha256 || "")) throw new Error("REPLY_SHA256_REQUIRED");
@@ -217,15 +238,39 @@ export async function bindNewConversation(root, requestId, space, agentId, paylo
 // The presence of a conversation UUID alone never arms a browser job.
 // A started send must remain observable even if acknowledgement failed; the
 // probe's existing reconciliation path can then establish whether it landed.
+//
+// #36 (freeze deadlock family): the ONLY widened branch. A probe may boot on a
+// TERMINAL ledger (COMPLETED/ABORTED) when an unconsumed composer freeze exists
+// in the conversation dir — fresh OR already expired — because the freeze
+// record's only consumer is the probe itself, and the #36/#39-③ live incident
+// proved the deadlock shape: Gate 0 blocks the send on the unconsumed freeze,
+// the probe is refused by the arm gate over the terminal ledger, and nothing
+// else can ever consume it. The admitted probe consumes + observes the surface
+// and then exits through its existing semantics (healthy round / storm backoff /
+// terminal wake). Everything else of the arm-on-wait contract is unchanged:
+// the freeze ledger read is fail-closed (an unreadable freeze ledger proves
+// nothing and never widens the gate), and watch semantics stay exactly as the
+// #38 fix left them.
 export async function requireArmedDispatch(dir, params, action) {
   const record = await readDispatchState(dir);
   if (!record || record.conversationUuid.toLowerCase() !== params.conversation.toLowerCase() ||
-      record.taskSpace !== params.space ||
-      (action === "probe" ? !["SEND_STARTED", "UNCERTAIN", "ACCEPTED"].includes(record.status) :
-        // #38 fix 3: watch may arm on a freshly ABORTED ledger — its terminal
-        // short-circuit below then exits with DISPATCH_ABORTED_WAKE_SUPERVISOR
-        // instead of a bare DISPATCH_NOT_ARMED.
-        !["SEND_STARTED", "UNCERTAIN", "ACCEPTED", "COMPLETED", "ABORTED"].includes(record.status))) {
+      record.taskSpace !== params.space) {
+    throw new Error("DISPATCH_NOT_ARMED");
+  }
+  if (action === "probe") {
+    if (["SEND_STARTED", "UNCERTAIN", "ACCEPTED"].includes(record.status)) return record;
+    if (record.status === "COMPLETED" || record.status === "ABORTED") {
+      let freeze = null;
+      try { freeze = await findComposerFreezeToConsume(dir); }
+      catch { freeze = null; } // unreadable freeze ledger proves nothing (fail-closed)
+      if (freeze) return record;
+    }
+    throw new Error("DISPATCH_NOT_ARMED");
+  }
+  // #38 fix 3: watch may arm on a freshly ABORTED ledger — its terminal
+  // short-circuit below then exits with DISPATCH_ABORTED_WAKE_SUPERVISOR
+  // instead of a bare DISPATCH_NOT_ARMED.
+  if (!["SEND_STARTED", "UNCERTAIN", "ACCEPTED", "COMPLETED", "ABORTED"].includes(record.status)) {
     throw new Error("DISPATCH_NOT_ARMED");
   }
   return record;
@@ -524,12 +569,14 @@ export function evaluateAbortEvidence({
 // are copied verbatim (no re-serialization), so the backup is a byte-exact
 // pre-abort restore point. An existing backup file is never overwritten: the
 // first candidate gets a timestamp suffix, and further collisions get a
-// counter, so a backup can never destroy another backup.
+// counter, so a backup can never destroy another backup. `suffix` marks the
+// writing flow in the archive name ("abort" default; "po-manual" for the #40
+// attach's replaced-terminal-ledger backup).
 const ABORT_BACKOFF_SUFFIX = "abort";
 
-async function backupLedgerBytes(dir, dispatchId, now = Date.now()) {
+async function backupLedgerBytes(dir, dispatchId, now = Date.now(), suffix = ABORT_BACKOFF_SUFFIX) {
   const bytes = await readFile(join(dir, "a-dispatch-state.json"));
-  const base = `a-dispatch-state.archive-${dispatchId.slice(0, 8)}-${ABORT_BACKOFF_SUFFIX}`;
+  const base = `a-dispatch-state.archive-${dispatchId.slice(0, 8)}-${suffix}`;
   for (let attempt = 0; ; attempt++) {
     const target = attempt === 0 ? `${base}.json` : `${base}-${now}${attempt > 1 ? "-" + attempt : ""}.json`;
     try {
@@ -637,6 +684,355 @@ export async function abortDispatch(p, { now = Date.now() } = {}) {
   });
   console.log("RESULT=DISPATCH_ABORTED dispatchId=" + record.dispatchId +
     " reason=" + p.reason + " evidence=" + verdict.source + " backup=" + backup.file);
+  return 0;
+}
+
+// ---- #39 item 3: managed discard/redispatch path for a stuck pending-new request ----
+//
+// A send-new interrupted before acceptance (e.g. LEVEL_GATE_FAIL_ABORT after
+// prepareDispatch) leaves pending-new/<requestId>/ with a PREPARED ledger and
+// no managed way out: a same-requestId retry hits NEW_CHAT_IN_PROGRESS_OR_
+// RECOVERY_REQUIRED (a-new-request.json EEXIST), bindNewConversation requires
+// ACCEPTED, abort's evidence gate does not accept PREPARED, and recover-draft
+// only parses conversations/<uuid>/. `discard-pending` opens the ONE managed
+// path: archive the whole pending directory (byte-preserving, non-destructive)
+// so the canonical pending-new path is free and the same requestId can be
+// reused — or a fresh one chosen. The browser is never touched: the leftover
+// draft page (if the fill already happened) is the operator's to close; its
+// label is recorded in the audit row so it can be found.
+//
+// Evidence gate (fail-closed — every step must PROVE, never assume):
+//   PENDING_REQUEST_UNREADABLE        — pending dir or its a-new-request.json missing/unreadable;
+//   PENDING_REQUEST_IDENTITY_MISMATCH — requestId/space/agentId do not anchor the request record;
+//   PENDING_LEDGER_UNREADABLE         — ledger corrupt (readDispatchState throws);
+//   PENDING_LEDGER_ABSENT             — no ledger yet (never prepared);
+//   PENDING_LEDGER_NOT_PREPARED:<st>  — any non-PREPARED status (delivery/binding lifecycles own those);
+//   PENDING_BOUND_TO_CONVERSATION     — conversationUuid ≠ requestId: a binding happened (or is
+//                                       in flight) and bindNewConversation owns the outcome;
+//   PENDING_DELIVERY_EVIDENCE_PRESENT — sendStartedAt/acceptedAt/completedAt/replyFile present:
+//                                       something was delivered or claimed delivered;
+//   PENDING_WAKE_UNACKNOWLEDGED       — an unacked ego-watch-exit/v1 marker: a wake is still open;
+//   PENDING_WAKE_MARKER_INVALID(_UNREADABLE) — marker corruption is never "no watch";
+//   PENDING_SUPERVISION_ALARM(_INVALID/_UNREADABLE) — an open supervision handoff owns the dir;
+//   PENDING_DISCARD_RACE_LOST         — in-lock re-check: the ledger changed between the advisory
+//                                       read and the commit;
+//   PENDING_DISCARD_LOCK_FAILED:<msg> — the monitor-root commit lock was unavailable (fail-closed,
+//                                       same participant discipline as every shared-state writer).
+// Write path: ONE monitor-root commit-lock section (commitLockScopeOf — pending-new
+// resolves to the root, the same domain arm/prepare/disarm serialize on) re-proving
+// the decisive ledger identity and then atomically renaming the directory to
+// <root>/pending-new-archive/<requestId>.archive-<ts>[-n]. The rename — not a copy+delete
+// — keeps every original byte (不物理删除原始证据) and moves the dir OUT of pending-new/,
+// where any directory counts as in-flight wholesale for disarm's global sibling scan.
+export const PENDING_DISCARD_AUDIT_FILE = "a-pending-discard-audit.ndjson";
+export const PENDING_NEW_ARCHIVE_DIR = "pending-new-archive";
+
+export async function discardPendingDispatch(p, { now = Date.now() } = {}) {
+  const pending = join(p.monitorDir, "pending-new", p.requestId.toLowerCase());
+  const auditFile = join(p.monitorDir, PENDING_DISCARD_AUDIT_FILE);
+  const audit = (entry) => appendFile(auditFile, JSON.stringify({
+    ts: new Date().toISOString(), action: "discard-pending", agentId: p.agentId,
+    space: p.space, requestId: p.requestId.toLowerCase(), ...entry,
+  }) + "\n", "utf8");
+  const refuse = async (code, detail = {}) => {
+    await audit({ outcome: "DENIED", code, ...detail }).catch(() => {});
+    console.error("RESULT=PENDING_DISCARD_DENIED code=" + code);
+    console.error("OPERATOR_ACTION=discard-pending 仅清理未绑定、无投递证据的 PREPARED pending 目录；按失败码核对后重试，或显式换新 request-id 走 send-new。");
+    return 2;
+  };
+
+  let request = null;
+  try { request = JSON.parse(await readFile(join(pending, "a-new-request.json"), "utf8")); }
+  catch { return await refuse("PENDING_REQUEST_UNREADABLE"); }
+  if (typeof request?.requestId !== "string" || request.requestId.toLowerCase() !== p.requestId.toLowerCase() ||
+      request.space !== p.space || request.agentId !== p.agentId) {
+    return await refuse("PENDING_REQUEST_IDENTITY_MISMATCH");
+  }
+  let record = null;
+  try { record = await readDispatchState(pending); }
+  catch { return await refuse("PENDING_LEDGER_UNREADABLE"); }
+  if (!record) return await refuse("PENDING_LEDGER_ABSENT");
+  if (record.status !== "PREPARED") return await refuse("PENDING_LEDGER_NOT_PREPARED:" + record.status);
+  if (typeof record.conversationUuid !== "string" ||
+      record.conversationUuid.toLowerCase() !== p.requestId.toLowerCase()) {
+    return await refuse("PENDING_BOUND_TO_CONVERSATION");
+  }
+  if (record.sendStartedAt != null || record.acceptedAt != null ||
+      record.completedAt != null || record.replyFile != null) {
+    return await refuse("PENDING_DELIVERY_EVIDENCE_PRESENT");
+  }
+  // No in-flight watch: an unacked wake marker or an open supervision handoff
+  // means a supervision loop still owns this directory. Marker/status corruption
+  // is never read as "no watch" (fail-closed, same contracts as the disarm scan).
+  try {
+    const marker = JSON.parse(await readFile(join(pending, "a-watch-exit.json"), "utf8"));
+    const structureError = watchExitStructureError(marker);
+    if (structureError) return await refuse("PENDING_WAKE_MARKER_INVALID");
+    if (marker.acknowledgedAt === null) return await refuse("PENDING_WAKE_UNACKNOWLEDGED");
+  } catch (error) {
+    if (error?.code !== "ENOENT") return await refuse("PENDING_WAKE_MARKER_UNREADABLE");
+  }
+  try {
+    const status = JSON.parse(await readFile(join(pending, "a-supervision-status.json"), "utf8"));
+    const structureError = supervisionStatusStructureError(status);
+    if (structureError) return await refuse("PENDING_SUPERVISION_STATUS_INVALID");
+    if (status.pending !== null) return await refuse("PENDING_SUPERVISION_ALARM");
+  } catch (error) {
+    if (error?.code !== "ENOENT") return await refuse("PENDING_SUPERVISION_STATUS_UNREADABLE");
+  }
+  // The leftover draft-page reference (a-new-page.json, written by the send
+  // template before task.newPage()) — evidence only; the browser is never touched.
+  let draftPageLabel = null;
+  try {
+    draftPageLabel = JSON.parse(await readFile(join(pending, "a-new-page.json"), "utf8"))?.pageLabel ?? null;
+  } catch { draftPageLabel = null; }
+
+  let archivedTo = null;
+  try {
+    await withCommitLock(commitLockScopeOf(pending), async () => {
+      // In-lock re-verification: the ledger must still be the SAME unbound
+      // PREPARED instance this decision was made on — a concurrent binding or
+      // recovery that moved it wins, and this discard aborts fail-closed.
+      const fresh = await readDispatchState(pending);
+      if (!fresh || fresh.dispatchId !== record.dispatchId || fresh.status !== "PREPARED" ||
+          typeof fresh.conversationUuid !== "string" ||
+          fresh.conversationUuid.toLowerCase() !== p.requestId.toLowerCase()) {
+        throw new Error("PENDING_DISCARD_RACE_LOST");
+      }
+      const archiveRoot = join(p.monitorDir, PENDING_NEW_ARCHIVE_DIR);
+      await mkdir(archiveRoot, { recursive: true });
+      for (let attempt = 0; ; attempt++) {
+        const target = join(archiveRoot,
+          `${p.requestId.toLowerCase()}.archive-${now}${attempt > 0 ? "-" + attempt : ""}`);
+        try {
+          await rename(pending, target);
+          archivedTo = target;
+          break;
+        } catch (error) {
+          if (error?.code !== "EEXIST" && error?.code !== "ENOTEMPTY") throw error;
+        }
+      }
+      // The audit trail rides with the archived evidence (best-effort; the
+      // monitor-root audit row below is the authoritative record).
+      await appendEvent(archivedTo, "PENDING_DISCARDED", {
+        requestId: p.requestId.toLowerCase(), space: p.space, agentId: p.agentId,
+        ledgerDispatchId: record.dispatchId,
+      }).catch(() => {});
+    });
+  } catch (error) {
+    if (isCommitLockError(error)) {
+      return await refuse("PENDING_DISCARD_LOCK_FAILED:" + error.message);
+    }
+    if (error?.message === "PENDING_DISCARD_RACE_LOST") {
+      return await refuse("PENDING_DISCARD_RACE_LOST");
+    }
+    throw error;
+  }
+  await audit({ outcome: "DISCARDED", archivedTo, ledgerDispatchId: record.dispatchId,
+    ledgerStatus: record.status, draftPageLabel }).catch(() => {});
+  console.log("RESULT=PENDING_DISCARDED requestId=" + p.requestId.toLowerCase() +
+    " archivedTo=" + archivedTo +
+    (draftPageLabel ? " draftPageLabel=" + draftPageLabel : ""));
+  console.error("OPERATOR_ACTION=pending 目录已整体归档（原目录字节保留）；同 request-id 现在可直接重派 send-new，或显式换新。残留草稿页（如已填充）需人工关闭，浏览器侧未做任何改动。");
+  return 0;
+}
+
+// ---- #40: PO-manual dispatch attach (managed tracking entry) ----
+//
+// When the managed dispatch gate fails repeatedly and the PO is authorized to
+// send the message by hand in the existing conversation page, the local Agent
+// previously had NO managed way to track that dispatch (probe/watch refused
+// with DISPATCH_NOT_ARMED — the PO's message never enters a ledger). `manual-attach`
+// binds the existing conversation into the managed tracking machinery:
+//   ledger  — source=PO_MANUAL, status=UNCERTAIN (honest: a send happened but
+//             acceptance is unproven; the probe's reconcileDispatch upgrades it
+//             with real surface evidence), payload_sha256/payload_bytes/composer_
+//             baseline all null (免 payload 指纹 — the PO's message text never
+//             transits the agent), and ONLY the verified attach-time baseline
+//             tail (baselineTailKey/Role) as the reply boundary.
+//   arm     — armForDispatch (the frozen v4 arm machine), same 布防 order as
+//             managed sends (arm before the ledger establishment); no
+//             armedReason bypass anywhere.
+//   registry— claimAgentSpace registers the conversation (known+active), so
+//             collect's ownership check and the release sweep's keep semantics
+//             anchor on it.
+//   release — the PO-opened page stays 非 agent 所有: the sweep classifies it
+//             FIXED_SESSION (no dispatch-created record) and never closes it;
+//             the release preflight's unowned-tab stop keeps failing closed
+//             while the PO's tab is open (existing keep semantics, unchanged).
+//
+// Fail-closed gates, in order (any failure writes NOTHING):
+//   PO_MANUAL_AGENT_SPACE_UNPROVEN      — the declared agent does not provably own the space (registry);
+//   PO_MANUAL_LEDGER_UNREADABLE         — corrupt ledger: never attach over an unprovable one;
+//   PO_MANUAL_LEDGER_IN_MANAGED_LIFECYCLE:<st> — only an ABSENT or ABORTED (terminal) ledger may be
+//                                         replaced; every other status is a managed lifecycle;
+//   PO_MANUAL_PAGE_VERIFY_FAILED:<why>  — the browser verification refused (see the template:
+//                                         space not found/foreign-owned, page not unique by exact
+//                                         URL, surface unavailable, generation still active, tail
+//                                         identity unavailable) — 绑定前必须核实页面属于该会话;
+//   PO_MANUAL_PAGE_EVIDENCE_UNPARSEABLE — the verification output lacks complete evidence fields;
+//   PO_MANUAL_REGISTRY_CLAIM_FAILED:<c> — claim refused (release pending / foreign space / ...);
+//   PO_MANUAL_ARM_FAILED:<msg>          — the v4 arm write failed (incl. commit lock);
+//   PO_MANUAL_ATTACH_RACE_LOST          — in-lock re-check: the ledger changed between the advisory
+//                                         read and the commit;
+//   PO_MANUAL_COMMIT_LOCK_FAILED:<msg>  — the monitor-root commit lock unavailable.
+// A replaced ABORTED ledger is first archived byte-exact (exclusive-create
+// a-dispatch-state.archive-<id8>-po-manual.json, never overwritten).
+export const PO_MANUAL_SOURCE = "PO_MANUAL";
+
+// Parse the verification template's evidence line:
+//   RESULT=PO_MANUAL_PAGE_VERIFIED evidence={"pageLabel":...,"tailRole":"user|assistant",
+//                                           "tailKey":"...","tailLen":N,"composerLength":N}
+// Returns null on any absent/invalid field (fail-closed) — the ledger baseline is
+// built ONLY from a complete, structurally valid evidence bundle.
+export function parseVerifiedPageEvidence(output) {
+  const line = String(output || "").split(/\r?\n/).reverse()
+    .find((row) => row.startsWith("RESULT=PO_MANUAL_PAGE_VERIFIED"));
+  if (!line) return null;
+  const match = line.match(/ evidence=(\{.*\})\s*$/);
+  if (!match) return null;
+  let evidence;
+  try { evidence = JSON.parse(match[1]); } catch { return null; }
+  if (!evidence || typeof evidence !== "object" || Array.isArray(evidence)) return null;
+  const { pageLabel, tailRole, tailKey, tailLen, composerLength } = evidence;
+  // pageLabel must be a real string: the ledger schema (validateDispatchRecord)
+  // requires one, and the audit trail's draft-page reference needs it — an
+  // unlabeled page refuses instead of writing a schema-invalid ledger.
+  if (typeof pageLabel !== "string" || !pageLabel ||
+      (tailRole !== "user" && tailRole !== "assistant") ||
+      typeof tailKey !== "string" || !tailKey ||
+      !Number.isFinite(tailLen) || tailLen < 0 ||
+      !Number.isFinite(composerLength) || composerLength < 0) return null;
+  return { pageLabel, tailRole, tailKey, tailLen, composerLength };
+}
+
+export async function manualAttachDispatch(p, { now = Date.now(), runVerify = null, directory = undefined } = {}) {
+  const dir = conversationDir(p);
+  const refuse = (code, hint) => {
+    console.error("RESULT=PO_MANUAL_ATTACH_REFUSED code=" + code);
+    console.error("OPERATOR_ACTION=" + hint);
+    return 2;
+  };
+  // 1. Registry preflight (read-only): the declared agent must provably own the space.
+  //    (`directory` is the rebuildSpace-precedent injection point — production
+  //    callers use the machine registry.)
+  let boundSpace = null;
+  try {
+    boundSpace = await withAgentRegistry((registry) => ({
+      changed: false, value: registry.agents[p.agentId]?.spaceName ?? null,
+    }), directory);
+  } catch { boundSpace = null; } // an unreadable registry proves nothing
+  if (boundSpace !== p.space) {
+    return refuse("PO_MANUAL_AGENT_SPACE_UNPROVEN",
+      "先用受管 claim 接管该空间（node monitor/dispatch-manager.mjs claim --monitor-dir <根> --agent-id <ID> --space <空间>），或核对 --agent-id/--space。");
+  }
+  // 2. Ledger pre-state: only ABSENT or a terminal ABORTED ledger may be attached over.
+  let current = null;
+  try { current = await readDispatchState(dir); }
+  catch {
+    return refuse("PO_MANUAL_LEDGER_UNREADABLE",
+      "派单账本损坏：先人工备份 a-dispatch-state.json 并修复后再 attach；拒绝在不可读账本上建立。");
+  }
+  if (current && current.status !== "ABORTED") {
+    return refuse("PO_MANUAL_LEDGER_IN_MANAGED_LIFECYCLE:" + current.status,
+      current.status === "COMPLETED"
+        ? "既有派单已 COMPLETED：先走受管 collect/consume/release 收尾，再考虑 attach。"
+        : "既有受管派单仍在生命周期内（未终态）：等待其收敛，attach 不接管在途派单。");
+  }
+  // 3. Page verification (browser work stays OUTSIDE any commit lock). The
+  // template fails closed unless exactly one page carries the conversation URL
+  // AND a stable, non-generating tail identity is readable.
+  const template = await readFile(templates["manual-attach"], "utf8");
+  const observation = runVerify
+    ? await runVerify(adaptTemplate(template, p), dir)
+    : await runEgo(adaptTemplate(template, p), dir, "manual-attach");
+  if (observation.code !== 0 || observation.result !== "PO_MANUAL_PAGE_VERIFIED") {
+    announceTaskspaceOwnershipLoss(observation, p.space);
+    return refuse("PO_MANUAL_PAGE_VERIFY_FAILED:" + String(observation.result || "EXIT_" + observation.code).slice(0, 80),
+      "绑定前必须核实页面属于该会话（URL 精确匹配 + 尾消息证据）；按失败码排查（空间归属/页面唯一性/表面可用性/生成中/尾标识缺失）后重试。");
+  }
+  const evidence = parseVerifiedPageEvidence(observation.output);
+  if (!evidence) {
+    return refuse("PO_MANUAL_PAGE_EVIDENCE_UNPARSEABLE",
+      "验证输出缺少完整证据字段（pageLabel/tailRole/tailKey/tailLen/composerLength）；重试 manual-attach。");
+  }
+  // 4. Registry claim — registers the conversation for collect ownership and
+  // the sweep's keep semantics. Fail-closed: a refused claim writes no ledger.
+  try {
+    await claimAgentSpace({ agentId: p.agentId, spaceName: p.space, conversationUuid: p.conversation, directory });
+  } catch (error) {
+    return refuse("PO_MANUAL_REGISTRY_CLAIM_FAILED:" + String(error.code || error.message).slice(0, 80),
+      "注册表 claim 失败：按失败码处理（release 挂起/空间他属/身份冲突）后重试。");
+  }
+  // 5. Arm FIRST (v4 arm machine, no bypass — same 布防-before-establishment
+  // order as managed sends). The conversation ledger directory may not exist
+  // yet (the PO-manual conversation was never managed before this attach), so
+  // establish it here — the arm write is the first durable artifact.
+  await mkdir(dir, { recursive: true });
+  try {
+    await armForDispatch(dir, { conversationUuid: p.conversation, space: p.space, timestamp: now });
+  } catch (error) {
+    return refuse("PO_MANUAL_ARM_FAILED:" + String(error.message || error.code || "UNKNOWN").slice(0, 80),
+      "布防写入失败（含提交锁不可用）：状态保持原样，按失败码处理后重试。");
+  }
+  // 6. Ledger establishment under the monitor-root commit lock (the same
+  // coordination domain every arm/prepare/disarm serializes on).
+  let dispatchId = null;
+  try {
+    await withCommitLock(commitLockScopeOf(dir), async (guard) => {
+      const fresh = await readDispatchState(dir);
+      if (!fresh !== !current || (fresh && (fresh.status !== "ABORTED" || fresh.dispatchId !== current.dispatchId))) {
+        throw new Error("PO_MANUAL_ATTACH_RACE_LOST");
+      }
+      let backup = null;
+      if (fresh) backup = await backupLedgerBytes(dir, fresh.dispatchId, now, "po-manual");
+      const record = {
+        schema: "ego-dispatch-state/v2",
+        dispatchId: randomUUID(),
+        conversationUuid: p.conversation,
+        taskSpace: p.space,
+        pageLabel: evidence.pageLabel,
+        baselineTailKey: evidence.tailKey,
+        baselineTailRole: evidence.tailRole,
+        baselineComposerLength: evidence.composerLength,
+        // 免 payload 指纹 (#40): the PO pasted the message themselves; the text
+        // never transits the agent, so there is no hash to store — the reply
+        // boundary is the verified attach-time baseline tail alone.
+        payload_sha256: null,
+        payload_display_sha256: null,
+        payload_bytes: null,
+        composer_baseline: null,
+        status: "UNCERTAIN",
+        attempt: 1,
+        createdAt: now,
+        source: PO_MANUAL_SOURCE,
+        uncertainAt: now,
+        reasonCode: "PO_MANUAL_ATTACH",
+      };
+      await guard();
+      await writeJsonAtomic(join(dir, "a-dispatch-state.json"), record);
+      await appendEvent(dir, "PO_MANUAL_ATTACHED", {
+        dispatchId: record.dispatchId, conversation: p.conversation, space: p.space,
+        pageLabel: evidence.pageLabel, baselineTailRole: evidence.tailRole,
+        ...(backup ? { backupFile: backup.file } : {}),
+      });
+      dispatchId = record.dispatchId;
+    });
+  } catch (error) {
+    if (error?.message === "PO_MANUAL_ATTACH_RACE_LOST") {
+      return refuse("PO_MANUAL_ATTACH_RACE_LOST",
+        "账本在绑定期间被并发修改：重跑 manual-attach 以当前真态重新判定。");
+    }
+    if (isCommitLockError(error)) {
+      return refuse("PO_MANUAL_COMMIT_LOCK_FAILED:" + error.message,
+        "提交锁不可用（fail-closed）：稍后重跑 manual-attach；布防已写入但账本未变。");
+    }
+    return refuse("PO_MANUAL_LEDGER_WRITE_FAILED:" + String(error.code || error.message || "UNKNOWN").slice(0, 80),
+      "账本写入失败：布防已写入但账本未建立，重跑 manual-attach。");
+  }
+  console.log("RESULT=PO_MANUAL_ATTACHED conversation=" + p.conversation + " dispatchId=" + dispatchId +
+    " source=" + PO_MANUAL_SOURCE + " baselineTailRole=" + evidence.tailRole);
+  console.error("OPERATOR_ACTION=已按 PO_MANUAL 受管绑定：现在可用受管 probe/watch 值守（回复就绪走受管 collect）。注意 PO 手动页面在 release 生命周期属非 agent 所有：清扫不会关闭它，PO 自行关闭页面前 release 保持 fail-closed。");
   return 0;
 }
 
@@ -1740,6 +2136,10 @@ export async function main(args = process.argv.slice(2)) {
   // per-conversation directory layout is touched at all. Same for claim.
   if (p.action === "rebuild-space") return rebuildSpace(p);
   if (p.action === "claim") return claimSpace(p);
+  // #39 item 3: the managed pending-new discard is a pure filesystem operation
+  // over pending-new/<requestId>/ — it routes before conversationDir(), which
+  // would otherwise resolve to the conversations/ layout.
+  if (p.action === "discard-pending") return discardPendingDispatch(p);
   const dir = conversationDir(p);
   p.rootMonitorDir = p.monitorDir;
   if (p.newChat) {
@@ -1806,6 +2206,11 @@ export async function main(args = process.argv.slice(2)) {
     await ensureMonitor(dir);
   }
   p.monitorDir = dir;
+  // #40: PO-manual attach — the managed tracking entry for a dispatch the PO
+  // sent by hand. Runs after ensureMonitor (the verification template imports
+  // the module copies from the conversation dir) and before any dispatch-
+  // lifecycle branch; its own gates refuse before anything is written.
+  if (p.action === "manual-attach") return manualAttachDispatch(p);
   if (p.recoverOnly && p.archivedRecord) {
     const originalPayload = await readFile(resolve(p.message), "utf8");
     const archived = JSON.parse(await readFile(resolve(p.archivedRecord), "utf8"));

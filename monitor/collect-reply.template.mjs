@@ -8,15 +8,21 @@ if ([MON, AGENT_ID, SPACE, CONV].some((value) => value.startsWith("REPLACE_"))) 
 import { readFile } from "node:fs/promises";
 import { pathToFileURL } from "node:url";
 const { readDispatchState, readComposerSurface } = await import(pathToFileURL(MON + "/dispatch-state.mjs").href);
-const { extractDomReply, extractApiReply, apiTailFinality, saveReply } = await import(pathToFileURL(MON + "/reply-delivery.mjs").href);
+const { extractDomReply, extractDomReplyByBaseline, extractApiReply, apiTailFinality, saveReply } = await import(pathToFileURL(MON + "/reply-delivery.mjs").href);
 const { assertAgentOwnedTaskSpace } = await import(pathToFileURL(MON + "/taskspace-takeover.mjs").href);
 const { withAgentRegistry } = await import(pathToFileURL(MON + "/agent-space.mjs").href);
 const { isConversationUrl } = await import(pathToFileURL(MON + "/page-recovery.mjs").href);
 
 const record = await readDispatchState(MON);
 const fast = JSON.parse(await readFile(MON + "/a-fast-state.json", "utf8"));
+// #40: a PO_MANUAL ledger carries no payload fingerprint (the PO pasted the
+// message themselves — 免 payload 指纹); its collection anchors on the
+// attach-time baseline tail instead. A manual ledger without that baseline
+// refuses like any other unprovable shape (fail-closed).
+const manualSource = record?.source === "PO_MANUAL";
 if (!record || record.status !== "ACCEPTED" || record.conversationUuid.toLowerCase() !== CONV.toLowerCase() ||
-    record.taskSpace !== SPACE || !record.payload_sha256 || !fast.doneCandidate || fast.generating ||
+    record.taskSpace !== SPACE || (!record.payload_sha256 && !manualSource) ||
+    (manualSource && typeof record.baselineTailKey !== "string") || !fast.doneCandidate || fast.generating ||
     fast.dispatchId !== record.dispatchId || fast.lastMessageRole !== "assistant" ||
     !fast.lastMessageKey || fast.dispatchStatus !== "ACCEPTED") {
   throw new Error("COLLECT_REQUIRES_STABLE_ACCEPTED_REPLY");
@@ -28,7 +34,10 @@ const owned = spaces.find((space) => space.taskId === SPACE || space.name === SP
 assertAgentOwnedTaskSpace(owned, SPACE);
 const task = await taskSpace(owned.id);
 const tabs = await task.tabs();
-if (tabs.some((tab) => tab.openedBy !== "agent")) throw new Error("COLLECT_UNOWNED_TAB");
+// #40: the PO-manual conversation's own page is opened by the PO
+// (openedBy !== "agent") — it IS the human channel being tracked, so it must
+// not trip the un-owned-tab stop. Any OTHER un-owned tab is still a stop.
+if (tabs.some((tab) => tab.openedBy !== "agent" && !isConversationUrl(tab.url, CONV, true))) throw new Error("COLLECT_UNOWNED_TAB");
 const pages = await task.pages();
 const matches = [];
 for (const page of pages) {
@@ -58,9 +67,13 @@ const stable = [first, second].every((surface) => surface.hostOk && surface.comp
   surface.lastMessageTextLength === fast.lastMessageTextLength);
 if (!stable || first.lastMessageTextLength !== second.lastMessageTextLength) throw new Error("COLLECT_PAGE_UNSTABLE");
 
-let reply = extractDomReply(units, record.payload_sha256, fast.lastMessageKey, {
-  displayHash: record.payload_display_sha256, baselineTailKey: record.baselineTailKey,
-});
+let reply = manualSource
+  // #40: the reply boundary is the attach-time baseline tail — the PO's message
+  // is unknowable to the agent, so there is no payload hash to anchor on.
+  ? extractDomReplyByBaseline(units, fast.lastMessageKey, record.baselineTailKey)
+  : extractDomReply(units, record.payload_sha256, fast.lastMessageKey, {
+      displayHash: record.payload_display_sha256, baselineTailKey: record.baselineTailKey,
+    });
 // agent-kit#33 post-mortem evidence: the live body length at extraction time.
 // Long threads virtualize turns out of the DOM, so this can legitimately shrink
 // after a CALIBRATE refresh — the recorded doneLive* fields separate that from
@@ -69,8 +82,10 @@ const domAnchorMissed = !reply;
 const liveBodyLen = await page.evaluate(() => (document.body ? document.body.innerText.length : 0));
 let apiFailure = null;
 let finality = null;
-if (!reply) {
+if (!reply && !manualSource) {
   // Conversation API can lag or return 404. Its failure is never proof of a dead page.
+  // (#40: skipped entirely for PO_MANUAL — both API extractors anchor on the
+  // payload hash, which a manual ledger deliberately does not carry.)
   const api = await page.evaluate(async (conversation) => {
     try {
       const session = await fetch("/api/auth/session", { credentials: "include" });
