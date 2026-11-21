@@ -6,15 +6,17 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile, writeFile, mkdir, rm, mkdtemp, readdir, chmod, stat } from "node:fs/promises";
+import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { randomUUID } from "node:crypto";
 import {
   ARMED_REASONS, IN_FLIGHT_DISPATCH_STATUSES, FAST_STATE_DEFAULTS,
   canTransitionArmedReason, armedTransitionPatch, armedReasonOnPeerGeneration,
   armedReasonOnProbeRound, classifyFastStateFile, classifyProbeBootState, normalizeFastState, validateFastState,
 } from "../monitor/state-schema.mjs";
-import { evaluateDisarmEligibility, dispatchStormGate, prepareDispatch, withCommitLock, isCommitLockError, COMMIT_LOCK_FILE } from "../monitor/dispatch-state.mjs";
+import { evaluateDisarmEligibility, dispatchStormGate, prepareDispatch, withCommitLock, isCommitLockError, COMMIT_LOCK_FILE, COMMIT_LOCK_SCHEMA } from "../monitor/dispatch-state.mjs";
 import {
   armForDispatch, disarmAfterRelease, retryPendingDisarm, managedAcknowledge, acknowledgeWake,
   classifyPageLabelLifecycle, PAGE_LABEL_LIFECYCLE,
@@ -1305,12 +1307,35 @@ test("#27 B3 P1-C round 4: a release attempt aborts fail-closed when the stale c
 });
 
 // ---- P1-C round 5 (planner ruling reply 325e2917): commit-lock TOCTOU closure ----
+// ---- P1-C round 7 rework (2026-11-22 ruling): PID-liveness fencing ----------
+// Deterministic evidence, no clock gambles: a claim's holder is judged by
+// process liveness, so the tests construct PROVABLY dead holders (a spawned
+// child that already exited — process.kill(pid, 0) rejects with ESRCH from
+// then on) and PROVABLY live holders (this very test process).
 
 // A live-looking commit lock claim (schema + current acquiredAt), as a real
 // holder would leave it on disk. Round 6 (P1-C-3): the claim lives at the
 // commit-lock SCOPE — the monitor root — so these helpers take the root.
+// Identity-less shape (no holderPid): the legacy round-5/6 claim, judged by
+// the mtime age fallback only.
 const lockHeldAt = (dir, acquiredAt = Date.now()) => writeFile(join(dir, COMMIT_LOCK_FILE),
-  JSON.stringify({ schema: "ego-commit-lock/v1", acquiredAt }), "utf8");
+  JSON.stringify({ schema: COMMIT_LOCK_SCHEMA, acquiredAt }), "utf8");
+
+// A claim whose holder process is PROVABLY dead: its holderPid belongs to a
+// spawned child that has already exited. The liveness-gated steal recovers it
+// regardless of file age (acquiredAt is deliberately fresh in most tests —
+// age must have no vote once a holderPid is present).
+const deadPid = async () => {
+  const child = spawn(process.execPath, ["-e", "process.exit(0)"], { stdio: "ignore" });
+  await new Promise((resolve) => child.once("exit", resolve));
+  return child.pid;
+};
+const deadHolderLockAt = async (dir, acquiredAt = Date.now()) => {
+  const holderPid = await deadPid();
+  await writeFile(join(dir, COMMIT_LOCK_FILE),
+    JSON.stringify({ schema: COMMIT_LOCK_SCHEMA, acquiredAt, holderId: randomUUID(), holderPid }), "utf8");
+  return holderPid;
+};
 
 // The lock is provably released: no claim file left behind (round 6: the
 // scope is the monitor root, shared by every conversation's participants).
@@ -1319,18 +1344,22 @@ const lockReleased = (dir) => stat(join(dir, COMMIT_LOCK_FILE))
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-// Reads the current claim at the lock scope, tolerating the transient absence
-// window of a contender's verified steal-and-restore (the claim is restored
-// verbatim within milliseconds).
-const readClaim = async (root) => {
-  for (let attempt = 0; ; attempt++) {
-    try { return JSON.parse(await readFile(join(root, COMMIT_LOCK_FILE), "utf8")); }
-    catch (error) {
-      if (error.code === "ENOENT" && attempt < 100) { await sleep(5); continue; }
-      throw error;
-    }
-  }
+// The .stolen-<uuid> artifacts (a verified steal retains the dead claim's
+// moved file as a theft record), read in creation order.
+const stolenArtifacts = async (root) => {
+  const names = (await readdir(root)).filter((name) => name.startsWith(COMMIT_LOCK_FILE + ".stolen-")).sort();
+  return Promise.all(names.map(async (name) => JSON.parse(await readFile(join(root, name), "utf8"))));
 };
+
+// No .retiring-/.stolen- residue anywhere in the scope (normal release, no
+// steal involved).
+const noLockResidue = async (root) => {
+  const names = await readdir(root);
+  return names.every((name) => !name.includes(".retiring-") && !name.includes(".stolen-"));
+};
+
+// Reads the current claim at the lock scope.
+const readClaim = async (root) => JSON.parse(await readFile(join(root, COMMIT_LOCK_FILE), "utf8"));
 
 // A pre-round-5 v4 fast state on disk: the armedSupersededDispatchId stamp
 // field does not exist yet (the tolerant-read migration shape).
@@ -1498,9 +1527,12 @@ test("#27 B3 P1-C round 5: pre-stamp v4 fast states stay readable (tolerant read
   } finally { await rm(controlRoot, { recursive: true, force: true }); }
 });
 
-test("#27 B3 P1-C round 5: commit-lock contention is fail-closed for both the disarm commit and the arm section", async () => {
-  // Disarm commit: a live holder keeps the state armed (explicit blocker),
-  // never writes; once the holder releases, the same call converges.
+test("#27 B3 P1-C round 5 (round 7 rework): commit-lock contention is fail-closed for both the disarm commit and the arm section", async () => {
+  // Disarm commit: a claim with no provably dead holder keeps the state armed
+  // (explicit blocker), never writes; once the claim is removed, the same call
+  // converges. (Round 7: the contender fails with COMMIT_LOCK_WAIT_TIMEOUT —
+  // the identity-less claim has no holder process to prove dead, and its fresh
+  // age is no evidence of abandonment.)
   {
     const root = await mkdtemp(join(tmpdir(), "ego-round5-lock-disarm-"));
     try {
@@ -1508,13 +1540,13 @@ test("#27 B3 P1-C round 5: commit-lock contention is fail-closed for both the di
       await completedConsumed(dir);
       await lockHeldAt(root);
       const blocked = await disarmAfterRelease(dir, {
-        rootMonitorDir: root, expectedDispatchId: uuid, commitLock: { waitMs: 60 },
+        rootMonitorDir: root, expectedDispatchId: uuid, commitLock: { waitBudgetMs: 60 },
       });
       assert.deepEqual(blocked, { disarmed: false, alreadyDisarmed: false,
-        blockers: ["DISARM_COMMIT_LOCK_FAILED:COMMIT_LOCK_TIMEOUT"] });
+        blockers: ["DISARM_COMMIT_LOCK_FAILED:COMMIT_LOCK_WAIT_TIMEOUT"] });
       assert.equal(JSON.parse(await readFile(join(dir, "a-fast-state.json"), "utf8")).armedReason, "DISPATCH_ACCEPTED");
       await rm(join(root, COMMIT_LOCK_FILE));
-      const ok = await disarmAfterRelease(dir, { rootMonitorDir: root, expectedDispatchId: uuid, commitLock: { waitMs: 60 } });
+      const ok = await disarmAfterRelease(dir, { rootMonitorDir: root, expectedDispatchId: uuid, commitLock: { waitBudgetMs: 60 } });
       assert.deepEqual(ok, { disarmed: true, alreadyDisarmed: false, blockers: [] });
     } finally { await rm(root, { recursive: true, force: true }); }
   }
@@ -1526,38 +1558,157 @@ test("#27 B3 P1-C round 5: commit-lock contention is fail-closed for both the di
       const dir = await makeConversation(root);
       await lockHeldAt(root);
       await assert.rejects(
-        armForDispatch(dir, { conversationUuid: uuid, space: "GDC-执行A", commitLock: { waitMs: 60 } }),
-        /ARM_COMMIT_LOCK_FAILED:COMMIT_LOCK_TIMEOUT/);
+        armForDispatch(dir, { conversationUuid: uuid, space: "GDC-执行A", commitLock: { waitBudgetMs: 60 } }),
+        /ARM_COMMIT_LOCK_FAILED:COMMIT_LOCK_WAIT_TIMEOUT/);
       await assert.rejects(readFile(join(dir, "a-fast-state.json"), "utf8"), /ENOENT/);
       await assert.rejects(readFile(join(dir, "a-fast-events.ndjson"), "utf8"), /ENOENT/);
     } finally { await rm(root, { recursive: true, force: true }); }
   }
 });
 
-test("#27 B3 P1-C round 5: an abandoned (stale) lock is recovered by atomic rename steal; a live claim is never stolen", async () => {
-  // Holder crashed: its claim is 40s old (> the 30s stale bound), the bounded
-  // wait is tiny — the steal path must recover the lock and leave no residue.
-  const root = await mkdtemp(join(tmpdir(), "ego-round5-stale-steal-"));
+test("#27 B3 P1-C round 7 rework T2: a PROVABLY DEAD holder's claim is stolen immediately — age has no vote — with the verified move retained, and a live-looking claim is never stolen (arm path)", async () => {
+  // T2 (dead holder stolen immediately): the claim's holderPid belongs to an
+  // already-exited child and acquiredAt is FRESH — file age says "young", the
+  // OS says "holder dead": the liveness judgment licenses the steal without
+  // any age wait. The real arm caller recovers the lock through its normal
+  // wait-budget path.
+  const root = await mkdtemp(join(tmpdir(), "ego-round7-dead-steal-"));
   try {
     const dir = await makeConversation(root);
-    await lockHeldAt(root, Date.now() - 40_000);
-    const next = await armForDispatch(dir, { conversationUuid: uuid, space: "GDC-执行A", commitLock: { waitMs: 60 } });
+    const deadHolderPid = await deadHolderLockAt(root, Date.now()); // fresh age, dead holder
+    const next = await armForDispatch(dir, { conversationUuid: uuid, space: "GDC-执行A", commitLock: { waitBudgetMs: 60 } });
     assert.equal(next.armedReason, "DISPATCH_ACCEPTED");
     assert.equal(await lockReleased(root), true);
-    assert.equal((await readdir(root)).some((name) => name.includes(".stolen-")), false,
-      "the stolen lock file is cleaned up");
+    // The verified move retained the dead claim as the .stolen- artifact.
+    const artifacts = await stolenArtifacts(root);
+    assert.equal(artifacts.length, 1, "exactly one theft record");
+    assert.match(String(artifacts[0].holderId), /^[\da-f-]{36}$/);
+    assert.equal(artifacts[0].holderPid, deadHolderPid);
+    const names = await readdir(root);
+    assert.equal(names.some((n) => n.includes(".retiring-")), false,
+      "no .retiring- residue on the steal path");
+    // The NEW claim established by the steal, observed mid-section: a fresh
+    // holderId and holderPid = the stealing process (never the dead pid) —
+    // the exact claim shape the liveness judgment later interrogates.
+    const secondDeadPid = await deadHolderLockAt(root, Date.now());
+    const seen = await withCommitLock(root, async () => readClaim(root), { waitBudgetMs: 0 });
+    assert.notEqual(seen.holderId, artifacts[0].holderId);
+    assert.equal(seen.holderPid, process.pid);
+    assert.notEqual(seen.holderPid, secondDeadPid);
+    assert.equal(await lockReleased(root), true);
   } finally { await rm(root, { recursive: true, force: true }); }
-  // A fresh claim inside the stale window is provably alive: fail-closed
-  // timeout, never a blind overwrite.
-  const liveRoot = await mkdtemp(join(tmpdir(), "ego-round5-stale-live-"));
+  // T1 (live holder never stolen): a claim whose holderPid is THIS test
+  // process — provably alive — and whose age is 60s OLD. Age would have
+  // licensed a round-6 steal; under liveness fencing the contender fails
+  // closed immediately (zero budget) and the claim bytes stay untouched.
+  {
+    const liveRoot = await mkdtemp(join(tmpdir(), "ego-round7-live-keep-"));
+    try {
+      const dir = await makeConversation(liveRoot);
+      const liveClaim = JSON.stringify({ schema: COMMIT_LOCK_SCHEMA, acquiredAt: Date.now() - 60_000, holderId: "self-holder", holderPid: process.pid });
+      await writeFile(join(liveRoot, COMMIT_LOCK_FILE), liveClaim, "utf8");
+      await assert.rejects(
+        armForDispatch(dir, { conversationUuid: uuid, space: "GDC-执行A", commitLock: { waitBudgetMs: 0 } }),
+        /ARM_COMMIT_LOCK_FAILED:COMMIT_LOCK_WAIT_TIMEOUT/);
+      assert.equal(await readFile(join(liveRoot, COMMIT_LOCK_FILE), "utf8"), liveClaim,
+        "the live holder's claim bytes are untouched");
+      assert.equal(await noLockResidue(liveRoot), true, "no theft attempted against a live holder");
+      await assert.rejects(readFile(join(dir, "a-fast-state.json"), "utf8"), /ENOENT/);
+    } finally { await rm(liveRoot, { recursive: true, force: true }); }
+  }
+  // An identity-less claim (no holderPid — legacy shape) is judged by the age
+  // fallback only: a fresh one is never abandoned on age evidence either.
+  {
+    const legacyRoot = await mkdtemp(join(tmpdir(), "ego-round7-legacy-fresh-"));
+    try {
+      const dir = await makeConversation(legacyRoot);
+      await lockHeldAt(legacyRoot, Date.now() - 5_000);
+      await assert.rejects(
+        armForDispatch(dir, { conversationUuid: uuid, space: "GDC-执行A", commitLock: { waitBudgetMs: 60 } }),
+        /ARM_COMMIT_LOCK_FAILED:COMMIT_LOCK_WAIT_TIMEOUT/);
+      await assert.rejects(readFile(join(dir, "a-fast-state.json"), "utf8"), /ENOENT/);
+    } finally { await rm(legacyRoot, { recursive: true, force: true }); }
+  }
+});
+
+test("#27 B3 P1-C round 7 rework T1: a LIVE holder (this process) is never stolen even with an old-looking age — a zero-budget contender fails closed immediately and the claim bytes are untouched", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ego-round7-t1-live-"));
   try {
-    const dir = await makeConversation(liveRoot);
-    await lockHeldAt(liveRoot, Date.now() - 5_000);
-    await assert.rejects(
-      armForDispatch(dir, { conversationUuid: uuid, space: "GDC-执行A", commitLock: { waitMs: 60 } }),
-      /ARM_COMMIT_LOCK_FAILED:COMMIT_LOCK_TIMEOUT/);
-    await assert.rejects(readFile(join(dir, "a-fast-state.json"), "utf8"), /ENOENT/);
-  } finally { await rm(liveRoot, { recursive: true, force: true }); }
+    // The claim carries holderPid = THIS test process (provably alive) and an
+    // age of 60s: under round-6 age rules this would be stolen; under round-7
+    // liveness fencing the age has no vote and the contender fails closed.
+    const liveClaim = JSON.stringify({ schema: COMMIT_LOCK_SCHEMA, acquiredAt: Date.now() - 60_000, holderId: "t1-self", holderPid: process.pid });
+    await writeFile(join(root, COMMIT_LOCK_FILE), liveClaim, "utf8");
+    await assert.rejects(withCommitLock(root, async () => "should-not-run", { waitBudgetMs: 0 }),
+      /COMMIT_LOCK_WAIT_TIMEOUT/);
+    assert.equal(await readFile(join(root, COMMIT_LOCK_FILE), "utf8"), liveClaim,
+      "the live holder's claim bytes are untouched");
+    assert.equal(await noLockResidue(root), true, "no theft artifacts against a live holder");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("#27 B3 P1-C round 7 rework T3: a release that finds FOREIGN claim content throws COMMIT_LOCK_LOST and never moves or deletes it", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ego-round7-t3-release-"));
+  try {
+    const foreignClaim = JSON.stringify({ schema: COMMIT_LOCK_SCHEMA, acquiredAt: Date.now(), holderId: "foreign-holder-B", holderPid: process.pid });
+    const run = withCommitLock(root, async (guard) => {
+      await guard(); // ours, passes
+      // Tamper while A is mid-section: the path content is replaced by B's
+      // claim. (Under liveness fencing no contender could PRODUCE this — the
+      // test plays the tamper directly to pin the release's content check.)
+      await writeFile(join(root, COMMIT_LOCK_FILE), foreignClaim, "utf8");
+      return "task-done";
+    }, { waitBudgetMs: 5_000 });
+    await assert.rejects(run, /COMMIT_LOCK_LOST/);
+    // B's content survives byte-for-byte — the old holder never touched it.
+    assert.equal(await readFile(join(root, COMMIT_LOCK_FILE), "utf8"), foreignClaim);
+    assert.equal((await readdir(root)).some((name) => name.includes(".retiring-")), false,
+      "no .retiring- residue: the foreign claim was never moved");
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("#27 B3 P1-C round 7 rework T5: the mistake-theft RESTORE path is gone — no rename-back recovery, and the only lock-path re-creation is an exclusive create", async () => {
+  const src = await readFile(fileURLToPath(new URL("../monitor/dispatch-state.mjs", import.meta.url)), "utf8");
+  assert.equal(src.includes("rename(stolen"), false,
+    "no stolen→lockPath rename restore (the round-6 overwrite restore is deleted)");
+  assert.equal(/export (async )?function \w*(restore|recover)/i.test(src), false,
+    "no exported restore/recovery function on the lock surface");
+  // Every re-creation of the lock path — acquisition AND the mismatch
+  // restore — goes through the exclusive create, so nothing is ever
+  // overwritten at the path.
+  assert.equal(src.split('open(lockPath, "wx", 0o600)').length - 1, 2,
+    "acquisition + restore both use O_EXCL; no other path re-creation exists");
+});
+
+test("#27 B3 P1-C round 7 rework T6: a live holder's guard→commit section cannot be stolen — a zero-budget contender fails while the holder commits and releases normally (window-3 structural closure)", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ego-round7-t6-window3-"));
+  try {
+    const dir = await makeConversation(root);
+    const marker = join(root, "commit-marker.txt");
+    let holderInside, resumeHolder;
+    const insidePromise = new Promise((resolve) => { holderInside = resolve; });
+    const gate = new Promise((resolve) => { resumeHolder = resolve; });
+    const holderRun = withCommitLock(dir, async (guard) => {
+      holderInside();
+      await gate; // holder paused mid-section; its claim is live (this process holds it)
+      await guard(); // ownership re-verified immediately before the write
+      await writeFile(marker, "committed", "utf8");
+      return "HOLDER_COMMITTED";
+    }, { waitBudgetMs: 5_000 });
+    await insidePromise;
+    // Barrier: with the holder provably mid-section, a zero-budget contender
+    // can neither acquire nor steal (theft requires holder death) — it fails
+    // closed immediately, deterministically, without any clock dependency.
+    await assert.rejects(withCommitLock(dir, async () => "should-not-run", { waitBudgetMs: 0 }),
+      /COMMIT_LOCK_WAIT_TIMEOUT/);
+    resumeHolder();
+    assert.equal(await holderRun, "HOLDER_COMMITTED");
+    // The guarded commit landed; the claim was released normally with no
+    // residue — the guard→commit window saw zero displacement.
+    assert.equal(await readFile(marker, "utf8"), "committed");
+    assert.equal(await lockReleased(root), true);
+    assert.equal(await noLockResidue(root), true);
+  } finally { await rm(root, { recursive: true, force: true }); }
 });
 
 test("#27 B3 P1-C round 5: the commit lock really serializes concurrent participants (no interleaving, no leaked lock)", async () => {
@@ -1572,7 +1723,7 @@ test("#27 B3 P1-C round 5: the commit lock really serializes concurrent particip
       await writeFile(join(dir, "a-fast-state.json"), raw);
       await new Promise((resolve) => setTimeout(resolve, 20));
       order.push(name + ":end");
-    }, { waitMs: 2_000 });
+    }, { waitBudgetMs: 2_000 });
     await Promise.all([section("A"), section("B")]);
     // Sections never interleave: each ":end" immediately precedes the other's
     // ":start" (single-holder mutual exclusion under real contention).
@@ -1583,6 +1734,7 @@ test("#27 B3 P1-C round 5: the commit lock really serializes concurrent particip
     assert.equal(order[3], order[2].replace(":start", ":end"));
     assert.notEqual(order[0], order[2]);
     assert.equal(await lockReleased(dir), true);
+    assert.equal(await noLockResidue(root), true);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
@@ -1596,8 +1748,8 @@ test("#27 B3 P1-C round 5 (ruling requirement 1): the PREPARED ledger establishm
     await lockHeldAt(root);
     await assert.rejects(
       prepareDispatch({ monitorDir: dir, conversationUuid: uuid, taskSpace: "GDC-执行A", pageLabel: "p1",
-        page: stubComposerPage(), payload: "新派单内容", commitLock: { waitMs: 60 } }),
-      /COMMIT_LOCK_TIMEOUT/);
+        page: stubComposerPage(), payload: "新派单内容", commitLock: { waitBudgetMs: 60 } }),
+      /COMMIT_LOCK_WAIT_TIMEOUT/);
     await assert.rejects(readFile(join(dir, "a-dispatch-state.json"), "utf8"), /ENOENT/);
     await rm(join(root, COMMIT_LOCK_FILE));
     // Happy path: the real prepare writes the PREPARED ledger and releases the
@@ -1618,12 +1770,13 @@ test("#27 B3 P1-C round 5 (ruling requirement 1): the PREPARED ledger establishm
 
 // ---- P1-C round 6 (planner ruling reply 365689e8): lock ownership + ACTIVE supersession + global coordination ----
 
-test("#27 B3 P1-C round 6 (P1-C-1 ruling reqs 1+2+5): three stale-lock contenders — exactly one steal wins, no fresh lock is taken away, the lock is properly released", async () => {
-  const root = await mkdtemp(join(tmpdir(), "ego-round6-steal-race-"));
+test("#27 B3 P1-C round 7 rework T7: three contenders race a DEAD holder's claim — exactly one wins through the verified move, the losers fail closed against the winner's live claim, no interleaving", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ego-round7-t7-race-"));
   try {
-    // A stale claim (its holder "crashed" 40s ago) that THREE contenders
-    // simultaneously try to recover (requirement 1).
-    await lockHeldAt(root, Date.now() - 40_000);
+    // A dead holder's claim that THREE contenders simultaneously try to
+    // recover — all with a zero wait budget, so every judgment is immediate
+    // and no timing luck is involved.
+    const deadHolderPid = await deadHolderLockAt(root, Date.now());
     const order = [];
     const contender = (name) => withCommitLock(root, async (guard) => {
       const claimAtStart = await readClaim(root);
@@ -1631,116 +1784,108 @@ test("#27 B3 P1-C round 6 (P1-C-1 ruling reqs 1+2+5): three stale-lock contender
       order.push(name + ":start");
       await sleep(30);
       const claimAtEnd = await readClaim(root);
-      // Requirement 2: the fresh claim this holder created was never taken
-      // away — a loser's mismatched steal attempt restores it verbatim, so
+      // The fresh claim this holder created was never taken away or replaced:
       // the claim identity is stable across the whole critical section.
       assert.equal(claimAtEnd.holderId, claimAtStart.holderId);
       order.push(name + ":end");
-    }, { waitMs: 1_500, staleMs: 2_000 });
+    }, { waitBudgetMs: 0 });
     const outcomes = await Promise.all([contender("A"), contender("B"), contender("C")]
       .map((run) => run.then(() => "ACQUIRED", (error) => String(error.message))));
-    // Requirement 2: exactly one contender won; the losers failed closed
-    // against the winner's fresh claim — none of them stole or replaced it.
+    // Exactly one contender won; the losers failed closed against the
+    // winner's LIVE claim (its holderPid is this very process) — none of them
+    // stole or replaced it.
     assert.equal(outcomes.filter((outcome) => outcome === "ACQUIRED").length, 1,
       JSON.stringify(outcomes));
     for (const outcome of outcomes) {
-      if (outcome !== "ACQUIRED") assert.equal(outcome, "COMMIT_LOCK_TIMEOUT", outcome);
+      if (outcome !== "ACQUIRED") assert.equal(outcome, "COMMIT_LOCK_WAIT_TIMEOUT", outcome);
     }
     // No critical section ever interleaved (single-holder execution).
     assert.equal(order.length, 2, JSON.stringify(order));
     assert.match(order[0], /:start$/);
     assert.equal(order[1], order[0].replace(":start", ":end"));
-    // Requirement 5: after all contenders settle, the claim is released with
-    // no residue, and a follow-up holder acquires cleanly.
+    // Exactly one theft record: the verified move of the dead claim.
+    const artifacts = await stolenArtifacts(root);
+    assert.equal(artifacts.length, 1, JSON.stringify(outcomes));
+    assert.equal(artifacts[0].holderPid, deadHolderPid);
+    // After all contenders settle, the claim is released with no .retiring
+    // residue, and a follow-up holder acquires cleanly.
     assert.equal(await lockReleased(root), true);
-    assert.equal((await readdir(root)).some((name) => name.includes(".stolen-")), false);
-    await withCommitLock(root, async () => {}, { waitMs: 1_000 });
+    const names = await readdir(root);
+    assert.equal(names.some((name) => name.includes(".retiring-")), false);
+    await withCommitLock(root, async () => {}, { waitBudgetMs: 1_000 });
     assert.equal(await lockReleased(root), true);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
-test("#27 B3 P1-C round 6 (P1-C-1 ruling reqs 3+4+5): a displaced holder detects the loss via its ownership guard, and its release spares the new holder's lock", async () => {
-  const root = await mkdtemp(join(tmpdir(), "ego-round6-displaced-"));
+test("#27 B3 P1-C round 7 rework (P1-C-1 ruling reqs 3+4): the pre-write ownership guard aborts fail-closed when the claim content is displaced mid-section (tamper simulation — liveness fencing means no contender could produce this against a live holder), and the release spares the foreign claim", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ego-round7-displaced-"));
   try {
-    let resumeX, resumeY;
+    let resumeX, xInside;
     const gateX = new Promise((resolve) => { resumeX = resolve; });
-    const gateY = new Promise((resolve) => { resumeY = resolve; });
-    let xInside, yInside;
     const xInsidePromise = new Promise((resolve) => { xInside = resolve; });
-    const yInsidePromise = new Promise((resolve) => { yInside = resolve; });
     const marker = join(root, "x-commit-marker.txt");
     // X holds the claim and pauses mid-section (a slow commit section).
     const xRun = withCommitLock(root, async (guard) => {
       xInside();
       await gateX;
-      // Requirement 3: the pre-write ownership re-verification detects that
-      // X's claim was displaced while it was paused — fail-closed, X never
-      // co-commits with the new holder.
+      // The pre-write ownership re-verification detects that the path no
+      // longer reads as X's claim — fail-closed, X never co-commits.
       await guard();
       await writeFile(marker, "x-committed", "utf8");
     }).then(() => "X_COMMITTED", (error) => String(error.message));
     await xInsidePromise;
-    let yHolderId = null;
-    // Y steals X's claim: Y's clock runs 60s ahead, so X's fresh claim looks
-    // stale (the ruling's named evidence boundary — file age never proves the
-    // holder process is dead; the guard is the backstop).
-    const yRun = withCommitLock(root, async (guard) => {
-      yHolderId = (await readClaim(root)).holderId;
-      yInside();
-      await gateY;
-      await guard();
-      return "Y_DONE";
-    }, { waitMs: 0, staleMs: 30_000, now: () => Date.now() + 60_000 })
-      .then(() => "Y_COMMITTED", (error) => String(error.message));
-    await yInsidePromise;
-    assert.notEqual(yHolderId, null);
+    // Displace X's claim while it is paused. Under liveness fencing no
+    // contender could PRODUCE this (X's process is alive — theft requires
+    // death), so the test plays the tamper directly: the guard remains the
+    // backstop for exactly this class of event.
+    const foreignClaim = JSON.stringify({ schema: COMMIT_LOCK_SCHEMA, acquiredAt: Date.now(), holderId: "foreign-Y", holderPid: process.pid });
+    await writeFile(join(root, COMMIT_LOCK_FILE), foreignClaim, "utf8");
     resumeX();
     assert.equal(await xRun, "COMMIT_LOCK_LOST");
     // X's guarded commit never happened.
     await assert.rejects(stat(marker), /ENOENT/);
-    // Requirement 4: X's ownership-protected release spared Y's lock — the
-    // claim still reads as Y's while Y is mid-section.
-    assert.equal((await readClaim(root)).holderId, yHolderId);
-    // Requirement 5: Y completes and releases; the scope ends clean.
-    resumeY();
-    assert.equal(await yRun, "Y_COMMITTED");
+    // X's release spared the foreign content byte-for-byte.
+    assert.equal(await readFile(join(root, COMMIT_LOCK_FILE), "utf8"), foreignClaim);
+    // Convergence: clear the tampered claim; a fresh holder acquires cleanly
+    // and the scope ends clean.
+    await rm(join(root, COMMIT_LOCK_FILE));
+    await withCommitLock(root, async () => {}, { waitBudgetMs: 1_000 });
     assert.equal(await lockReleased(root), true);
+    assert.equal(await noLockResidue(root), true);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
-test("#27 B3 P1-C round 6 (P1-C-1): the disarm commit's pre-write ownership guard aborts fail-closed when its lock is stolen mid-section; the thief's lock survives the victim's release", async () => {
-  const root = await mkdtemp(join(tmpdir(), "ego-round6-guard-disarm-"));
+test("#27 B3 P1-C round 7 rework (P1-C-1): the disarm commit aborts fail-closed when its claim is displaced mid-section (barrier tamper — liveness fencing means no contender could produce this against a live holder); the displacing claim survives the victim's release and the retry converges", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ego-round7-guard-disarm-"));
   try {
     const dir = await makeConversation(root, { "a-fast-state.json": armedState("DISPATCH_ACCEPTED") });
     await completedConsumed(dir);
-    // A large sibling set makes the in-lock global re-scan take long enough
-    // that a contender's stale-based steal deterministically lands INSIDE the
-    // commit section, before its pre-write ownership guard.
+    // A large sibling set makes the in-lock global re-scan structurally long:
+    // the tamper lands microseconds after the victim's claim appears, so it
+    // is guaranteed to sit INSIDE the commit section, before the pre-write
+    // ownership guard (a barrier on the claim's existence, not a sleep gamble).
     for (let i = 0; i < 1500; i++) {
       const sibling = join(root, "conversations", `sib-${i}`);
       await mkdir(sibling, { recursive: true });
       await writeFile(join(sibling, "a-dispatch-state.json"),
         JSON.stringify(dispatchRecord({ status: "COMPLETED" })), "utf8");
     }
-    // The thief waits until the victim provably holds the claim, then — with
-    // a clock 60s ahead (fresh claims LOOK stale; the evidence boundary named
-    // by the ruling) — steals it while the victim is inside its re-scan.
-    let thiefResume, thiefClaimId = null;
-    const thiefGate = new Promise((resolve) => { thiefResume = resolve; });
-    const thiefRun = (async () => {
+    // Displace the victim's claim with a foreign one the moment the victim
+    // provably holds it (mid-section, long before its guard runs).
+    const thiefClaimBytes = JSON.stringify({ schema: COMMIT_LOCK_SCHEMA, acquiredAt: Date.now(), holderId: "thief-Z", holderPid: process.pid });
+    const displace = (async () => {
       for (let i = 0; ; i++) {
-        try { await readFile(join(root, COMMIT_LOCK_FILE), "utf8"); break; }
-        catch (error) {
+        try {
+          const claim = JSON.parse(await readFile(join(root, COMMIT_LOCK_FILE), "utf8"));
+          if (claim?.schema === COMMIT_LOCK_SCHEMA && typeof claim.holderId === "string" && claim.holderId.length > 0) {
+            await writeFile(join(root, COMMIT_LOCK_FILE), thiefClaimBytes, "utf8");
+            return;
+          }
+        } catch (error) {
           if (error.code !== "ENOENT" || i > 2000) throw error;
-          await sleep(2);
         }
+        await sleep(2);
       }
-      await sleep(20);
-      return withCommitLock(root, async () => {
-        thiefClaimId = (await readClaim(root)).holderId;
-        await thiefGate;
-      }, { waitMs: 30, staleMs: 30_000, now: () => Date.now() + 60_000 })
-        .then(() => "THIEF_DONE", (error) => String(error.message));
     })();
     // The victim's commit: the ownership guard fires COMMIT_LOCK_LOST (its
     // claim was displaced mid-section) and the disarm stays armed fail-closed.
@@ -1750,16 +1895,14 @@ test("#27 B3 P1-C round 6 (P1-C-1): the disarm commit's pre-write ownership guar
     assert.equal(JSON.parse(await readFile(join(dir, "a-fast-state.json"), "utf8")).armedReason,
       "DISPATCH_ACCEPTED");
     await assertNoDisarmEvent(dir);
-    // The victim's ownership-protected release spared the thief's claim.
-    assert.notEqual(thiefClaimId, null);
-    assert.equal((await readClaim(root)).holderId, thiefClaimId);
-    // Convergence: the thief finishes and releases; the victim's retry — no
+    // The victim's release spared the displacing claim byte-for-byte.
+    assert.equal(await readFile(join(root, COMMIT_LOCK_FILE), "utf8"), thiefClaimBytes);
+    // Convergence: the displaced claim is cleared; the victim's retry — no
     // contender left, no in-flight sibling — disarms cleanly.
-    thiefResume();
-    assert.equal(await thiefRun, "THIEF_DONE");
-    assert.equal(await lockReleased(root), true);
+    await rm(join(root, COMMIT_LOCK_FILE));
     const retry = await disarmAfterRelease(dir, { rootMonitorDir: root, expectedDispatchId: uuid });
     assert.deepEqual(retry, { disarmed: true, alreadyDisarmed: false, blockers: [] });
+    await displace; // the tamper step always completed (never rejected)
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
@@ -1924,7 +2067,7 @@ test("#27 B3 P1-C round 6 (P1-C-1 wiring): every participant's commit section re
   // COMMIT_LOCK_LOST joins the fail-closed lock error family every caller
   // maps through isCommitLockError.
   assert.equal(isCommitLockError(new Error("COMMIT_LOCK_LOST")), true);
-  assert.equal(isCommitLockError(new Error("COMMIT_LOCK_TIMEOUT")), true);
+  assert.equal(isCommitLockError(new Error("COMMIT_LOCK_WAIT_TIMEOUT")), true);
   assert.equal(isCommitLockError(new Error("COMMIT_LOCK_STALE")), true);
   assert.equal(isCommitLockError(new Error("OTHER_FAILURE")), false);
 });

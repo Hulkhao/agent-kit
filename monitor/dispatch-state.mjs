@@ -47,7 +47,8 @@ export async function writeJsonAtomic(path, value) {
 }
 
 // ---- #27 Batch 3 P1-C round 5 (planner ruling reply 325e2917): the
-// serialized commit lock; round 6 (reply 365689e8): holder ownership ----
+// serialized commit lock; round 6 (reply 365689e8): holder ownership;
+// round 7 rework (2026-11-22 ruling): PID-liveness fencing ----
 //
 // One exclusive-create lockfile serializes every writer of dispatch-identity-
 // relevant state, closing the TOCTOU window the round-4 ruling identified
@@ -79,44 +80,68 @@ export async function writeJsonAtomic(path, value) {
 // Fail-closed policy (ruling requirement 4): a lock the caller cannot take is
 // never a license to write — arm aborts (nothing is delivered), the disarm
 // commit stays armed, prepareDispatch aborts before any delivery. Error codes:
-//   COMMIT_LOCK_TIMEOUT — the bounded wait expired while the current holder
-//     still looks alive (lock file present, not provably stale);
-//   COMMIT_LOCK_STALE   — a stale lock was detected but could not be removed;
-//   COMMIT_LOCK_LOST    — the holder's ownership guard found the lock file
-//     gone or held by a DIFFERENT holderId: this holder was displaced
-//     mid-section and must not write (P1-C-1 ruling requirement 3).
+//   COMMIT_LOCK_WAIT_TIMEOUT — the wait budget expired while the current
+//     holder process is provably ALIVE: a live holder is never stolen from
+//     (round-7 rework; replaces the round-5/6 COMMIT_LOCK_TIMEOUT);
+//   COMMIT_LOCK_STALE   — a dead holder's claim was being stolen but the steal
+//     could not be completed safely;
+//   COMMIT_LOCK_LOST    — the holder's ownership guard or release found the
+//     lock file gone or holding a DIFFERENT holderId's claim: this holder was
+//     displaced (or tampered) mid-section and must not write (P1-C-1 ruling
+//     requirement 3).
 //
-// Holder ownership (round 6, P1-C-1): every claim carries a random holderId.
-//   acquire — exclusive create + claim write { schema, acquiredAt, holderId };
-//   steal   — a contender whose bounded wait expired may steal a lock ONLY
-//     when the claim is provably abandoned: its recorded acquiredAt (or, for a
-//     zero-byte file from a crash between create and write, its mtime) is
-//     older than COMMIT_LOCK_STALE_MS. The steal is an ATOMIC RENAME to a
-//     unique sibling name — exactly one contender can win the move — and the
-//     winner VERIFIES the moved file is still the stale claim it judged
-//     (same acquiredAt + holderId). A mismatch means the contender renamed a
-//     DIFFERENT, fresher claim between its judgment and its move: the fresher
-//     claim is restored verbatim by an atomic rename back (its holder's own
-//     guard stays authoritative) and the loser re-contends instead of taking
-//     the new lock (P1-C-1 requirement 2). Evidence boundary (named by the
-//     ruling): file age proves the claim is old, NOT that its holder process
-//     is dead — a live holder displaced by a stale-based steal therefore
-//     detects the loss through its ownership guard and aborts fail-closed
-//     before any write, never through blind trust in the lock.
+// Holder ownership (round 6, P1-C-1; round 7 rework): every claim carries a
+// random holderId AND the holder process id.
+//   acquire — exclusive create + claim write
+//     { schema, acquiredAt, holderId, holderPid: process.pid };
+//   steal   — a contender whose wait budget expired judges the claim by PID
+//     LIVENESS, not by file age: process.kill(holderPid, 0) succeeding (or
+//     failing with EPERM — the process exists but is not signalable by us)
+//     proves the holder is ALIVE and the contender fails closed with
+//     COMMIT_LOCK_WAIT_TIMEOUT; only ESRCH (no such process) proves death and
+//     licenses the steal. File age has NO vote once a holderPid is present —
+//     the round-6 ruling's named evidence boundary (age proves a claim is old,
+//     not that its holder is dead) is closed structurally: a LIVE holder can
+//     no longer be displaced at all, which also removes the round-6
+//     mistake-theft RESTORE path (see below). The steal itself is an ATOMIC
+//     RENAME to a unique sibling name — exactly one contender can win the
+//     move — and the winner VERIFIES the moved file is still the dead claim it
+//     judged (same acquiredAt + holderId + holderPid). The verified dead claim
+//     is RETAINED as the .stolen-<uuid> artifact (theft record; deterministic
+//     test evidence; never read by the protocol). A mismatch means the
+//     contender moved a DIFFERENT claim between its judgment and its move —
+//     possibly a live holder's: the moved claim is restored verbatim through
+//     an EXCLUSIVE create (open "wx": if any claim already sits at the path —
+//     a third contender got there first — the restore is abandoned, the
+//     artifact kept, and the loser re-contends; NOTHING is ever overwritten,
+//     so a restore can never clobber another contender's claim) and the loser
+//     re-contends without taking the lock. A claim with no usable holderPid
+//     (a zero-byte file from a crash between create and content write, or a
+//     legacy round-6 claim) has no identity to interrogate — for exactly that
+//     identity-less case only, the mtime age (COMMIT_LOCK_STALE_MS) remains
+//     the fall-back evidence, so crash recovery survives.
 //   guard   — task(guard): every participant re-verifies ownership
 //     (read claim → holderId === mine, else COMMIT_LOCK_LOST) IMMEDIATELY
-//     BEFORE its final state write, so a holder displaced mid-section can
-//     never co-commit with the new holder (P1-C-1 requirement 3).
-//   release — ownership-protected: read claim → holderId === mine → atomic
-//     rename to a unique retiring name → unlink THAT file (P1-C-1 requirement
-//     4). A foreign or vanished claim is never unlinked blindly, so a
-//     displaced holder cannot delete the new holder's lock.
+//     BEFORE its final state write. Defense-in-depth: theft requires the
+//     holder process's death, and a live holder executing guard+commit cannot
+//     die mid-sequence, so the guard→commit double-write window (round-7
+//     ruling problem 3) is STRUCTURALLY closed — the guard only fires on
+//     external tampering or identity-less corner cases, never on a protocol
+//     steal of a live holder.
+//   release — ownership-protected (round-7 rework): read claim →
+//     holderId !== mine → COMMIT_LOCK_LOST and the file is NEVER touched
+//     (content-level check; combined with the liveness-gated steal the path
+//     content stays ours for as long as we live, so a release can never delete
+//     or overwrite a successor's lock — round-7 ruling problem 1); holderId ===
+//     mine → atomic rename to a unique retiring name → unlink THAT file.
 // Critical sections here are short pure file operations, so the defaults leave
-// a wide margin: live contention waits up to 10s, an abandoned lock is
-// recoverable after ~30s at the latest.
+// a wide margin: live contention waits up to 30s (waitBudgetMs, injectable)
+// and then fails closed; a dead holder's claim is stolen as soon as the
+// contender's budget expires — immediately for a zero budget; an identity-less
+// orphan (crash between create and write) is recoverable after ~30s of age.
 
 export const COMMIT_LOCK_FILE = "a-commit-lock.json";
-export const COMMIT_LOCK_WAIT_MS = 10_000;
+export const COMMIT_LOCK_WAIT_MS = 30_000;
 export const COMMIT_LOCK_STALE_MS = 30_000;
 const COMMIT_LOCK_POLL_MS = 25;
 export const COMMIT_LOCK_SCHEMA = "ego-commit-lock/v1";
@@ -142,13 +167,22 @@ export function isCommitLockError(error) {
 
 // The current holder's claim, or null when the file is missing. readable=false
 // marks a zero-byte/corrupt lock file (a crash between exclusive create and
-// content write, or a structurally invalid claim): its age falls back to the
-// file mtime, and an unprovable age is never treated as stale — fail-closed,
-// the contender times out instead of stealing blindly.
+// content write, or a structurally invalid claim): it carries no holder
+// identity, so it falls to the identity-less age fallback (below), and an
+// unprovable age is never treated as dead — fail-closed, the contender times
+// out instead of stealing blindly.
 const parseCommitLockClaim = (raw) =>
   (raw && typeof raw === "object" && !Array.isArray(raw) &&
     raw.schema === COMMIT_LOCK_SCHEMA && Number.isFinite(raw.acquiredAt))
-    ? { acquiredAt: raw.acquiredAt, holderId: raw.holderId ?? null, readable: true }
+    ? {
+      acquiredAt: raw.acquiredAt,
+      holderId: raw.holderId ?? null,
+      // pid 0 is never trusted (kill(0, 0) addresses a process GROUP, not a
+      // process — round-7 ruling note): only a positive integer participates
+      // in the liveness judgment; anything else is identity-less.
+      holderPid: Number.isInteger(raw.holderPid) && raw.holderPid > 0 ? raw.holderPid : null,
+      readable: true,
+    }
     : null;
 
 async function readCommitLockClaim(lockPath) {
@@ -158,34 +192,75 @@ async function readCommitLockClaim(lockPath) {
   } catch { /* fall through to the mtime fallback */ }
   try {
     const info = await stat(lockPath);
-    return { acquiredAt: info.mtimeMs, holderId: null, readable: false };
+    return { acquiredAt: info.mtimeMs, holderId: null, holderPid: null, readable: false };
   } catch { return null; }
 }
 
-// Ownership-protected release (P1-C-1 requirement 4): only a claim that still
-// reads as OURS is removed, and it is removed through an atomic rename to a
-// unique name followed by the unlink of THAT name — a concurrent steal can
-// never make this delete a lock this holder did not verify as its own.
+// PID-liveness judgment (round-7 rework): a claim that carries a holderPid is
+// judged ALIVE unless the OS proves otherwise — kill(pid, 0) succeeding means
+// the holder process exists; EPERM means it exists but we may not signal it;
+// ONLY ESRCH (no such process) proves death and licenses a steal. File age has
+// NO vote once a holder identity is present (the round-6 ruling's evidence
+// boundary — age proves a claim is old, not that its holder is dead — is
+// closed by never using age for identity-bearing claims). Any other kill
+// failure is treated as ALIVE: uncertain evidence never steals. A claim with
+// no usable holderPid (zero-byte crash remnant, legacy round-6 claim) has no
+// identity to interrogate; for exactly that identity-less case the mtime age
+// stays the fallback evidence.
+const commitHolderIsDead = (claim, nowMs) => {
+  if (claim.readable && claim.holderPid !== null) {
+    try {
+      process.kill(claim.holderPid, 0);
+      return false; // alive
+    } catch (error) {
+      return error?.code === "ESRCH"; // EPERM and anything else: alive, never steal
+    }
+  }
+  return nowMs - claim.acquiredAt > COMMIT_LOCK_STALE_MS; // identity-less fallback
+};
+
+// Ownership-protected release (P1-C-1 requirement 4, round-7 rework): the
+// claim at the path must still READ as ours before anything is moved. Foreign
+// (readable) content throws COMMIT_LOCK_LOST and the file is never touched;
+// gone or unreadable content leaves nothing provably ours to remove and is
+// left alone as well. Combined with the liveness-gated steal (theft requires
+// our process death, so while we live the path content stays ours), a release
+// can never delete or overwrite a successor's lock (round-7 ruling problem 1).
 async function releaseOwnedCommitLock(lockPath, holderId) {
   let claim = null;
   try { claim = JSON.parse(await readFile(lockPath, "utf8")); }
   catch { return; } // gone or unreadable: nothing of ours is there to remove
-  if (claim?.schema !== COMMIT_LOCK_SCHEMA || claim.holderId !== holderId) return;
+  if (claim?.schema !== COMMIT_LOCK_SCHEMA || claim.holderId !== holderId) {
+    // Foreign claim at the path: this holder no longer owns the lock. Fail
+    // loudly, move nothing — the foreign holder's claim stays byte-intact.
+    throw new Error("COMMIT_LOCK_LOST");
+  }
   const retiring = lockPath + ".retiring-" + randomUUID();
   try {
     await rename(lockPath, retiring);
-    await unlink(retiring).catch(() => {});
-  } catch { /* a contender renamed it away first: nothing of ours left to remove */ }
+  } catch (error) {
+    if (error.code === "ENOENT") return; // moved away first: nothing of ours left to remove
+    throw error;
+  }
+  await unlink(retiring).catch(() => {});
 }
 
-export async function withCommitLock(dir, task, { waitMs = COMMIT_LOCK_WAIT_MS, staleMs = COMMIT_LOCK_STALE_MS, now = Date.now } = {}) {
+export async function withCommitLock(dir, task, options = {}) {
+  const { now = Date.now } = options;
+  // The wait budget (round-7 rework): how long a contender waits before it
+  // judges the current claim. waitBudgetMs is the canonical knob; waitMs is
+  // the round-5/6 option name kept as an alias for existing callers.
+  const waitBudget = options.waitBudgetMs ?? options.waitMs ?? COMMIT_LOCK_WAIT_MS;
   const lockPath = `${dir}/${COMMIT_LOCK_FILE}`;
   const holderId = randomUUID();
-  const deadline = now() + waitMs;
+  const deadline = now() + waitBudget;
   // Ownership guard (P1-C-1 requirement 3): handed to the task, which calls it
-  // immediately before its final state write. A holder displaced mid-section
-  // (its claim renamed away, or the path now holding a foreign claim) throws
-  // COMMIT_LOCK_LOST here and writes nothing — fail-closed.
+  // immediately before its final state write. A displaced holder throws
+  // COMMIT_LOCK_LOST here and writes nothing — fail-closed. Under the
+  // liveness-gated steal, theft requires the holder process's death and a LIVE
+  // holder executing guard+commit cannot be stolen, so the guard→commit
+  // double-write window (round-7 ruling problem 3) is structurally closed;
+  // the guard remains as the tamper/legacy backstop.
   const guard = async () => {
     let claim = null;
     try { claim = JSON.parse(await readFile(lockPath, "utf8")); }
@@ -206,11 +281,15 @@ export async function withCommitLock(dir, task, { waitMs = COMMIT_LOCK_WAIT_MS, 
       if (error.code !== "EEXIST") throw error; // e.g. ENOENT: the dir itself is broken
       if (now() >= deadline) {
         const judged = await readCommitLockClaim(lockPath);
-        if (judged === null || !(now() - judged.acquiredAt > staleMs)) {
-          throw new Error("COMMIT_LOCK_TIMEOUT");
+        if (judged === null) continue; // vanished between EEXIST and read: re-contend
+        if (!commitHolderIsDead(judged, now())) {
+          // A live holder is never stolen from (round-7 rework): the contender
+          // fails closed instead of displacing it.
+          throw new Error("COMMIT_LOCK_WAIT_TIMEOUT");
         }
-        // Atomic steal: exactly one contender wins the rename; the losers get
-        // ENOENT and immediately re-contend on the exclusive create.
+        // Atomic steal of a PROVABLY DEAD holder's claim: exactly one
+        // contender wins the rename; the losers get ENOENT and re-contend on
+        // the exclusive create.
         const stolen = lockPath + ".stolen-" + randomUUID();
         try {
           await rename(lockPath, stolen);
@@ -218,45 +297,76 @@ export async function withCommitLock(dir, task, { waitMs = COMMIT_LOCK_WAIT_MS, 
           if (stealError.code === "ENOENT") continue; // another contender stole it first
           throw new Error("COMMIT_LOCK_STALE");
         }
-        // Verify the moved file is STILL the stale claim this contender judged
-        // (P1-C-1 requirement 2: a contender must never take away a fresher
-        // claim that another contender created in the meantime).
+        // Verify the moved file is STILL the dead claim this contender judged
+        // (a contender must never take away a DIFFERENT claim that appeared
+        // between its judgment and its move).
         let stolenClaim = null;
         try {
           stolenClaim = parseCommitLockClaim(JSON.parse(await readFile(stolen, "utf8")));
         } catch { stolenClaim = null; }
-        const sameStaleClaim = judged.readable
+        const sameDeadClaim = judged.readable
           ? stolenClaim !== null && stolenClaim.acquiredAt === judged.acquiredAt &&
-            stolenClaim.holderId === judged.holderId
+            stolenClaim.holderId === judged.holderId &&
+            stolenClaim.holderPid === judged.holderPid
           : stolenClaim === null; // unreadable claim stays unreadable = same file
-        if (sameStaleClaim) {
-          await unlink(stolen).catch(() => {});
-          continue; // lockPath is free now; the next turn claims it exclusively
+        if (sameDeadClaim) {
+          // The dead claim stays archived as the .stolen-<uuid> artifact (a
+          // theft record and deterministic test evidence; never read by the
+          // protocol). lockPath is free now; the next turn claims it
+          // exclusively.
+          continue;
         }
-        // The renamed claim was NOT the stale one — restore it verbatim by
-        // atomic rename (no absence window for a third contender to slip a
-        // foreign claim into) and re-contend without touching the new lock.
+        // The moved file was NOT the dead claim this contender judged — it
+        // moved a claim that appeared in between, possibly a LIVE holder's.
+        // Restore it verbatim through an EXCLUSIVE create: if any claim
+        // already sits at the path (a third contender got there during the
+        // restore), the restore is abandoned — the artifact is kept as the
+        // displaced claim's only remaining copy — and this contender
+        // re-contends. NOTHING is ever overwritten, so a restore can never
+        // clobber another contender's claim (round-7 ruling problem 2: the
+        // rename-back restore is gone).
+        let stolenBytes = null;
+        try { stolenBytes = await readFile(stolen); }
+        catch {
+          // The moved file vanished without explanation: the steal cannot be
+          // completed safely, and nothing provably dead was verified.
+          await unlink(stolen).catch(() => {});
+          throw new Error("COMMIT_LOCK_STALE");
+        }
+        let restored = false;
         try {
-          await rename(stolen, lockPath);
-        } catch (restoreError) {
-          await unlink(stolen).catch(() => {});
-          if (restoreError.code !== "ENOENT") throw new Error("COMMIT_LOCK_STALE");
-        }
-        continue;
+          const restoreHandle = await open(lockPath, "wx", 0o600);
+          try {
+            await restoreHandle.writeFile(stolenBytes);
+            restored = true;
+          } finally { await restoreHandle.close(); }
+        } catch { /* EEXIST (a contender claimed the free path) or a hard failure: abandon */ }
+        if (restored) await unlink(stolen).catch(() => {}); // verbatim copy lives at the path again
+        continue; // re-contend either way — this contender never takes the lock after a mismatch
       }
       await new Promise((resolve) => setTimeout(resolve, COMMIT_LOCK_POLL_MS));
       continue;
     }
     try {
       await handle.writeFile(JSON.stringify({
-        schema: COMMIT_LOCK_SCHEMA, acquiredAt: now(), holderId,
+        schema: COMMIT_LOCK_SCHEMA, acquiredAt: now(), holderId, holderPid: process.pid,
       }), "utf8");
     } finally { await handle.close(); }
-    // Critical section. The ownership-protected release runs even when the
-    // task throws, so an in-process failure never orphans the lock — only a
-    // process crash does, and that is what the stale policy recovers from.
-    try { return await task(guard); }
-    finally { await releaseOwnedCommitLock(lockPath, holderId); }
+    // Critical section. The ownership-protected release runs on both the
+    // success and the failure path, so an in-process failure never orphans
+    // the lock — only a process crash does, and that is what the liveness
+    // judgment recovers from. The release's foreign-claim detection never
+    // masks the task's own failure, and a task that succeeded while its
+    // release could not verify ownership fails loudly instead of reporting
+    // success.
+    let taskError = null;
+    let taskResult;
+    try { taskResult = await task(guard); }
+    catch (error) { taskError = error; }
+    try { await releaseOwnedCommitLock(lockPath, holderId); }
+    catch (releaseError) { if (taskError === null) throw releaseError; }
+    if (taskError !== null) throw taskError;
+    return taskResult;
   }
 }
 
