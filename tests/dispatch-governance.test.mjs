@@ -1750,6 +1750,12 @@ test("#33: the probe freezes doneLive evidence into the dispatch record at DONE_
 test("#33: collect failures are classified with post-mortem details and operator guidance", async () => {
   const source = await readFile(new URL("../monitor/collect-reply.template.mjs", import.meta.url), "utf8");
   assert.match(source, /COLLECT_DOM_ANCHOR_MISS payloadBytes=/);
+  // Each layer's evidence rides on the anchor-miss line: DOM unit count (the
+  // virtualization signature), DOM tail key vs expected assistant tail key.
+  assert.match(source, / domUnits=" \+ units\.length \+/);
+  assert.match(source, /const tailKey = units\.length \? \(units\[units\.length - 1\]\.messageKey \|\| "null"\) : "null";/);
+  assert.match(source, / tailKey=" \+ tailKey \+/);
+  assert.match(source, / expectedKey=" \+ \(fast\.lastMessageKey \|\| "null"\) \+/);
   assert.match(source, /COLLECT_API_FETCH_NULL stage=/);
   assert.match(source, /COLLECT_FINALITY_NOT_REACHED end_turn=/);
   assert.match(source, /REPLY_GENERATION_DIED_SERVER_SIDE suspicion=live_had_more/);
@@ -1761,6 +1767,57 @@ test("#33: collect failures are classified with post-mortem details and operator
   // The boundary failure exits through a classified RESULT, never a bare throw.
   assert.match(source, /console\.log\("RESULT=COLLECT_BOUNDARY_OR_FINALITY_UNVERIFIED"\)/);
   assert.doesNotMatch(source, /throw new Error\("COLLECT_BOUNDARY_OR_FINALITY_UNVERIFIED"\)/);
+});
+
+test("#33: the anchor-miss diagnostics line is built from the real slice with every layer's evidence", async () => {
+  const src = await readFile(new URL("../monitor/collect-reply.template.mjs", import.meta.url), "utf8");
+  // Run the real detail-building block, not a copied reimplementation: slice
+  // from `const details = []` through the RECOVERY_DETAIL emission loop.
+  const start = src.indexOf("  const details = [];");
+  const end = src.indexOf('for (const detail of details) console.log("RECOVERY_DETAIL=" + detail);');
+  assert.ok(start > 0 && end > start, "diagnostics block not found in template");
+  const block = src.slice(start, end + 'for (const detail of details) console.log("RECOVERY_DETAIL=" + detail);'.length);
+  const lines = [];
+  const sandbox = {
+    console: { log: (line) => lines.push(line) },
+    units: [
+      { role: "user", text: "old", messageKey: "baseline-key" },
+      { role: "assistant", text: "partial", messageKey: "assistant-live-key" },
+    ],
+    record: { payload_bytes: 4649, doneLiveBodyLen: 10338, doneLiveLastMessageKey: "assistant-live-key" },
+    fast: { lastMessageKey: "assistant-live-key" },
+    liveBodyLen: 6564,
+    domAnchorMissed: true,
+    apiFailure: null,
+    finality: null,
+  };
+  new (await import("node:vm")).Script(block, { filename: "collect-diagnostics-slice.mjs" })
+    .runInNewContext(sandbox);
+  const anchorMiss = lines.find((line) => line.startsWith("RECOVERY_DETAIL=COLLECT_DOM_ANCHOR_MISS"));
+  assert.ok(anchorMiss, "anchor-miss detail line missing");
+  // DOM unit count, tail key, expected key and the live/done body pair all ride
+  // on one line, so the next round can judge virtualization vs a dead reply.
+  assert.match(anchorMiss, /payloadBytes=4649/);
+  assert.match(anchorMiss, /domUnits=2/);
+  assert.match(anchorMiss, /tailKey=assistant-live-key/);
+  assert.match(anchorMiss, /expectedKey=assistant-live-key/);
+  assert.match(anchorMiss, /liveBodyLen=6564/);
+  assert.match(anchorMiss, /doneLiveBodyLen=10338/);
+  // An empty virtualized window reports domUnits=0 and a null tail key.
+  const shrunk = [];
+  const sandboxEmpty = {
+    console: { log: (line) => shrunk.push(line) },
+    units: [], record: { payload_bytes: 100, doneLiveBodyLen: 9000 }, fast: { lastMessageKey: "k" },
+    liveBodyLen: 40, domAnchorMissed: true, apiFailure: null, finality: null,
+  };
+  new (await import("node:vm")).Script(block, { filename: "collect-diagnostics-slice.mjs" })
+    .runInNewContext(sandboxEmpty);
+  const emptyMiss = shrunk.find((line) => line.startsWith("RECOVERY_DETAIL=COLLECT_DOM_ANCHOR_MISS"));
+  assert.match(emptyMiss, /domUnits=0/);
+  assert.match(emptyMiss, /tailKey=null/);
+  // The shrank window (live well below doneLive) still raises the dead-reply
+  // suspicion line from the same real block.
+  assert.ok(shrunk.some((line) => line.includes("RECOVERY_DETAIL=REPLY_GENERATION_DIED_SERVER_SIDE")));
 });
 
 // ---- #27 Batch 2: TaskSpace ownership governance (V1: naming + probe owner

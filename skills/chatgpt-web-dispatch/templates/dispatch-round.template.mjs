@@ -217,10 +217,18 @@ else if (pageNeedsNavigation) await navigate("CONVERSATION_PAGE_RECOVERY");
 // Same tier order and visibility rule as monitor/dispatch-state.mjs readComposerSurface.
 // One page-evaluate implementation covers read, clear and fill; ambiguous tiers fail closed.
 const evaluateComposer = (action, text = "") => page.evaluate(({ sel, action, text }) => {
+  // Issue #23-②: visibility needs an ACTUALLY sized box — same rule as
+  // readComposerSurface. A rendered-but 0×0 hidden composer twin reports one
+  // zero-size client rect and must not enter the candidate tiers.
   const visible = (element) => {
+    const rects = element?.getClientRects?.();
+    if (rects) {
+      for (const rect of rects) {
+        if (rect && rect.width > 0 && rect.height > 0) return true;
+      }
+    }
     const rect = element?.getBoundingClientRect?.();
-    return Boolean((rect && rect.width > 0 && rect.height > 0) ||
-      element?.getClientRects?.().length > 0);
+    return Boolean(rect && rect.width > 0 && rect.height > 0);
   };
   const composers = [...document.querySelectorAll(sel)].filter(visible);
   const composerLabels = new Set(["询问 ChatGPT", "Ask ChatGPT"]);

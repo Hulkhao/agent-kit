@@ -259,10 +259,11 @@ test("#26: every STOP is classified by the current dispatch identity and send st
 
 // Execute the template's actual browser-side callback against a minimal DOM, not a copy of its
 // selector rules. querySelectorAll returns document order (Edit code precedes the real Composer).
-function composerNode({ label = null, id = "", testid = null, visible = true, text = "", tagName = "DIV", childNodes } = {}) {
+function composerNode({ label = null, id = "", testid = null, visible = true, text = "", tagName = "DIV", childNodes, rects } = {}) {
   return {
     id, tagName, innerText: text, value: text, childNodes, offsetParent: visible ? {} : null,
-    getClientRects: () => visible ? [{}] : [],
+    // Sized client rects: #23-② visibility requires an actually sized box.
+    getClientRects: () => visible ? (rects || [{ width: 40, height: 20 }]) : [],
     getAttribute: (key) => ({ "aria-label": label, "data-testid": testid })[key] ?? null,
     matches: (selector) => selector === '[contenteditable="true"][role="textbox"]' && tagName === "DIV",
     focus() { this.focused = true; },
@@ -365,6 +366,25 @@ test("agent-kit#14: id/testid, visibility, generic fallback, and ambiguity fail-
   assert.equal(await ambiguous("clear"), false, "two labeled Composers cannot be resolved uniquely");
   assert.equal(await ambiguous("insert", "MUST NOT INSERT"), false);
   assert.equal(another.innerText, "other");
+});
+
+test("#23-②: a rendered-but 0×0 hidden composer twin (zero-size client rect) never enters the candidate tiers", async () => {
+  // The #23 field shape: an invisible same-aria composer BEFORE the real one in
+  // DOM order, carrying one ZERO-size client rect. A bare getClientRects().length>0
+  // visibility test lets it through; the sized-box rule excludes it, so the real
+  // composer stays uniquely resolvable instead of failing closed on ambiguity.
+  const twin = composerNode({
+    label: "Ask ChatGPT", text: "ghost draft", rects: [{ width: 0, height: 0 }],
+  });
+  const real = composerNode({ label: "Ask ChatGPT", text: "old owned draft" });
+  const evaluateComposer = await composerHarness([twin, real]);
+  assert.equal((await evaluateComposer("read")).raw, "old owned draft",
+    "the real composer must be selected past the 0×0 twin");
+  assert.equal(await evaluateComposer("clear"), true);
+  assert.equal(real.innerText, "");
+  await evaluateComposer.insertChunk("new payload");
+  assert.equal(real.innerText, "new payload");
+  assert.equal(twin.innerText, "ghost draft", "the hidden twin must stay untouched");
 });
 
 test("#30: real composer callback extracts top-level paragraphs for strict URL readback", async () => {
@@ -915,4 +935,204 @@ test("#30: recover-draft ledger semantics — only a proved PREPARED aborts to A
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("#34: URL-line-contained chunking keeps every URL-bearing line whole; the real fill loop passes strict readback", async () => {
+  const { chunkPayload, classifyChunkReadback, readbackMatches, readbackMode } =
+    await import("../monitor/dispatch-state.mjs");
+  const src = await template();
+
+  // B48-shaped payload: multi-block CJK prose whose URL line sits where a
+  // target-sized chunk boundary would otherwise fall.
+  const lines = [];
+  for (let i = 1; i <= 5; i++) lines.push("背景说明第" + i + "行：" + "设".repeat(60));
+  lines.push("- 仓库首页：https://github.com/Hulkhao/agent-kit");
+  for (let i = 1; i <= 8; i++) lines.push("后续说明第" + i + "行：" + "置".repeat(60));
+  const payload = lines.join("\n");
+  assert.ok(Array.from(payload).length > 600, "payload must span multiple chunks");
+  const urlLineStart = payload.lastIndexOf("\n", payload.indexOf("https://")) + 1;
+  const urlLineEnd = payload.indexOf("\n", payload.indexOf("https://"));
+
+  // ProseMirror-shaped composer: a URL arriving separated from its line context
+  // (a chunk boundary inside the URL line) is linkified and its line splits into
+  // sibling paragraphs — the exact #34 field artifact. A whole-line arrival
+  // stays one paragraph, so the strict paragraph-join readback is exact.
+  const composer = (() => {
+    const blocks = [""];
+    return {
+      insert(text) {
+        text.split("\n").forEach((line, idx) => {
+          if (idx > 0) blocks.push("");
+          const current = blocks[blocks.length - 1];
+          if (line && /^(https?:\/\/|www\.)/.test(line) && current.length > 0) {
+            blocks.push(line); // link-node paragraph split
+          } else {
+            blocks[blocks.length - 1] = current + line;
+          }
+        });
+      },
+      read: () => blocks.join("\n"),
+    };
+  })();
+
+  // Run the template's real Gate 5 fill-loop slice, not a reimplementation.
+  const loopStart = src.indexOf('let expectedPrefix = "";');
+  const loopEnd = src.indexOf("// ---- Gate 6:", loopStart);
+  assert.ok(loopStart > 0 && loopEnd > loopStart, "fill loop not found in template");
+  const fillLoop = src.slice(loopStart, loopEnd);
+  const runFill = async (chunks) => runInNewContext(
+    "(async () => {\n" + fillLoop + "\nreturn composerText;\n})()",
+    {
+      chunks, composer,
+      composerOp: (fn) => fn(),
+      insertChunk: (chunk) => composer.insert(chunk),
+      page: { waitForTimeout: async () => {} },
+      readRaw: async () => composer.read(),
+      classifyChunkReadback,
+      fillReadbackMode: readbackMode(payload), // strict: the payload carries a URL
+      abort: (code) => { throw new Error(code); },
+    },
+  );
+
+  const chunks = chunkPayload(payload, 1200, 600);
+  assert.ok(chunks.length >= 2, "chunking must be multi-block for this payload");
+  // Every URL-bearing line is wholly inside exactly one chunk.
+  let position = 0;
+  for (const chunk of chunks) {
+    position += Array.from(chunk).length;
+    assert.ok(position <= urlLineStart || position >= urlLineEnd,
+      "a chunk boundary fell strictly inside the URL-bearing line");
+    assert.ok(Buffer.byteLength(chunk, "utf8") <= 1200, "hard byte cap holds");
+  }
+  assert.equal(chunks.join(""), payload, "chunking stays lossless");
+  const composerText = await runFill(chunks);
+  assert.equal(composerText, payload, "composer readback is exact under contained chunking");
+  assert.equal(readbackMatches(payload, composerText, "strict"), true);
+
+  // The pre-fix shape (a boundary between the line context and the URL, i.e.
+  // 「在 URL 处切块」) reproduces the field artifact and the strict gate refuses
+  // it — containment is what makes the fill passable, the gate never relaxed.
+  const urlStart = payload.indexOf("https://");
+  const badChunks = [payload.slice(0, urlStart), payload.slice(urlStart)];
+  await assert.rejects(() => runFill(badChunks), /CHUNK_READBACK_MISMATCH/);
+
+  // A URL-bearing line longer than the hard byte cap can never be filled
+  // without a split: fail closed at chunking time, before any fill work.
+  assert.throws(() => chunkPayload("x\nhttps://" + "a".repeat(1300) + "\n"),
+    { message: "CHUNK_URL_LINE_EXCEEDS_LIMIT" });
+});
+
+test("#23-②: readComposerSurface excludes a rendered-but 0×0 composer twin and still reads the real surface", async () => {
+  const { readComposerSurface } = await import("../monitor/dispatch-state.mjs");
+  const twin = {
+    id: "", tagName: "DIV", value: "", innerText: "ghost draft", textContent: "ghost draft",
+    offsetParent: null,
+    getClientRects: () => [{ width: 0, height: 0 }], // rendered box with zero extent
+    getBoundingClientRect: () => ({ width: 0, height: 0 }),
+    getAttribute: (name) => name === "aria-label" ? "询问 ChatGPT" : null,
+    matches: () => false,
+    querySelectorAll: () => [],
+  };
+  const real = {
+    id: "prompt-textarea", tagName: "DIV", value: "", innerText: "", textContent: "",
+    offsetParent: {},
+    getClientRects: () => [{ width: 680, height: 48 }],
+    getBoundingClientRect: () => ({ width: 680, height: 48 }),
+    getAttribute: (name) => name === "data-testid" ? "prompt-textarea"
+      : name === "aria-label" ? "询问 ChatGPT" : null,
+    matches: () => false,
+    querySelectorAll: () => [],
+  };
+  const doc = {
+    querySelectorAll(selector) {
+      if (selector.includes("prompt-textarea") || selector.includes("contenteditable") || selector === "textarea") {
+        return [twin, real]; // DOM order: the hidden twin precedes the real composer
+      }
+      return []; // codex twins, units, buttons: none present
+    },
+  };
+  const page = {
+    async evaluate(fn) {
+      const oldDoc = globalThis.document;
+      const oldLocation = globalThis.location;
+      globalThis.document = doc;
+      globalThis.location = { hostname: "chatgpt.com" };
+      try { return await fn(); }
+      finally {
+        if (oldDoc === undefined) delete globalThis.document; else globalThis.document = oldDoc;
+        if (oldLocation === undefined) delete globalThis.location; else globalThis.location = oldLocation;
+      }
+    },
+  };
+  const surface = await readComposerSurface(page);
+  assert.equal(surface.composerPresent, true, "the real composer must remain resolvable past the twin");
+  assert.equal(surface.composerCount, 1, "only the sized composer counts as a visible candidate");
+  assert.equal(surface.composerEmpty, true, "the ghost text must not be read as the draft");
+  assert.equal(surface.composerLength, 0);
+  assert.equal(surface.surfaceMode, "CHATGPT");
+});
+
+test("#23-④: the draft-resurrection check holds a long staged window and clears an owned draft once", async () => {
+  const src = await template();
+  const { verifyDraftOwnership } = await import("../monitor/dispatch-state.mjs");
+  const start = src.indexOf("const ensureOwnEmptyComposer = async () => {");
+  const end = src.indexOf("// ---- Gate 3:", start);
+  assert.ok(start > 0 && end > start, "ensureOwnEmptyComposer not found in template");
+  const slice = src.slice(start, end);
+
+  const run = (surfaces) => {
+    const waits = [];
+    let clears = 0;
+    let read = 0;
+    const api = runInNewContext(slice + "\n({ ensureOwnEmptyComposer })", {
+      composerOp: (fn) => fn(),
+      readComposerSurface: async () => surfaces[Math.min(read++, surfaces.length - 1)],
+      page: { waitForTimeout: async (ms) => waits.push(ms) },
+      readRaw: async () => "draft text",
+      verifyDraftOwnership,
+      evaluateClearComposer: async () => { clears += 1; return true; },
+      payload: "draft text", existing: null, resume: false,
+      abort: (code) => { throw new Error(code); },
+    });
+    return { api, waits, clearCount: () => clears, readCount: () => read };
+  };
+
+  const empty = { composerEmpty: true };
+  const draft = { composerEmpty: false };
+  // Owned draft: cleared, then empty through the whole staged window → proceed.
+  const good = run([draft, empty, empty, empty, empty]);
+  await good.api.ensureOwnEmptyComposer();
+  assert.equal(good.clearCount(), 1);
+  assert.equal(good.readCount(), 5, "one surface read + the full staged window");
+  assert.deepEqual(good.waits, [700, 1100, 1500],
+    "the resurrection window is the staged long wait (0/700/1100/1500ms), not the old 600ms");
+
+  // Server-side resurrection: the draft reappears inside the staged window of
+  // BOTH attempts → fail-closed stop after two full clear+reverify cycles.
+  const resurrecting = run([draft, empty, empty, empty, draft, draft, empty, empty, empty, draft]);
+  await assert.rejects(() => resurrecting.api.ensureOwnEmptyComposer(),
+    /DRAFT_RESURRECTED_AFTER_CLEAR/);
+  assert.equal(resurrecting.clearCount(), 2, "both attempts clear before giving up");
+  assert.equal(resurrecting.readCount(), 10, "each attempt runs the full staged window");
+});
+
+test("#23-④: a foreign draft still stops before any clear through the real ownership verifier", async () => {
+  const src = await template();
+  const { verifyDraftOwnership } = await import("../monitor/dispatch-state.mjs");
+  const start = src.indexOf("const ensureOwnEmptyComposer = async () => {");
+  const end = src.indexOf("// ---- Gate 3:", start);
+  const slice = src.slice(start, end);
+  let clears = 0;
+  const api = runInNewContext(slice + "\n({ ensureOwnEmptyComposer })", {
+    composerOp: (fn) => fn(),
+    readComposerSurface: async () => ({ composerEmpty: false }),
+    page: { waitForTimeout: async () => {} },
+    readRaw: async () => "someone else's text",
+    verifyDraftOwnership,
+    evaluateClearComposer: async () => { clears += 1; return true; },
+    payload: "draft text", existing: null, resume: false,
+    abort: (code) => { throw new Error(code); },
+  });
+  await assert.rejects(() => api.ensureOwnEmptyComposer(), /FOREIGN_DRAFT_STOP/);
+  assert.equal(clears, 0, "a foreign draft is never cleared");
 });

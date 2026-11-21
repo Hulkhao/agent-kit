@@ -132,7 +132,15 @@ if (!reply) {
   // (a dead reply must not be "repaired" by relaxing finality semantics).
   const details = [];
   if (domAnchorMissed) {
+    // agent-kit#33 follow-up: each layer's evidence on one line so the next
+    // round can decide without re-deriving it — DOM unit count (a near-empty
+    // window is the virtualization signature), the DOM tail key vs the
+    // expected assistant tail key, and the live/done body-length pair.
+    const tailKey = units.length ? (units[units.length - 1].messageKey || "null") : "null";
     details.push("COLLECT_DOM_ANCHOR_MISS payloadBytes=" + (record.payload_bytes ?? "null") +
+      " domUnits=" + units.length +
+      " tailKey=" + tailKey +
+      " expectedKey=" + (fast.lastMessageKey || "null") +
       " liveBodyLen=" + liveBodyLen +
       (record.doneLiveBodyLen != null ? " doneLiveBodyLen=" + record.doneLiveBodyLen : ""));
   }

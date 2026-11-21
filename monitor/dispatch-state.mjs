@@ -267,10 +267,19 @@ export async function appendEvent(dir, event, fields = {}) {
 
 export async function readComposerSurface(page) {
   return page.evaluate(() => {
+    // Issue #23-②: visibility needs an ACTUALLY sized box. A rendered-but
+    // 0×0 hidden composer twin reports one zero-size client rect, so a bare
+    // getClientRects().length>0 test lets it through and (DOM order first)
+    // poisons the composer candidates. Require a rect with real extent.
     const visible = (element) => {
+      const rects = element?.getClientRects?.();
+      if (rects) {
+        for (const rect of rects) {
+          if (rect && rect.width > 0 && rect.height > 0) return true;
+        }
+      }
       const rect = element?.getBoundingClientRect?.();
-      return Boolean((rect && rect.width > 0 && rect.height > 0) ||
-        element?.getClientRects?.().length > 0);
+      return Boolean(rect && rect.width > 0 && rect.height > 0);
     };
     const composerSelector = '#prompt-textarea, [data-testid="prompt-textarea"], [contenteditable="true"][role="textbox"], textarea';
     const composers = [...document.querySelectorAll(composerSelector)].filter(visible);
@@ -719,6 +728,41 @@ export function chunkPayload(text, byteLimit = 1200, targetChars = 600) {
     if (byteLength > byteLimit) throw new Error("CHUNK_GRAPHEME_EXCEEDS_LIMIT");
   }
 
+  // agent-kit#34: URL-line containment. The composer (ProseMirror) linkifies a
+  // URL that arrives separated from its line context — an insertText chunk
+  // boundary inside a URL-bearing line splits that line into sibling <p> nodes,
+  // and the strict readback gate then (rightly) refuses the mismatched draft,
+  // leaving residue no managed path may clear. So a chunk boundary must never
+  // fall strictly inside a URL-bearing line: the whole line stays in one chunk.
+  const urlLineSpans = [];
+  {
+    let lineStart = 0;
+    let lineText = "";
+    const closeLine = (breakIndex) => {
+      // Same URL signature as isSensitivePayload — the strict-gate trigger set.
+      if (/https?:\/\/|www\./.test(lineText)) urlLineSpans.push({ start: lineStart, end: breakIndex });
+      lineText = "";
+    };
+    for (let i = 0; i < graphemes.length; i++) {
+      if (isLineBreak(graphemes[i])) {
+        closeLine(i);
+        lineStart = i + 1;
+      } else {
+        lineText += graphemes[i];
+      }
+    }
+    closeLine(graphemes.length);
+  }
+  for (const span of urlLineSpans) {
+    let spanBytes = 0;
+    for (let i = span.start; i < span.end; i++) spanBytes += byteLengths[i];
+    if (spanBytes > byteLimit) {
+      // Unfillable without a split: fail closed here (before any fill work),
+      // never mid-fill with residue the managed paths cannot clear.
+      throw new Error("CHUNK_URL_LINE_EXCEEDS_LIMIT");
+    }
+  }
+
   const chunks = [];
   let start = 0;
   while (start < graphemes.length) {
@@ -756,6 +800,20 @@ export function chunkPayload(text, byteLimit = 1200, targetChars = 600) {
         }
         if (adjustedEnd > start) end = adjustedEnd;
       }
+    }
+
+    // agent-kit#34: enforce URL-line containment AFTER the line-edge adjustment
+    // (that adjustment itself can push a boundary into a URL-bearing line). The
+    // soft grapheme target yields to a contained line, like the line-edge
+    // adjustment; the hard byte cap never does — when the line busts the cap
+    // from `start`, the boundary retreats to the line start (the line alone
+    // always fits: the pre-check above rejected oversized lines).
+    for (let guard = 0; guard <= urlLineSpans.length; guard++) {
+      const span = urlLineSpans.find((s) => end > s.start && end < s.end);
+      if (!span) break;
+      let bytesFromStart = 0;
+      for (let i = start; i < span.end; i++) bytesFromStart += byteLengths[i];
+      end = bytesFromStart <= byteLimit ? span.end : span.start;
     }
 
     const chunk = graphemes.slice(start, end).join("");

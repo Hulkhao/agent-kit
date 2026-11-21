@@ -384,21 +384,22 @@ test("probe recovery behavior: duplicate managed UUID URLs retain the ambiguity 
 });
 
 function makeSurface({ composerText = "prompt body", role = "assistant", key = "11111111-1111-4111-8111-111111111111", generating = false, includeUnit = true, includeDilId = true } = {}) {
+  // #23-②: sized client rects — visibility now requires an actually sized box.
   const composer = {
     id: "prompt-textarea", tagName: "DIV", value: "", innerText: composerText,
     textContent: composerText, offsetParent: {},
-    getClientRects: () => [{}],
+    getClientRects: () => [{ width: 680, height: 48 }],
     getAttribute: (name) => name === "data-testid" ? "prompt-textarea" : null,
   };
   const message = {
     innerText: "opaque message text", textContent: "opaque message text",
-    offsetParent: {}, getClientRects: () => [{}],
+    offsetParent: {}, getClientRects: () => [{ width: 640, height: 90 }],
     getAttribute: (name) => name === "data-dil-message-id" ? key : null,
   };
   const unitKey = role === "user" ? key : `fallback-turn-5:1:${role}`;
   const unit = {
     innerText: "opaque unit text", textContent: "opaque unit text",
-    offsetParent: {}, getClientRects: () => [{}],
+    offsetParent: {}, getClientRects: () => [{ width: 640, height: 120 }],
     getAttribute: (name) => name === "data-content-search-unit-key" ? unitKey : null,
     matches: () => false,
     querySelectorAll: (selector) => selector === "[data-dil-response][data-dil-message-id]" && includeDilId && role === "assistant"
@@ -406,7 +407,7 @@ function makeSurface({ composerText = "prompt body", role = "assistant", key = "
   };
   const stop = {
     offsetParent: generating ? {} : null,
-    getClientRects: () => generating ? [{}] : [],
+    getClientRects: () => generating ? [{ width: 28, height: 28 }] : [],
     getAttribute: (name) => name === "aria-label" ? "Stop generating" : null,
   };
   const doc = {
