@@ -10,7 +10,7 @@ import { join, resolve } from "node:path";
 import { normalizeFastState, validateFastState, classifyFastStateFile } from "../monitor/state-schema.mjs";
 import { tick, acknowledge } from "../monitor/supervision-watchdog.mjs";
 import { shouldReviewStartupIdle, classifySupervision, deliverySuspected } from "../monitor/supervision-policy.mjs";
-import { parseArgs, adaptTemplate, bindNewConversation, classifyManagerResult, loadAttachments, requireArmedDispatch, main, readEgoOutcome, ensureMonitor, authorizeSpaceRebuild, rebuildSpace, claimSpace, taskspaceOwnershipLost, announceTaskspaceOwnershipLoss, exitWatching, acknowledgeWake, releaseDelivered, managedAcknowledge, ackOwnershipEvidence, armForDispatch, ACK_RESOLVED_OWNERSHIP_REQUIRED, ACK_AUDIT_FILE, SUPERVISION_WAKE_REASON_MAP } from "../monitor/dispatch-manager.mjs";
+import { parseArgs, adaptTemplate, bindNewConversation, classifyManagerResult, loadAttachments, requireArmedDispatch, main, readEgoOutcome, ensureMonitor, authorizeSpaceRebuild, rebuildSpace, claimSpace, taskspaceOwnershipLost, announceTaskspaceOwnershipLoss, exitWatching, acknowledgeWake, releaseDelivered, managedAcknowledge, ackOwnershipEvidence, armForDispatch, ACK_RESOLVED_OWNERSHIP_REQUIRED, ACK_AUDIT_FILE, SUPERVISION_WAKE_REASON_MAP, assertNewChatNamingAllowed, agentRegistryKnowsSpace, AGENT_REGISTRY_DIR_ENV } from "../monitor/dispatch-manager.mjs";
 import { withAgentRegistry, isValidNewTaskSpaceName, assertTaskSpaceNamingAllowed } from "../monitor/agent-space.mjs";
 import { taskspaceOperatorAction } from "../monitor/taskspace-takeover.mjs";
 import { checkDispatchTool } from "../plugins/chatgpt-dispatch-guard/hooks/policy.mjs";
@@ -356,6 +356,54 @@ test("new chat binding refuses a target conversation already owned by another di
     await assert.rejects(readFile(join(root, "new-requests", uuid + ".json")), { code: "ENOENT" });
     assert.equal((await readDispatchState(target)).taskSpace, "OTHER");
     assert.equal((await readDispatchState(pending)).conversationUuid, uuid);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("send-new naming gate refuses an invalid new space before creating any pending shell (#43 F1)", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ego-new-chat-naming-"));
+  const registryDir = join(root, "registry"); // no ledger file: space unknown → shape enforced
+  const messageFile = join(root, "message.txt");
+  await writeFile(messageFile, "首次派单内容");
+  const previous = process.env[AGENT_REGISTRY_DIR_ENV];
+  process.env[AGENT_REGISTRY_DIR_ENV] = registryDir;
+  try {
+    await assert.rejects(main(["send-new", "--monitor-dir", root, "--agent-id", "gdc-a",
+      "--space", "坏名字", "--request-id", randomUUID(), "--message", messageFile]),
+      /TASKSPACE_NAMING_VIOLATION_STOP/);
+    // zero creation: no pending-new shell, no request file, nothing to clean
+    await assert.rejects(stat(join(root, "pending-new")), { code: "ENOENT" });
+    await assert.rejects(readFile(join(root, "new-requests", "whatever.json")), { code: "ENOENT" });
+  } finally {
+    if (previous === undefined) delete process.env[AGENT_REGISTRY_DIR_ENV];
+    else process.env[AGENT_REGISTRY_DIR_ENV] = previous;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("agent registry ledger decides the naming gate's existence oracle (#43 F1)", async () => {
+  const root = await mkdtemp(join(tmpdir(), "ego-naming-oracle-"));
+  const registryDir = join(root, "registry");
+  try {
+    // missing ledger: unknown → non-conforming refused, conforming allowed
+    await assert.rejects(assertNewChatNamingAllowed({ space: "坏名字", agentId: "gdc-a", registryDirectory: registryDir }),
+      /TASKSPACE_NAMING_VIOLATION_STOP/);
+    await assertNewChatNamingAllowed({ space: "mx-ok-gdc-a-20261122", agentId: "gdc-a", registryDirectory: registryDir });
+    // malformed ledger: unknown → non-conforming still refused (never a silent pass)
+    await mkdir(registryDir, { recursive: true });
+    await writeFile(join(registryDir, "ego-taskspaces.json"), "{oops", "utf8");
+    assert.equal(await agentRegistryKnowsSpace("GDC-执行A", registryDir), false);
+    await assert.rejects(assertNewChatNamingAllowed({ space: "坏名字", agentId: "gdc-a", registryDirectory: registryDir }),
+      /TASKSPACE_NAMING_VIOLATION_STOP/);
+    // seeded ledger: a claimed space keeps its (possibly legacy) name
+    await writeFile(join(registryDir, "ego-taskspaces.json"), JSON.stringify({
+      schema: "ego-agent-spaces/v1",
+      agents: { "gdc-a": { spaceName: "GDC-执行A", active: [], known: [] } },
+    }), "utf8");
+    assert.equal(await agentRegistryKnowsSpace("GDC-执行A", registryDir), true);
+    await assertNewChatNamingAllowed({ space: "GDC-执行A", agentId: "gdc-a", registryDirectory: registryDir });
+    // but an unclaimed legacy-shaped name is still refused
+    await assert.rejects(assertNewChatNamingAllowed({ space: "另一个未领名", agentId: "gdc-a", registryDirectory: registryDir }),
+      /TASKSPACE_NAMING_VIOLATION_STOP/);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 

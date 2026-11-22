@@ -12,7 +12,7 @@ import { tick, acknowledge } from "./supervision-watchdog.mjs";
 import { readDispatchState, markCompleted, writeJsonAtomic, validateDispatchRecord, evaluateDisarmEligibility, appendEvent, withCommitLock, commitLockScopeOf, isCommitLockError, findComposerFreezeToConsume } from "./dispatch-state.mjs";
 import { ARMED_REASONS, IN_FLIGHT_DISPATCH_STATUSES, armedTransitionPatch, classifyFastStateFile, normalizeFastState } from "./state-schema.mjs";
 import { verifiedReply, acknowledgeReply, verifiedConsumption, sha256 } from "./reply-delivery.mjs";
-import { withAgentRegistry, claimAgentSpace } from "./agent-space.mjs";
+import { withAgentRegistry, claimAgentSpace, assertTaskSpaceNamingAllowed } from "./agent-space.mjs";
 import { taskspaceOperatorAction } from "./taskspace-takeover.mjs";
 
 const sourceDir = dirname(fileURLToPath(import.meta.url));
@@ -2124,6 +2124,30 @@ async function runEgo(source, dir, name) {
   }
 }
 
+// #43 (F1): the pending-new naming gate must fire BEFORE the shell exists.
+// The probe-side gate only runs inside the round — by then this directory is
+// already created — so an invalid name used to leave an uncleanable
+// pending-new shell that permanently counts as in-flight. Existence here is
+// the agent-side registry ledger (ego's live registry is only reachable from
+// ego-runtime scripts): a space any agent entry has claimed keeps its
+// (possibly legacy) name; a lost legacy space recovers through rebuild-space,
+// which intentionally bypasses this gate. An unreadable ledger counts as
+// unknown, so the name must conform — never a silent pass.
+export const AGENT_REGISTRY_DIR_ENV = "EGO_AGENT_REGISTRY_DIR";
+
+export async function agentRegistryKnowsSpace(space, directory = process.env[AGENT_REGISTRY_DIR_ENV] || join(homedir(), ".agents")) {
+  let registry;
+  try { registry = JSON.parse(await readFile(join(directory, "ego-taskspaces.json"), "utf8")); }
+  catch { return false; }
+  if (!registry || registry.schema !== "ego-agent-spaces/v1" || !registry.agents ||
+      typeof registry.agents !== "object" || Array.isArray(registry.agents)) return false;
+  return Object.values(registry.agents).some((entry) => entry && entry.spaceName === space);
+}
+
+export async function assertNewChatNamingAllowed({ space, agentId, registryDirectory } = {}) {
+  await assertTaskSpaceNamingAllowed(space, agentId, await agentRegistryKnowsSpace(space, registryDirectory));
+}
+
 export async function main(args = process.argv.slice(2)) {
   const p = parseArgs(args);
   // Old shared-state directories may still be active. Never silently move or
@@ -2153,6 +2177,10 @@ export async function main(args = process.argv.slice(2)) {
     } catch (error) {
       if (error.message !== "NEW_CHAT_RECONCILIATION_REQUIRED") throw error;
     }
+    // #43 (F1): naming gate BEFORE any byte of the pending-new shell — see
+    // assertNewChatNamingAllowed(). The offline receipt-bind above stays
+    // ahead of the gate, so recovery of an existing request never regresses.
+    await assertNewChatNamingAllowed({ space: p.space, agentId: p.agentId });
     await mkdir(dir, { recursive: true });
     const requestFile = join(dir, "a-new-request.json");
     let handle;
