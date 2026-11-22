@@ -1,6 +1,6 @@
 # ZCode 回执监控与 Codex 按需接棒
 
-本能力按**单次任务需要**手动启动。2026-11-13 已撤销 `Codex-ZCode-Reply-Watcher` Windows 登录计划任务。平时不运行，也不注册计划任务。
+本能力按**单次任务需要**手动启动。平时不运行，也不注册 Windows 计划任务（不随登录自动启动）。
 
 ## 启动与停止
 
@@ -27,12 +27,11 @@ pwsh -File .\monitor\start-zcode-reply-watcher.ps1 -ThreadId <现有 Codex 会�
 
 回执可见并不等于成功唤醒。队列失败会记录 `QUEUE_FAILED` 和 `failed` 状态，并停止监控，**不会无条件重试**。出现 `QUEUE_UNCERTAIN`、`queued_unwoken` 等情况时先查 Codex 会话是否已经收到消息，确认后再人工处理状态，避免二次派发。每次接棒后续工作仍遵循当前任务的授权与验收条件。
 
-## 2026-11-13 实测记录
+## 已有测试与已知边界
 
 - Node 测试 `node --test monitor/test-watch-zcode-replies.mjs`，覆盖接单 ACK、基线、临时文件过滤、末行 DONE、两分钟延迟、批量接棒、进程重启去重与队列异常留痕。测试中的 `queue` 为模拟函数。
-- Codex 26.1106 CLI 提供 `codex queue --thread ... --message ... --resume`。使用不存在的会话 ID 时，CLI 返回 `no rollout found`，证明命令链可到达本机线程存储。
-- 真实 app-server `daemon start` 在本次受限宿主执行时报 `start the Windows daemon from a non-elevated terminal`。因此**不在监听脚本启动时强制执行 daemon start**。
-- 先前安装的 Windows 计划任务启动失败，日志中有上述 daemon 错误。用户要求按需调用后，已撤销计划任务并改用手动入口。
+- Codex 26.1106 CLI 提供 `codex queue --thread ... --message ... --resume`。对不存在的会话 ID，CLI 返回 `no rollout found`；可借此确认命令链是否到达本机线程存储。
+- app-server `daemon start` 必须在非提升（non-elevated）终端执行，否则报 `start the Windows daemon from a non-elevated terminal`。因此**不在监听脚本启动时强制执行 daemon start**。
 - **尚未验证**真实 ZCode 新回执触发 `queue --resume` 后，原 Codex 会话自动恢复并完成下一轮开发。只有观察到原会话实际继续工作，才可将这一项标为端到端 PASS。
 
 ## 再次启用时的验收

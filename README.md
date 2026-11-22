@@ -27,7 +27,7 @@ git push -u origin master
 
 `monitor/dispatch-manager.mjs` 提供 `send`、`send-new`、`probe`、`watch`、`collect`、`consume`、`release`、`ack` 和 `rebuild-space`。每个 Agent 用固定 `--agent-id` 与可读中文 `--space`，每个会话用 `--conversation`（UUID）隔离账本、回复及监控状态。`send` 还需 `--message` 指向任务文件。新聊天使用 `send-new --request-id <新请求UUID> --message <文件路径>`，由管理器返回实际会话 UUID。同一请求只能以同一身份与正文哈希恢复绑定，禁止盲目重发。
 
-`rebuild-space --agent-id <AgentID> --space <空间名>` 用于 ego 重启丢失空间注册表后的受管重建（#31）：管理器先核验所有权证据——机器级归属账本 `~/.agents/ego-taskspaces.json` 仍把该 Agent 绑定到该空间（主证据），或本机 `ego-profile.json` 的 `spaceRebuildAllowlist` 显式白名单（兜底）——通过后才由管理器子进程按账号钉扎重建空间、在真实页面上核对钉扎账号并关闭该页；每次调用（含拒绝）都追加审计行到 `<监控目录>/a-space-rebuild-audit.ndjson`。无证据即拒绝（exit 2），此时按手册上报 PO，不得盲试 ad-hoc ego 调用（守卫会拦截）。
+`rebuild-space --agent-id <AgentID> --space <空间名>` 用于 ego 重启丢失空间注册表后的受管重建：管理器先核验所有权证据——机器级归属账本 `~/.agents/ego-taskspaces.json` 仍把该 Agent 绑定到该空间（主证据），或本机 `ego-profile.json` 的 `spaceRebuildAllowlist` 显式白名单（兜底）——通过后才由管理器子进程按账号钉扎重建空间、在真实页面上核对钉扎账号并关闭该页；每次调用（含拒绝）都追加审计行到 `<监控目录>/a-space-rebuild-audit.ndjson`。无证据即拒绝（exit 2），此时按手册上报 PO，不得盲试 ad-hoc ego 调用（守卫会拦截）。
 
 ```powershell
 node monitor/dispatch-manager.mjs watch --monitor-dir <项目监控目录> --agent-id gdc-exec-a --space GDC-本地执行A --conversation <会话UUID>
@@ -37,7 +37,7 @@ node monitor/dispatch-manager.mjs watch --monitor-dir <项目监控目录> --age
 
 退出码和 `WAKE_SUPERVISOR` 输出需要宿主实际转交给 Agent 才构成唤醒。未验证宿主退出通知时，不能声称已完成自动接棒。
 
-唤醒保障钩子（#25③，wake-guard）：watch 的每条 exit 2 路径先落盘 `a-watch-exit.json` 再退出；安装器（`monitor/install-zcode-guard.mjs`，幂等升级）同时安装 PreToolUse 注入与 Stop 一次性接棒——宿主每次工具调用前会在有未处理唤醒/监督积压/快探测陈旧时收到 `[AGENT_KIT_WAKE_GUARD]` 摘要（仅异常注入，健康零输出），收尾时仍有未处理唤醒则被强制继续一轮。机器需在 `~/.agents/ego-profile.json` 显式配置 `monitorRoots`（监控根目录绝对路径列表），未配置即不启用。处置后用 `ack --wake-id <注入的wakeId> --ack-action investigated|resolved` 双账本清账。详见手册 §6.6。该钩子是事件驱动恢复机制，不是 24×7 实时监控（宿主完全休眠/阻塞超 3 分钟/进程死亡无保障，OS 级守护按裁决不做）。
+唤醒保障钩子（wake-guard）：watch 的每条 exit 2 路径先落盘 `a-watch-exit.json` 再退出；安装器（`monitor/install-zcode-guard.mjs`，幂等升级）同时安装 PreToolUse 注入与 Stop 一次性接棒——宿主每次工具调用前会在有未处理唤醒/监督积压/快探测陈旧时收到 `[AGENT_KIT_WAKE_GUARD]` 摘要（仅异常注入，健康零输出），收尾时仍有未处理唤醒则被强制继续一轮。机器需在 `~/.agents/ego-profile.json` 显式配置 `monitorRoots`（监控根目录绝对路径列表），未配置即不启用。处置后用 `ack --wake-id <注入的wakeId> --ack-action investigated|resolved` 双账本清账。详见手册 §6.6。该钩子是事件驱动恢复机制，不是 24×7 实时监控（宿主完全休眠/阻塞超 3 分钟/进程死亡无保障，OS 级守护不做）。
 
 ## ZCode 文件回执按需接棒
 
