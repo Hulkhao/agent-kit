@@ -10,7 +10,7 @@ import { join, resolve } from "node:path";
 import { normalizeFastState, validateFastState, classifyFastStateFile } from "../monitor/state-schema.mjs";
 import { tick, acknowledge } from "../monitor/supervision-watchdog.mjs";
 import { shouldReviewStartupIdle, classifySupervision, deliverySuspected } from "../monitor/supervision-policy.mjs";
-import { parseArgs, adaptTemplate, bindNewConversation, classifyManagerResult, loadAttachments, requireArmedDispatch, main, readEgoOutcome, ensureMonitor, authorizeSpaceRebuild, rebuildSpace, claimSpace, taskspaceOwnershipLost, announceTaskspaceOwnershipLoss, exitWatching, acknowledgeWake, releaseDelivered, managedAcknowledge, ackOwnershipEvidence, armForDispatch, ACK_RESOLVED_OWNERSHIP_REQUIRED, ACK_AUDIT_FILE, SUPERVISION_WAKE_REASON_MAP, assertNewChatNamingAllowed, agentRegistryKnowsSpace, AGENT_REGISTRY_DIR_ENV } from "../monitor/dispatch-manager.mjs";
+import { parseArgs, adaptTemplate, bindNewConversation, classifyManagerResult, loadAttachments, requireArmedDispatch, main, readEgoOutcome, ensureMonitor, authorizeSpaceRebuild, rebuildSpace, claimSpace, taskspaceOwnershipLost, announceTaskspaceOwnershipLoss, exitWatching, acknowledgeWake, releaseDelivered, managedAcknowledge, ackOwnershipEvidence, armForDispatch, ACK_RESOLVED_OWNERSHIP_REQUIRED, ACK_AUDIT_FILE, SUPERVISION_WAKE_REASON_MAP, assertNewChatNamingAllowed, agentRegistryKnowsSpace, AGENT_REGISTRY_DIR_ENV, evaluateVanishEscalation, countManagedAborts, VANISH_ESCALATION_SEND_NEW_REQUIRED, VANISH_ESCALATION_RETRY_ONCE } from "../monitor/dispatch-manager.mjs";
 import { withAgentRegistry, isValidNewTaskSpaceName, assertTaskSpaceNamingAllowed } from "../monitor/agent-space.mjs";
 import { taskspaceOperatorAction } from "../monitor/taskspace-takeover.mjs";
 import { checkDispatchTool } from "../plugins/chatgpt-dispatch-guard/hooks/policy.mjs";
@@ -405,6 +405,40 @@ test("agent registry ledger decides the naming gate's existence oracle (#43 F1)"
     await assert.rejects(assertNewChatNamingAllowed({ space: "另一个未领名", agentId: "gdc-a", registryDirectory: registryDir }),
       /TASKSPACE_NAMING_VIOLATION_STOP/);
   } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test("vanish escalation verdict follows the two-abort evidence standard (#42)", () => {
+  // first managed delivery-failure abort on a conversation: original-conversation
+  // retry is still allowed (after a managed probe re-check)
+  assert.deepEqual(evaluateVanishEscalation(0),
+    { prior: 0, total: 1, escalation: VANISH_ESCALATION_RETRY_ONCE });
+  // second: the #42 evidence standard is met — never resend to this conversation
+  assert.deepEqual(evaluateVanishEscalation(1),
+    { prior: 1, total: 2, escalation: VANISH_ESCALATION_SEND_NEW_REQUIRED });
+  assert.equal(evaluateVanishEscalation(9).escalation, VANISH_ESCALATION_SEND_NEW_REQUIRED);
+  // hostile/garbage input degrades to the human-judgment branch, never throws
+  assert.equal(evaluateVanishEscalation(null).escalation, VANISH_ESCALATION_RETRY_ONCE);
+  assert.equal(evaluateVanishEscalation(-3).escalation, VANISH_ESCALATION_RETRY_ONCE);
+});
+
+test("countManagedAborts reads the conversation's managed-abort history (#42)", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "ego-vanish-count-"));
+  try {
+    // no event log yet = zero history (ENOENT is the normal fresh-conversation shape)
+    assert.equal(await countManagedAborts(dir), 0);
+    await writeFile(join(dir, "a-fast-events.ndjson"),
+      JSON.stringify({ ts: 1, event: "DISPATCH_ABORTED", dispatchId: "a" }) + "\n" +
+      // probe observation of a terminal ledger is NOT a managed abort verdict
+      JSON.stringify({ ts: 2, event: "DISPATCH_ABORTED_OBSERVED", dispatchId: "b" }) + "\n" +
+      "{corrupt\n" +
+      JSON.stringify({ ts: 3, event: "DISPATCH_ABORTED", dispatchId: "c",
+        evidence: "FAST_STATE_DELIVERY_FAILED_CANDIDATE" }) + "\n" +
+      "\n", "utf8");
+    assert.equal(await countManagedAborts(dir), 2);
+    // readable-but-empty history is a real zero, distinct from unreadable
+    await writeFile(join(dir, "a-fast-events.ndjson"), "", "utf8");
+    assert.equal(await countManagedAborts(dir), 0);
+  } finally { await rm(dir, { recursive: true, force: true }); }
 });
 
 test("watch and probe require a matching accepted ledger before touching browser or state files", async () => {

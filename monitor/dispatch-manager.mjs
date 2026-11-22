@@ -565,6 +565,50 @@ export function evaluateAbortEvidence({
   return { ok: false, source: null };
 }
 
+// ---- #42: managed vanish escalation ----------------------------------------
+//
+// "Vanish" (issue #42): send verified persistence, then the message is gone
+// server-side — tail back at the dispatch baseline, no generation ever. The
+// remedy is NOT a blind resend (the same conversation eats it again); the
+// observed effective playbook is: abort with evidence, then re-dispatch to a
+// NEW conversation via send-new. The evidence standard for automatic
+// escalation is TWO managed delivery-failure aborts on the SAME conversation:
+// every `DISPATCH_ABORTED` row is written under abort's delivery-failure
+// evidence gate above, so counting those rows per conversation directory IS
+// the conversation's proven delivery-failure history — no extra state file to
+// drift out of sync.
+//   1 total abort  → RETRY_ORIGINAL_ALLOWED_ONCE (managed probe re-check first)
+//   ≥2 total aborts → SEND_NEW_REQUIRED (never resend to this conversation)
+// Under-counting (missing/corrupt history) degrades toward the
+// human-judgment branch and is reported, never silently assumed absent.
+
+export const VANISH_ESCALATION_SEND_NEW_REQUIRED = "SEND_NEW_REQUIRED";
+export const VANISH_ESCALATION_RETRY_ONCE = "RETRY_ORIGINAL_ALLOWED_ONCE";
+
+export function evaluateVanishEscalation(priorAbortCount) {
+  const prior = Number.isInteger(priorAbortCount) && priorAbortCount >= 0 ? priorAbortCount : 0;
+  const total = prior + 1; // the abort in progress is recorded immediately after this verdict
+  if (total >= 2) return { prior, total, escalation: VANISH_ESCALATION_SEND_NEW_REQUIRED };
+  return { prior, total, escalation: VANISH_ESCALATION_RETRY_ONCE };
+}
+
+export async function countManagedAborts(dir) {
+  let text;
+  try { text = await readFile(join(dir, "a-fast-events.ndjson"), "utf8"); }
+  catch (error) {
+    if (error && error.code === "ENOENT") return 0;
+    throw error;
+  }
+  let count = 0;
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
+    let row = null;
+    try { row = JSON.parse(line); } catch { continue; } // corrupt line is never evidence
+    if (row && row.event === "DISPATCH_ABORTED") count += 1;
+  }
+  return count;
+}
+
 // Byte-level, exclusive-create backup of the dispatch ledger. The raw bytes
 // are copied verbatim (no re-serialization), so the backup is a byte-exact
 // pre-abort restore point. An existing backup file is never overwritten: the
@@ -667,6 +711,12 @@ export async function abortDispatch(p, { now = Date.now() } = {}) {
     fastTailKeyEqualsBaseline: summary.fastTailKeyEqualsBaseline,
   });
   if (!verdict.ok) return evidenceRequired();
+  // #42 vanish escalation — read the history BEFORE this abort is recorded;
+  // an unreadable event log degrades to 0 (retry allowed) and is reported.
+  let priorAborts = 0;
+  let vanishHistoryState = "READ";
+  try { priorAborts = await countManagedAborts(dir); }
+  catch { priorAborts = 0; vanishHistoryState = "UNREADABLE"; }
   // Backup BEFORE any mutation; then the existing atomic write pattern.
   const backup = await backupLedgerBytes(dir, record.dispatchId, now);
   const next = {
@@ -684,6 +734,12 @@ export async function abortDispatch(p, { now = Date.now() } = {}) {
   });
   console.log("RESULT=DISPATCH_ABORTED dispatchId=" + record.dispatchId +
     " reason=" + p.reason + " evidence=" + verdict.source + " backup=" + backup.file);
+  const escalation = evaluateVanishEscalation(priorAborts);
+  console.log("VANISH_COUNT=" + escalation.total + " ESCALATION=" + escalation.escalation +
+    (vanishHistoryState === "UNREADABLE" ? " VANISH_HISTORY_UNREADABLE=1" : "") +
+    (escalation.escalation === VANISH_ESCALATION_SEND_NEW_REQUIRED
+      ? " OPERATOR_ACTION=本会话已两连交付失败，禁止原会话重试：按 §3.1 用 send-new 新会话自包含重派（原会话保留现场取证）。"
+      : " OPERATOR_ACTION=可原会话重试一次：先受管 probe 复核服务端真态，再次交付失败即升级 send-new（§3.1）。"));
   return 0;
 }
 
@@ -2357,7 +2413,15 @@ export async function main(args = process.argv.slice(2)) {
   if (["send", "send-new"].includes(p.action)) {
     await armForDispatch(dir, { conversationUuid: p.conversation, space: p.space });
   }
-  if (p.action === "probe") await writeFile(join(dir, "a-watch-uuid.txt"), p.conversation + "\n", "utf8");
+  if (p.action === "probe") {
+    // #27 proposal-1 residual: the probe's startup log names the owning agent.
+    // send-new's naming gate embeds the agentId in the space name, but legacy
+    // registry-known spaces predate that shape, so the owner is printed
+    // explicitly on every probe start.
+    console.log("PROBE_OWNER space=" + p.space + " agentId=" + p.agentId +
+      " conversation=" + p.conversation);
+    await writeFile(join(dir, "a-watch-uuid.txt"), p.conversation + "\n", "utf8");
+  }
   const observation = await runEgo(adaptTemplate(template, p), dir, p.action);
   // agent-kit#33: takeover guidance on send-family failures. The probe announces
   // it at its own takeover exits, so it is not repeated here for probe runs.

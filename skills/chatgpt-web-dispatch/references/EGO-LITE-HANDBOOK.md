@@ -130,6 +130,7 @@ const r = await page.fetch("/backend-api/conversation/" + uuid,
 | 新会话 API 索引延迟 | 刚建的会话 API 404，页面 DOM 却有内容 | 走 DOM 提取兜底，稍后 API 自然可用（§4 坑 4） |
 | 端点滞后/冻结 | 页面实时推进而 conversation GET total 冻结在旧值 | 完成态与内容以 DOM 为准（§4） |
 | 长回复分块 | 长回复拆多条 assistant 消息，分块可能藏在轮次中段的 tool 输出里 | **提取必须扫全响应并合并，禁只看尾部**（§4 分块交付协议） |
+| 项目落地页空主区 + 新会话默认 Codex 模式 | goto 项目落地页（/g/g-p-…/project 重定向落地）主内容区持续空（仅侧栏渲染，刷新 2 次与 >40s 等待不恢复）；同项目会话页渲染正常；根路径新聊天落地可能默认 Codex 模式（composer「随心输入」、GPT-6.1 Sol 8 档思考档），与对话模式（「询问 ChatGPT」、3 档滑杆）的选择器/就绪判据互不通用 | **不用项目落地页做就绪判定**：项目内工作直接 goto 既有会话页，新会话走 send-new 流程；派单一律过 Gate 7 模式门（chat=「询问 ChatGPT」放行，codex=「随心输入」显式拒绝，见 §3.1），Codex 8 档思考档不在派单链路上、无需校准；需切对话模式用 app shell「切换模式」→ menuitem ChatGPT |
 
 ### 5.1 判定「回复完成」——结构化状态翻转，不用内容基线
 
@@ -199,7 +200,7 @@ const r = await page.fetch("/backend-api/conversation/" + uuid,
 | `WAKE_SUPERVISOR reason=NO_SUBSTANTIVE_PROGRESS`（脚本2） | 配置窗口无实质进展 | 本地 Agent 检查状态/工具/页面，按 wakeId 回执并重新布防 |
 | `WAKE_SUPERVISOR reason=REPLY_UNHANDLED` | 回复到达但还未交付 | 立即提取、处理结果，再回执 |
 | `DELIVERY_SUSPECTED_WAKE_SUPERVISOR` | 账本 ACCEPTED 但发送疑似未持久化（vanish-mode：非生成态下 tail==派单 baseline，或乐观 user 轮悬空无回复；assistant 尾部越过 baseline 则永不触发） | 受管 probe 复核尾部（必要时全新 goto 取服务端真态）：确认未落 → 用受管 `abort` 按证据关闭账本（见下行与 docs/OPERATIONS.md §7，备份先行）并按 §3.1 重派；确认已落 → 正常监控；禁止当完成候选、禁止盲重发 |
-| `DISPATCH_ABORTED_WAKE_SUPERVISOR` | 受管 `abort` 已按证据门把在途账本关闭为 ABORTED（账本含 abortReason/abortedAt/abortedBy；原账本字节级备份 `a-dispatch-state.archive-<dispatchId前8>-abort.json`；probe 观测到 ABORTED 账本即报此信号） | 读 `DISPATCH_ABORTED` 事件与备份核对 reason/证据来源；确认后 `ack` 该 wakeId；ABORTED 无回复可言——禁止 collect/consume，禁止重复 abort（`ABORT_NOT_APPLICABLE`）；按 §3.1 决定是否重派 |
+| `DISPATCH_ABORTED_WAKE_SUPERVISOR` | 受管 `abort` 已按证据门把在途账本关闭为 ABORTED（账本含 abortReason/abortedAt/abortedBy；原账本字节级备份 `a-dispatch-state.archive-<dispatchId前8>-abort.json`；probe 观测到 ABORTED 账本即报此信号） | 读 `DISPATCH_ABORTED` 事件与备份核对 reason/证据来源；确认后 `ack` 该 wakeId；ABORTED 无回复可言——禁止 collect/consume，禁止重复 abort（`ABORT_NOT_APPLICABLE`）；按 §3.1 决定是否重派。**重派出口按 abort 输出的 `VANISH_COUNT`/`ESCALATION` 裁决**：本会话第 1 次受管交付失败 abort（`ESCALATION=RETRY_ORIGINAL_ALLOWED_ONCE`）可原会话重试一次，重试前先受管 probe 复核服务端真态；第 2 次及以后（`ESCALATION=SEND_NEW_REQUIRED`，两连交付失败即证据标准）**禁止原会话重试**，一律 send-new 新会话自包含重派，原会话保留现场取证；abort 事件历史不可读时输出 `VANISH_HISTORY_UNREADABLE=1`，按首次处置并人工复核历史 |
 | `USER_ESCALATION_REQUIRED` | 连续 3 轮异常且没有实质进展 | 联系 PO；不能把第三次告警直接当“会话死亡” |
 | `STATE_MISSING / WATCHDOG_TRIGGER(stale>=7min)` | 快轮询死亡 | 修复快轮询（页面失附→重新 goto）后重新运行受管 probe/watch runner，不重启宿主 |
 | `startIdle=true` | 监视器启动/恢复时页面已空闲（基线时序风险） | 「启动即提取」：单次 API 比对派单基线，防吞已到达回复 |
