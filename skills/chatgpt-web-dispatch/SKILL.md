@@ -3,7 +3,6 @@ name: chatgpt-web-dispatch
 description: 两人项目组的 ChatGPT 网页派单工作流（ego-browser）——GitHub 优先交接材料、双循环监控与异常接管、回复提取、会话迁移、GitHub Issues 反馈。凡涉及 chatgpt.com 会话派单、监控、提取、迁移或故障上报必读本 skill。Use for ChatGPT web dispatch, GitHub handoff, reply monitoring, recovery, and issue reporting.
 metadata:
   version: "1.8.0"
-  date: "2026-11-19"
 ---
 
 # ChatGPT 网页派单（ego-browser 工作流）
@@ -18,9 +17,9 @@ metadata:
 
 **目标复核**：仓库根 `README.md` 的「ChatGPT 网页派单治理目标与复核表」是六项长期验收合同。实战发现异常时，对照相关项核查行为证据，按 §9.1 查重并报 Issue；维护 Agent 每次修复、发布前复核六项，逐项记录 `PASS / FAIL / 未验证` 与证据。未取得宿主实机回执的 Hook 拦截、Agent 唤醒与回复接棒均填「未验证」，不得只凭单元测试结案。
 
-## 本机账号钉扎（ego-profile.json，PO 令 2026-11-08，首次使用本 skill 前必配）
+## 本机账号钉扎（ego-profile.json，首次使用本 skill 前必配）
 
-**为什么**：`taskSpace(名字)` 按名字复用已存在的空间，ego 的 profileId 只在「创建空间」那一刻生效——复用一个早期用错账号建的空间，就会一直用那个账号跑（实测事故：复用了无会员账号的空间，整个会话静默跑在 mini 档，见 agent-kit#7）。所以账号必须本机钉死+使用前验证。
+**为什么**：`taskSpace(名字)` 按名字复用已存在的空间，ego 的 profileId 只在「创建空间」那一刻生效——复用一个早期用错账号建的空间，就会一直用那个账号跑（可能整会话静默落在低档模型）。所以账号必须本机钉死+使用前验证。
 
 **配置（机器本地，绝不进仓库、绝不写真实邮箱进 Git）**：复制 `config/ego-profile.example.json` 到本机 `~/.agents/ego-profile.json`（Windows 即 `C:\Users\<你>\.agents\ego-profile.json`），填本机值：
 
@@ -34,7 +33,7 @@ metadata:
 
 校验工具：本仓库 `monitor/ego-profile-check.mjs`（`ego-browser nodejs < ego-profile-check.mjs`，MODE=list/init/verify，详见文件头注释）。
 
-**#17 `ego-browser nodejs` 脚本调用（agent-kit#17）**：Git Bash/cmd：`ego-browser nodejs < script.mjs`（stdin 重定向）；PowerShell：`ego-browser nodejs -e "await import('file:///C:/path/script.mjs')"`；错误用法 `ego-browser nodejs script.mjs` 会把路径当内联 JS 求值并报错。
+**`ego-browser nodejs` 脚本调用**：Git Bash/cmd：`ego-browser nodejs < script.mjs`（stdin 重定向）；PowerShell：`ego-browser nodejs -e "await import('file:///C:/path/script.mjs')"`；错误用法 `ego-browser nodejs script.mjs` 会把路径当内联 JS 求值并报错。
 
 ## 七条铁律（细则见手册）
 
@@ -54,21 +53,33 @@ metadata:
 
 ## 相关事实源
 
-- 监控脚本唯一存放点：**本仓库 `monitor/` 目录（PO 令 2026-11-08 并入 agent-kit；原独立 ego-tools 本地仓库停用为历史归档）**；要改脚本只改仓库内这一份，禁止本地另立孤本副本。**开工前 `git pull` 同步官方最新**（任务边界更新，skill 与脚本天然同版交付）。状态机文件：`dispatch-state.mjs`（派单账本 + 结构化 Composer/尾部读取）、`state-schema.mjs`（v3 Schema + 绝对 deadline）、`page-recovery.mjs`（多 Page URL-UUID 消歧）、`ego-profile-check.mjs`（本机账号钉扎校验）。
-- **派单规范模板**：`templates/dispatch-round.template.mjs`（R2.5 九闸门冻结事务链 + R2.6-F 自适应填充，见手册 §3.1）。统一管理器内部使用此模板生成每轮脚本，业务 Agent 不手改模板适配器。遇到 `ADAPTATION_REQUIRED` 说明环境与模板假设不符，STOP 上报，不要徒手重写链路。Gate 7 主检查=可见 composer aria-label（#21：chat=询问 ChatGPT/codex=随心输入；codex 拒绝留痕 `MODE_REJECT=`，未知一律降级旧判据再 STOP）。失败路径取证行（只增不改判据）：模式不可证 STOP 前输出 `MODE_LABELS=`/`MODE_DUMP=`（#39-②），附件挂载未证实 STOP 前输出 `ATTACH_DUMP=`（#39-①）。
+- 监控脚本唯一存放点：**本仓库 `monitor/` 目录**；要改脚本只改仓库内这一份，禁止本地另立孤本副本。**开工前 `git pull` 同步官方最新**（任务边界更新，skill 与脚本天然同版交付）。状态机文件：`dispatch-state.mjs`（派单账本 + 结构化 Composer/尾部读取）、`state-schema.mjs`（v3 Schema + 绝对 deadline）、`page-recovery.mjs`（多 Page URL-UUID 消歧）、`ego-profile-check.mjs`（本机账号钉扎校验）。
+- **派单规范模板**：`templates/dispatch-round.template.mjs`（R2.5 九闸门冻结事务链 + R2.6-F 自适应填充，见手册 §3.1）。统一管理器内部使用此模板生成每轮脚本，业务 Agent 不手改模板适配器。遇到 `ADAPTATION_REQUIRED` 说明环境与模板假设不符，STOP 上报，不要徒手重写链路。Gate 7 主检查=可见 composer aria-label（chat=询问 ChatGPT/codex=随心输入；codex 拒绝留痕 `MODE_REJECT=`，未知一律降级旧判据再 STOP）。失败路径取证行（只增不改判据）：模式不可证 STOP 前输出 `MODE_LABELS=`/`MODE_DUMP=`，附件挂载未证实 STOP 前输出 `ATTACH_DUMP=`。
 - 跨机器交付的 SHA256 必须注明哈希对象与字节基准（Git blob / 下载文件 / 部署磁盘，注明 LF/CRLF），见手册 §11.10。
 - 通用浏览器操作（非 ChatGPT 派单流）见 `ego-browser` skill。
 - 弃用声明：chrome-use / chatgpt-use 已全面弃用，仅存量旧脚本可读，禁止新建依赖。
 
-## 实战问题协作方式（PO 令 2026-11-08，所有使用本 skill 的 Agent 遵守）
+## 实战问题协作方式（所有使用本 skill 的 Agent 遵守）
 
 不通过高频刷新或故意制造网页故障来测试应急方案；Skill **在实际派单任务中迭代**。实战遇到问题时的标准路径（完整处置和权限错误分支见手册 §5.2、§6.4、§9.1）：
 
 1. **当场止损**：按手册对应章节处置（STOP / 退避 / 对账），保住现场证据（状态文件、事件日志，脱敏后留存），不盲目重试。
 2. **查重并报 Issue**：先搜索 `Hulkhao/agent-kit` 的现有 Issues；重复问题补充脱敏证据，新问题直接创建。GitHub 明确拒绝读写时报告原始错误并停止该上报动作，不能声称“已上报”；不要换仓库或账号绕过权限。
-3. **通知 PO**：提交成功才通知“Issue #编号 已上报”，附链接、当前任务能否继续；失败则明确“未上报”及错误。由 PO 的 **Skill 维护 Agent** 统一处理，普通执行 Agent 不自行修改 Skill/监控脚本。
+3. **通知 PO**：提交成功才通知“Issue #编号 已上报”，附链接、当前任务能否继续；失败则明确“未上报”及错误。缺陷修复的归属判定与自修路径按下方「发现缺陷的提报与处理路径」执行。
 4. **继续主线**：能恢复则按手册既有路径恢复并重新布防；不能继续则保留当前进度、定位阻塞，通知 PO，不盲目重派。
-5. **接管/交接先审计**（2026-11-19，#38 案教训）：从交接文档接管监控根时，先按手册 §6.4「接管交接审计」对 `conversations/` 全部会话目录做事实基线盘点——handoff 是假设，盘上证据才是事实；关键断言被证伪即停止按其拟定的动作并先向 PO 汇报差异。
+5. **接管/交接先审计**：从交接文档接管监控根时，先按手册 §6.4「接管交接审计」对 `conversations/` 全部会话目录做事实基线盘点——handoff 是假设，盘上证据才是事实；关键断言被证伪即停止按其拟定的动作并先向 PO 汇报差异。
 
 这样其他 Agent 遇到同类问题能直接查 issue 看到已知现象与修复进度，避免各自踩坑、各自打补丁。
+
+## 发现缺陷的提报与处理路径
+
+发现缺陷先判归属，再按对应路径处理：
+
+1. **agent-kit 自身缺陷**（派单链、监控脚本、skill 手册、模板/守卫）：
+   - 首选自己修：改码 → 测试 → commit → push → 关闭对应 issue；只改仓库源文件，禁止碰部署副本，发布后各机 pull + deploy。
+   - 不能立即修：提 issue 到 https://github.com/Hulkhao/agent-kit/issues 。标题 = `[Bug]`/`[Feature]` + 一句话短述；正文 = 现象 / 复现步骤 / 期望结果。脱敏红线：禁止 Cookie、Token、payload 原文、完整提示词与客户数据。
+2. **ego-lite 内核 / 浏览器本体缺陷**（注册表持久化、页面行为异常、升级崩溃类）：提官方 https://github.com/citrolabs/ego-lite/issues ，规范同上并附 ego lite 版本号；不在 agent-kit 自提。
+3. **兜底**：两处都不适用，或提报受阻（权限 / 网络 / 限流失败）→ 上报 PO，附已尝试路径与实际错误。
+
+上报前先在目标仓库查重（含已关闭 issue）；重复问题补充脱敏证据，新问题直接创建。查重、脱敏与提报失败的处置细节见上文「实战问题协作方式」与手册 §9.1。
 
